@@ -942,6 +942,14 @@ fn sync_provider_profiles_from_env(workspace: &Path) {
             Some("minimax"),
             "env:minimax",
         ),
+        (
+            "deepinfra",
+            "openai-compat",
+            "DEEPINFRA_API_KEY",
+            Some("DEEPINFRA_BASE_URL"),
+            Some("deepinfra"),
+            "env:deepinfra",
+        ),
     ];
 
     let mut saved = Vec::new();

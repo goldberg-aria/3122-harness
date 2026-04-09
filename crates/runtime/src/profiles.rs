@@ -182,6 +182,12 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             description: "MiniMax OpenAI-compatible API",
         },
         ProviderPreset {
+            name: "deepinfra",
+            route: ProviderRoute::OpenAiCompat,
+            base_url: "https://api.deepinfra.com/v1/openai",
+            description: "DeepInfra OpenAI-compatible API",
+        },
+        ProviderPreset {
             name: "zai-coding",
             route: ProviderRoute::OpenAiCompat,
             base_url: "https://api.z.ai/api/coding/paas/v4",
@@ -279,5 +285,8 @@ mod tests {
 
         let minimax = provider_preset("minimax").unwrap();
         assert_eq!(minimax.base_url, "https://api.minimax.io/v1");
+
+        let deepinfra = provider_preset("deepinfra").unwrap();
+        assert_eq!(deepinfra.base_url, "https://api.deepinfra.com/v1/openai");
     }
 }

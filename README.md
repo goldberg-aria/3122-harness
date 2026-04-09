@@ -188,9 +188,9 @@ Saved provider profiles:
 
 - `providers add` stores BYOK profiles in `.harness/providers.json`
 - auto-detection currently recognizes some key formats such as OpenRouter and OpenAI
-- manual registration supports presets such as `deepseek`, `dashscope-cn`, `dashscope-intl`, `siliconflow`, `groq`, `minimax`, and `zai-coding`
+- manual registration supports presets such as `deepseek`, `dashscope-cn`, `dashscope-intl`, `siliconflow`, `groq`, `minimax`, `deepinfra`, and `zai-coding`
 - saved profiles can be used as `profile/<alias>/<model>`
-- `providers sync-env` saves env-backed profiles such as `anthropic-api`, `openai-api`, `groq`, `qwen-api`, `zai`, and `minimax`
+- `providers sync-env` saves env-backed profiles such as `anthropic-api`, `openai-api`, `groq`, `qwen-api`, `zai`, `minimax`, and `deepinfra`
 
 What to prepare:
 
@@ -198,6 +198,7 @@ What to prepare:
 - OpenAI API key if you want the API lane
 - Z.AI API key and the base URL you want to standardize on
 - MiniMax API key and the compatibility mode you want to use first
+- DeepInfra API key if you want its OpenAI-compatible lane in the matrix
 - Groq and Qwen API keys if you want them in the matrix
 - local Ollama models pulled in advance, at least one Gemma and one Qwen model
 - authenticated CLI login for `claude` and `codex` if you want auth-lane smoke tests
@@ -221,6 +222,12 @@ Live provider tests:
   - `HARNESS_TEST_CLAUDE_CODE_MODEL`
   - `HARNESS_TEST_CODEX_MODEL`
 - `scripts/run_provider_matrix.sh` syncs env-backed profiles, chooses local Ollama defaults, and runs the live smoke test suite
+- current saved-profile defaults in the matrix script:
+  - Z.AI: `5.1`
+  - MiniMax: `2.7`
+  - Groq: `openai/gpt-oss-20b`
+  - Qwen API via OpenRouter: `qwen/qwen3.6-plus`
+  - DeepInfra: `nvidia/Nemotron-3-Nano-30B-A3B`
 
 ## Immediate next steps
 

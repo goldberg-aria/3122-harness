@@ -14,6 +14,8 @@ const KNOWN_KEYS: &[&str] = &[
     "ZAI_BASE_URL",
     "MINIMAX_API_KEY",
     "MINIMAX_BASE_URL",
+    "DEEPINFRA_API_KEY",
+    "DEEPINFRA_BASE_URL",
     "OLLAMA_HOST",
     "HARNESS_TEST_OLLAMA_MODEL",
     "HARNESS_TEST_OLLAMA_GEMMA_MODEL",
@@ -33,6 +35,7 @@ const KNOWN_KEYS: &[&str] = &[
     "HARNESS_TEST_MINIMAX_MODEL",
     "HARNESS_TEST_GROQ_MODEL",
     "HARNESS_TEST_QWEN_API_MODEL",
+    "HARNESS_TEST_DEEPINFRA_MODEL",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +46,7 @@ enum FreeformSection {
     MiniMax,
     Groq,
     Qwen,
+    DeepInfra,
 }
 
 pub fn load_workspace_env(workspace_root: &Path) -> Result<Vec<String>, String> {
@@ -103,6 +107,9 @@ fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, String> {
                 Some(FreeformSection::Groq) => {
                     values.entry("GROQ_BASE_URL".to_string()).or_insert(url);
                 }
+                Some(FreeformSection::DeepInfra) => {
+                    values.entry("DEEPINFRA_BASE_URL".to_string()).or_insert(url);
+                }
                 _ => {}
             }
             continue;
@@ -119,6 +126,9 @@ fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, String> {
     values
         .entry("MINIMAX_BASE_URL".to_string())
         .or_insert_with(|| "https://api.minimax.io/v1".to_string());
+    values
+        .entry("DEEPINFRA_BASE_URL".to_string())
+        .or_insert_with(|| "https://api.deepinfra.com/v1/openai".to_string());
 
     if let Some(base_url) = values.get("QWEN_BASE_URL").cloned() {
         values.insert("QWEN_BASE_URL".to_string(), strip_chat_completions(&base_url));
@@ -161,6 +171,9 @@ fn detect_section(line: &str) -> Option<FreeformSection> {
     }
     if lower.contains("qwen") && lower.contains("api") {
         return Some(FreeformSection::Qwen);
+    }
+    if lower.contains("deepinfra") && lower.contains("api") {
+        return Some(FreeformSection::DeepInfra);
     }
     None
 }
@@ -207,6 +220,14 @@ fn infer_freeform_value(section: Option<FreeformSection>, line: &str) -> Option<
             if trimmed.starts_with("sk-or-v1-") || trimmed.starts_with("sk-") =>
         {
             Some(("QWEN_API_KEY", trimmed))
+        }
+        Some(FreeformSection::DeepInfra)
+            if trimmed.len() >= 20
+                && trimmed
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_') =>
+        {
+            Some(("DEEPINFRA_API_KEY", trimmed))
         }
         _ => None,
     }
@@ -262,6 +283,10 @@ gsk_demo
 • Qwen API key
 https://openrouter.ai/api/v1/chat/completions
 sk-or-v1-demo
+
+• DeepInfra API key
+https://api.deepinfra.com/v1/openai
+KIGa6N9N38UFeOj8L8kftPjzxOEsxhGB
 "#,
         )
         .unwrap();
@@ -290,6 +315,14 @@ sk-or-v1-demo
         assert_eq!(
             parsed.get("MINIMAX_BASE_URL").map(String::as_str),
             Some("https://api.minimax.io/v1")
+        );
+        assert_eq!(
+            parsed.get("DEEPINFRA_BASE_URL").map(String::as_str),
+            Some("https://api.deepinfra.com/v1/openai")
+        );
+        assert_eq!(
+            parsed.get("DEEPINFRA_API_KEY").map(String::as_str),
+            Some("KIGa6N9N38UFeOj8L8kftPjzxOEsxhGB")
         );
         cleanup(&workspace);
     }
