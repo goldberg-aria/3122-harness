@@ -64,9 +64,10 @@ pub use tools::{
     ToolOutput,
 };
 pub use trajectory::{
-    active_trajectory, build_trajectory_recall_text, list_recent_trajectories,
-    list_skill_candidates, memory_db_path, promote_skill_candidate, record_session_trajectory,
-    search_trajectories, SkillCandidate, TrajectoryRecord, TrajectoryStep,
+    active_trajectory, build_file_memory_recall_text, build_trajectory_recall_text,
+    list_recent_trajectories, list_skill_candidates, memory_db_path, promote_skill_candidate,
+    record_session_trajectory, search_trajectories, FileMemoryRecord, SkillCandidate,
+    TrajectoryRecord, TrajectoryStep,
 };
 pub use verifier::{assess_verification, VerificationAssessment, VerificationEvent};
 

@@ -234,6 +234,7 @@ Local-Lite memory:
 - `trajectory` lists recent compressed work trajectories
 - `trajectory active` shows the current active trajectory with files, failure, and verification hints
 - `trajectory search <query>` runs local FTS search across stored trajectories
+- prompt context now includes file-level memory when the current query or active trajectory points at specific files
 - `memory` lists recent memory records
 - `memory show <index>` prints one saved memory record with tags and source session
 - `memory recall [limit]` prints the exact recall block the harness would inject
@@ -244,6 +245,7 @@ Local-Lite memory:
 - REPL exit autosaves new local memory records for the current session
 - prompt context now includes recent working history, Local-Lite memory recall, and relevant conversation recall from older sessions
 - Local-Lite recall now prioritizes the active trajectory over older free-form memory records
+- `why-context` now explains why the current recall set was selected
 - the first prompt after `/model <spec>` gets a temporary handoff boost in prompt context
 - prompt context is budgeted so long sessions degrade conversation recall first, then memory, recent history, and finally instructions
 - `/status` shows approval and verification behavior alongside provider and memory state
@@ -254,6 +256,7 @@ Skill summaries:
 - discovered skills now expose a routing-friendly summary capped to about 250 characters
 - frontmatter `description:` is preferred when present
 - repeated tool workflows are tracked as skill candidates
+- read-only browsing loops are filtered out so low-value candidates are not suggested
 - `skills suggest` lists candidates with repeated occurrence counts
 - `skills promote <index>` turns a candidate into a prompt-template slash command in `.harness/commands/`
 

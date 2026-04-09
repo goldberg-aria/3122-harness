@@ -79,6 +79,9 @@ Trajectory rows capture:
 - last verification
 - next step
 
+File memory is derived from trajectory activity.
+When a query or active trajectory points at concrete files, the prompt context includes a small file-level recall block with the latest goal, failure, and verification attached to those files.
+
 This is the main continuity layer for `/resume`, `/handoff`, `/why-context`, and post-switch handoff boost.
 
 The same store also tracks repeated tool sequences as `skill_candidates`.

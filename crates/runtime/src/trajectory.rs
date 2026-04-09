@@ -51,6 +51,17 @@ pub struct SkillCandidate {
     pub last_seen_ts_ms: u128,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileMemoryRecord {
+    pub path: String,
+    pub updated_ts_ms: u128,
+    pub last_goal: String,
+    pub last_summary: String,
+    pub last_failure: Option<String>,
+    pub last_verification: Option<String>,
+    pub session_path: String,
+}
+
 struct DerivedTrajectory {
     record: TrajectoryRecord,
     steps: Vec<TrajectoryStep>,
@@ -69,8 +80,15 @@ pub fn record_session_trajectory(
     let derived = derive_trajectory(workspace_root, session_path, &events);
     let connection = open_memory_db(workspace_root)?;
     let trajectory_id = upsert_trajectory(&connection, &derived)?;
+    upsert_file_memory(&connection, &derived)?;
     if !derived.tool_sequence.is_empty() {
-        upsert_skill_candidate(&connection, session_path, &derived.tool_sequence, trajectory_id)?;
+        upsert_skill_candidate(
+            &connection,
+            session_path,
+            &derived.tool_sequence,
+            &derived.record.current_goal,
+            trajectory_id,
+        )?;
     }
     Ok(active_trajectory(workspace_root)?.unwrap_or(derived.record))
 }
@@ -180,6 +198,34 @@ pub fn build_trajectory_recall_text(workspace_root: &Path, limit: usize) -> Resu
     } else {
         Ok(sections.join("\n\n"))
     }
+}
+
+pub fn build_file_memory_recall_text(
+    workspace_root: &Path,
+    user_query: Option<&str>,
+    limit: usize,
+) -> Result<String, String> {
+    let records = relevant_file_memories(workspace_root, user_query, limit)?;
+    if records.is_empty() {
+        return Ok("none".to_string());
+    }
+    let mut sections = Vec::new();
+    for record in records {
+        let mut lines = vec![
+            "[file_memory]".to_string(),
+            format!("Path: {}", record.path),
+            format!("Goal: {}", record.last_goal),
+            format!("Summary: {}", record.last_summary),
+        ];
+        if let Some(failure) = record.last_failure.as_deref() {
+            lines.push(format!("Last failure: {failure}"));
+        }
+        if let Some(verification) = record.last_verification.as_deref() {
+            lines.push(format!("Last verification: {verification}"));
+        }
+        sections.push(lines.join("\n"));
+    }
+    Ok(sections.join("\n\n"))
 }
 
 pub fn list_skill_candidates(
@@ -319,6 +365,15 @@ fn open_memory_db(workspace_root: &Path) -> Result<Connection, String> {
                session_path TEXT NOT NULL,
                PRIMARY KEY (fingerprint, session_path)
              );
+             CREATE TABLE IF NOT EXISTS file_memory (
+               path TEXT PRIMARY KEY,
+               updated_ts_ms INTEGER NOT NULL,
+               last_goal TEXT NOT NULL,
+               last_summary TEXT NOT NULL,
+               last_failure TEXT,
+               last_verification TEXT,
+               session_path TEXT NOT NULL
+             );
              CREATE VIRTUAL TABLE IF NOT EXISTS trajectory_fts USING fts5(
                title, current_goal, recent_work_summary, latest_attempt, latest_failure, next_step
              );",
@@ -429,9 +484,10 @@ fn upsert_skill_candidate(
     connection: &Connection,
     session_path: &Path,
     tool_sequence: &[String],
+    current_goal: &str,
     trajectory_id: i64,
 ) -> Result<(), String> {
-    if tool_sequence.len() < 3 {
+    if !qualifies_skill_candidate(tool_sequence) {
         return Ok(());
     }
     let fingerprint = tool_sequence.join(">");
@@ -447,13 +503,15 @@ fn upsert_skill_candidate(
     }
 
     let now_ms = now_ms();
-    let command_name = suggest_command_name(tool_sequence);
+    let command_name = suggest_command_name(tool_sequence, current_goal);
     let description = format!(
-        "Repeated workflow: {}",
+        "Repeated workflow for {}: {}",
+        truncate_text(current_goal, 64),
         tool_sequence.join(" -> ")
     );
     let prompt = format!(
-        "Follow this proven workflow for the current task: {}. Explain findings briefly, keep context continuity, and verify before claiming completion.",
+        "Follow this proven workflow for tasks similar to `{}`. Preferred steps: {}. Keep context continuity, mention relevant files, and verify before claiming completion.",
+        truncate_text(current_goal, 96),
         tool_sequence.join(" -> ")
     );
     connection
@@ -482,6 +540,126 @@ fn upsert_skill_candidate(
         )
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn upsert_file_memory(connection: &Connection, derived: &DerivedTrajectory) -> Result<(), String> {
+    if derived.record.active_files.is_empty() {
+        return Ok(());
+    }
+    for path in &derived.record.active_files {
+        connection
+            .execute(
+                "INSERT INTO file_memory (
+                   path, updated_ts_ms, last_goal, last_summary, last_failure, last_verification, session_path
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(path) DO UPDATE SET
+                   updated_ts_ms=excluded.updated_ts_ms,
+                   last_goal=excluded.last_goal,
+                   last_summary=excluded.last_summary,
+                   last_failure=excluded.last_failure,
+                   last_verification=excluded.last_verification,
+                   session_path=excluded.session_path",
+                params![
+                    path,
+                    to_sql_i64(derived.record.updated_ts_ms),
+                    derived.record.current_goal,
+                    truncate_text(&derived.record.recent_work_summary, 240),
+                    derived.record.latest_failure,
+                    derived.record.last_verification,
+                    derived.record.session_path
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn relevant_file_memories(
+    workspace_root: &Path,
+    user_query: Option<&str>,
+    limit: usize,
+) -> Result<Vec<FileMemoryRecord>, String> {
+    let connection = open_memory_db(workspace_root)?;
+    let active = active_trajectory(workspace_root)?;
+    let mut targets = Vec::new();
+
+    if let Some(query) = user_query {
+        let lowered = query.to_ascii_lowercase();
+        for token in lowered.split_whitespace() {
+            if token.contains('/') || token.contains('.') {
+                targets.push(token.trim_matches(|ch: char| ",:;()[]{}".contains(ch)).to_string());
+            }
+        }
+    }
+
+    if let Some(active) = active.as_ref() {
+        for path in &active.active_files {
+            push_unique(&mut targets, path.to_ascii_lowercase(), 8);
+        }
+    }
+
+    let mut records = Vec::new();
+    if !targets.is_empty() {
+        let mut statement = connection
+            .prepare(
+                "SELECT path, updated_ts_ms, last_goal, last_summary, last_failure, last_verification, session_path
+                 FROM file_memory
+                 ORDER BY updated_ts_ms DESC",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(FileMemoryRecord {
+                    path: row.get(0)?,
+                    updated_ts_ms: row.get::<_, i64>(1)?.max(0) as u128,
+                    last_goal: row.get(2)?,
+                    last_summary: row.get(3)?,
+                    last_failure: row.get(4)?,
+                    last_verification: row.get(5)?,
+                    session_path: row.get(6)?,
+                })
+            })
+            .map_err(|err| err.to_string())?;
+        for row in rows {
+            let record = row.map_err(|err| err.to_string())?;
+            let haystack = record.path.to_ascii_lowercase();
+            if targets.iter().any(|target| haystack.contains(target)) {
+                records.push(record);
+                if records.len() >= limit.max(1) {
+                    return Ok(records);
+                }
+            }
+        }
+    }
+
+    if records.is_empty() {
+        let mut statement = connection
+            .prepare(
+                "SELECT path, updated_ts_ms, last_goal, last_summary, last_failure, last_verification, session_path
+                 FROM file_memory
+                 ORDER BY updated_ts_ms DESC
+                 LIMIT ?1",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = statement
+            .query_map([limit.max(1) as i64], |row| {
+                Ok(FileMemoryRecord {
+                    path: row.get(0)?,
+                    updated_ts_ms: row.get::<_, i64>(1)?.max(0) as u128,
+                    last_goal: row.get(2)?,
+                    last_summary: row.get(3)?,
+                    last_failure: row.get(4)?,
+                    last_verification: row.get(5)?,
+                    session_path: row.get(6)?,
+                })
+            })
+            .map_err(|err| err.to_string())?;
+        for row in rows {
+            records.push(row.map_err(|err| err.to_string())?);
+        }
+    }
+
+    Ok(records)
 }
 
 fn row_to_trajectory(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrajectoryRecord> {
@@ -943,28 +1121,80 @@ fn project_verification_hints(workspace_root: &Path) -> Vec<String> {
     hints
 }
 
-fn suggest_command_name(tool_sequence: &[String]) -> String {
-    let mut parts = tool_sequence
+fn qualifies_skill_candidate(tool_sequence: &[String]) -> bool {
+    if tool_sequence.len() < 3 {
+        return false;
+    }
+    let unique_count = tool_sequence
         .iter()
-        .take(3)
-        .map(|value| value.to_ascii_lowercase().replace('_', "-"))
-        .map(|value| {
-            value
-                .chars()
-                .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
-                .collect::<String>()
-        })
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
+        .map(|tool| tool.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    if unique_count < 2 {
+        return false;
+    }
+    let has_discovery = tool_sequence
+        .iter()
+        .any(|tool| matches!(tool.as_str(), "read" | "grep" | "glob" | "parallel_read"));
+    let has_action = tool_sequence
+        .iter()
+        .any(|tool| matches!(tool.as_str(), "edit" | "write" | "exec" | "skill" | "mcp_call"));
+    has_discovery && has_action
+}
+
+fn suggest_command_name(tool_sequence: &[String], current_goal: &str) -> String {
+    let mut parts = goal_keywords(current_goal, 2);
+    parts.extend(
+        tool_sequence
+            .iter()
+            .take(2)
+            .map(|value| value.to_ascii_lowercase().replace('_', "-"))
+            .map(|value| {
+                value
+                    .chars()
+                    .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+                    .collect::<String>()
+            })
+            .filter(|value| !value.is_empty()),
+    );
     if parts.is_empty() {
         parts.push("workflow".to_string());
     }
-    let mut name = format!("auto-{}", parts.join("-"));
+    let mut name = parts.join("-");
     if name.len() > 32 {
         name.truncate(32);
         name = name.trim_end_matches('-').to_string();
     }
     name
+}
+
+fn goal_keywords(current_goal: &str, limit: usize) -> Vec<String> {
+    let stop_words = [
+        "the", "and", "for", "with", "from", "that", "this", "into", "현재", "프로젝트",
+        "내용", "설명", "continue", "current", "task",
+    ];
+    let mut parts = Vec::new();
+    for token in current_goal
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+        .filter(|token| !token.is_empty())
+    {
+        let lowered = token.to_ascii_lowercase();
+        if lowered.len() < 3 || stop_words.iter().any(|word| *word == lowered) {
+            continue;
+        }
+        let cleaned = lowered
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+            .collect::<String>();
+        if cleaned.is_empty() {
+            continue;
+        }
+        push_unique(&mut parts, cleaned, limit);
+        if parts.len() >= limit {
+            break;
+        }
+    }
+    parts
 }
 
 fn newest_event_ts(events: &[SessionEvent]) -> u128 {
@@ -1029,8 +1259,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        active_trajectory, build_trajectory_recall_text, list_skill_candidates, memory_db_path,
-        promote_skill_candidate, record_session_trajectory, search_trajectories,
+        active_trajectory, build_file_memory_recall_text, build_trajectory_recall_text,
+        list_skill_candidates, memory_db_path, promote_skill_candidate, record_session_trajectory,
+        search_trajectories,
     };
 
     fn temp_workspace(prefix: &str) -> PathBuf {
@@ -1129,8 +1360,87 @@ mod tests {
         assert!(recall.contains("[active_trajectory]"));
         let candidates = list_skill_candidates(&workspace, 10).unwrap();
         assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].command_name.contains("inspect"));
         let promoted = promote_skill_candidate(&workspace, candidates[0].id).unwrap();
         assert!(promoted.is_file());
+
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn file_memory_recall_prefers_matching_paths() {
+        let workspace = temp_workspace("trajectory-file-memory");
+        let session_path = workspace.join(".harness/sessions/session-test.jsonl");
+        write_session(
+            &session_path,
+            &[
+                crate::session::SessionEvent {
+                    ts_ms: 1,
+                    kind: "user_input".to_string(),
+                    payload: json!({ "text": "fix provider parser" }),
+                },
+                crate::session::SessionEvent {
+                    ts_ms: 2,
+                    kind: "agent_tool".to_string(),
+                    payload: json!({ "name": "read", "summary": "read provider", "arguments": { "path": "crates/runtime/src/provider.rs" }}),
+                },
+                crate::session::SessionEvent {
+                    ts_ms: 3,
+                    kind: "tool_error".to_string(),
+                    payload: json!({ "error": "provider parse failed" }),
+                },
+            ],
+        );
+        record_session_trajectory(&workspace, &session_path).unwrap();
+
+        let recall = build_file_memory_recall_text(
+            &workspace,
+            Some("check crates/runtime/src/provider.rs"),
+            3,
+        )
+        .unwrap();
+        assert!(recall.contains("[file_memory]"));
+        assert!(recall.contains("provider.rs"));
+        assert!(recall.contains("provider parse failed"));
+
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn read_only_sequences_do_not_become_skill_candidates() {
+        let workspace = temp_workspace("trajectory-skill-filter");
+        for index in 0..2 {
+            let session_path = workspace.join(format!(".harness/sessions/session-{index}.jsonl"));
+            write_session(
+                &session_path,
+                &[
+                    crate::session::SessionEvent {
+                        ts_ms: 1,
+                        kind: "user_input".to_string(),
+                        payload: json!({ "text": "inspect docs" }),
+                    },
+                    crate::session::SessionEvent {
+                        ts_ms: 2,
+                        kind: "agent_tool".to_string(),
+                        payload: json!({ "name": "grep", "summary": "grep docs", "arguments": { "path": "README.md" }}),
+                    },
+                    crate::session::SessionEvent {
+                        ts_ms: 3,
+                        kind: "agent_tool".to_string(),
+                        payload: json!({ "name": "read", "summary": "read docs", "arguments": { "path": "README.md" }}),
+                    },
+                    crate::session::SessionEvent {
+                        ts_ms: 4,
+                        kind: "agent_tool".to_string(),
+                        payload: json!({ "name": "glob", "summary": "glob docs", "arguments": { "pattern": "*.md" }}),
+                    },
+                ],
+            );
+            record_session_trajectory(&workspace, &session_path).unwrap();
+        }
+
+        let candidates = list_skill_candidates(&workspace, 10).unwrap();
+        assert!(candidates.is_empty());
 
         cleanup(&workspace);
     }

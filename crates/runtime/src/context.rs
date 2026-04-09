@@ -5,14 +5,15 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::{
-    build_memory_recall_text, pending_model_handoff, render_model_handoff_text, LoadedConfig,
-    PermissionMode, SessionStore,
+    build_file_memory_recall_text, build_memory_recall_text, pending_model_handoff,
+    render_model_handoff_text, LoadedConfig, PermissionMode, SessionStore,
 };
 
 const MAX_INSTRUCTION_CHARS: usize = 8000;
 const MAX_RECENT_HISTORY_EVENTS: usize = 8;
 const MAX_RECENT_HISTORY_CHARS: usize = 2000;
 const MAX_MEMORY_RECALL_CHARS: usize = 1800;
+const MAX_FILE_MEMORY_RECALL_CHARS: usize = 1000;
 const MAX_CONVERSATION_RECALL_LINES: usize = 6;
 const MAX_CONVERSATION_RECALL_CHARS: usize = 1800;
 const MAX_MODEL_HANDOFF_CHARS: usize = 1400;
@@ -21,12 +22,14 @@ const DEFAULT_BUDGETED_INSTRUCTION_CHARS: usize = 4000;
 const DEFAULT_BUDGETED_MODEL_HANDOFF_CHARS: usize = 700;
 const DEFAULT_BUDGETED_RECENT_HISTORY_CHARS: usize = 1200;
 const DEFAULT_BUDGETED_MEMORY_RECALL_CHARS: usize = 1200;
+const DEFAULT_BUDGETED_FILE_MEMORY_RECALL_CHARS: usize = 700;
 const DEFAULT_BUDGETED_CONVERSATION_RECALL_CHARS: usize = 900;
 const COMPACT_PROMPT_CONTEXT_CHARS: usize = 8500;
 const COMPACT_BUDGETED_INSTRUCTION_CHARS: usize = 2200;
 const COMPACT_BUDGETED_MODEL_HANDOFF_CHARS: usize = 550;
 const COMPACT_BUDGETED_RECENT_HISTORY_CHARS: usize = 900;
 const COMPACT_BUDGETED_MEMORY_RECALL_CHARS: usize = 850;
+const COMPACT_BUDGETED_FILE_MEMORY_RECALL_CHARS: usize = 500;
 const COMPACT_BUDGETED_CONVERSATION_RECALL_CHARS: usize = 450;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,7 @@ struct ContextBudgetProfile {
     model_handoff_chars: usize,
     recent_history_chars: usize,
     memory_recall_chars: usize,
+    file_memory_recall_chars: usize,
     conversation_recall_chars: usize,
 }
 
@@ -55,7 +59,9 @@ pub struct WorkspaceContext {
     pub model_handoff: String,
     pub recent_history: String,
     pub memory_recall: String,
+    pub file_memory_recall: String,
     pub conversation_recall: String,
+    pub recall_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,8 +123,12 @@ pub fn gather_workspace_context(
         memory_recall: build_memory_recall_text(workspace_root, 5)
             .map(|text| truncate_text(&text, MAX_MEMORY_RECALL_CHARS))
             .unwrap_or_else(|_| "none".to_string()),
+        file_memory_recall: build_file_memory_recall_text(workspace_root, user_query, 3)
+            .map(|text| truncate_text(&text, MAX_FILE_MEMORY_RECALL_CHARS))
+            .unwrap_or_else(|_| "none".to_string()),
         conversation_recall: build_conversation_recall(config, workspace_root, user_query)
             .unwrap_or_else(|_| "none".to_string()),
+        recall_reason: build_recall_reason(workspace_root, user_query),
     }
 }
 
@@ -133,6 +143,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     let mut model_handoff = context.model_handoff.clone();
     let mut recent_history = context.recent_history.clone();
     let mut memory_recall = context.memory_recall.clone();
+    let mut file_memory_recall = context.file_memory_recall.clone();
     let mut conversation_recall = context.conversation_recall.clone();
 
     let mut out = render_prompt_context_sections(
@@ -141,6 +152,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &model_handoff,
         &recent_history,
         &memory_recall,
+        &file_memory_recall,
         &conversation_recall,
         budget.name,
     );
@@ -155,6 +167,22 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &model_handoff,
         &recent_history,
         &memory_recall,
+        &file_memory_recall,
+        &conversation_recall,
+        budget.name,
+    );
+    if out.chars().count() <= budget.total_chars {
+        return out;
+    }
+
+    file_memory_recall = budget_section(&file_memory_recall, budget.file_memory_recall_chars);
+    out = render_prompt_context_sections(
+        context,
+        &instructions,
+        &model_handoff,
+        &recent_history,
+        &memory_recall,
+        &file_memory_recall,
         &conversation_recall,
         budget.name,
     );
@@ -169,6 +197,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &model_handoff,
         &recent_history,
         &memory_recall,
+        &file_memory_recall,
         &conversation_recall,
         budget.name,
     );
@@ -183,6 +212,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &model_handoff,
         &recent_history,
         &memory_recall,
+        &file_memory_recall,
         &conversation_recall,
         budget.name,
     );
@@ -197,6 +227,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &model_handoff,
         &recent_history,
         &memory_recall,
+        &file_memory_recall,
         &conversation_recall,
         budget.name,
     );
@@ -211,6 +242,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &model_handoff,
         &recent_history,
         &memory_recall,
+        &file_memory_recall,
         &conversation_recall,
         budget.name,
     );
@@ -227,6 +259,7 @@ fn render_prompt_context_sections(
     model_handoff: &str,
     recent_history: &str,
     memory_recall: &str,
+    file_memory_recall: &str,
     conversation_recall: &str,
     budget_profile: &str,
 ) -> String {
@@ -271,6 +304,7 @@ fn render_prompt_context_sections(
         "handoff_boost_active: {}\n",
         context.handoff_boost_active
     ));
+    out.push_str(&format!("recall_reason: {}\n", context.recall_reason));
 
     match &context.git.repo_root {
         Some(repo_root) => {
@@ -310,6 +344,10 @@ fn render_prompt_context_sections(
     out.push_str(memory_recall);
     out.push('\n');
 
+    out.push_str("file_memory_recall:\n");
+    out.push_str(file_memory_recall);
+    out.push('\n');
+
     out.push_str("conversation_recall:\n");
     out.push_str(conversation_recall);
     out.push('\n');
@@ -346,6 +384,7 @@ fn context_budget_profile(model: Option<&str>) -> ContextBudgetProfile {
             model_handoff_chars: COMPACT_BUDGETED_MODEL_HANDOFF_CHARS,
             recent_history_chars: COMPACT_BUDGETED_RECENT_HISTORY_CHARS,
             memory_recall_chars: COMPACT_BUDGETED_MEMORY_RECALL_CHARS,
+            file_memory_recall_chars: COMPACT_BUDGETED_FILE_MEMORY_RECALL_CHARS,
             conversation_recall_chars: COMPACT_BUDGETED_CONVERSATION_RECALL_CHARS,
         };
     }
@@ -357,8 +396,24 @@ fn context_budget_profile(model: Option<&str>) -> ContextBudgetProfile {
         model_handoff_chars: DEFAULT_BUDGETED_MODEL_HANDOFF_CHARS,
         recent_history_chars: DEFAULT_BUDGETED_RECENT_HISTORY_CHARS,
         memory_recall_chars: DEFAULT_BUDGETED_MEMORY_RECALL_CHARS,
+        file_memory_recall_chars: DEFAULT_BUDGETED_FILE_MEMORY_RECALL_CHARS,
         conversation_recall_chars: DEFAULT_BUDGETED_CONVERSATION_RECALL_CHARS,
     }
+}
+
+fn build_recall_reason(workspace_root: &Path, user_query: Option<&str>) -> String {
+    let mut reasons = vec!["active trajectory is always prioritized".to_string()];
+    if let Some(query) = user_query.map(str::trim).filter(|value| !value.is_empty()) {
+        if query.contains('/') || query.contains('.') {
+            reasons.push("query mentions file-like tokens, so file memory was preferred".to_string());
+        } else {
+            reasons.push("query matched prior task and conversation keywords".to_string());
+        }
+    }
+    if workspace_root.join(".harness").join("memory.db").is_file() {
+        reasons.push("SQLite trajectory memory is available".to_string());
+    }
+    reasons.join(" | ")
 }
 
 fn uses_compact_context_budget(model: Option<&str>) -> bool {
@@ -856,6 +911,8 @@ mod tests {
         assert!(rendered.contains("local_lite_recall:"));
         assert!(rendered.contains("[active_trajectory]"));
         assert!(rendered.contains("Goal: continue provider integration"));
+        assert!(rendered.contains("recall_reason:"));
+        assert!(rendered.contains("file_memory_recall:"));
         assert!(rendered.contains("conversation_recall:"));
         assert!(rendered.contains("openrouter fallback"));
 
@@ -890,7 +947,9 @@ mod tests {
             model_handoff: huge.clone(),
             recent_history: huge.clone(),
             memory_recall: huge.clone(),
+            file_memory_recall: huge.clone(),
             conversation_recall: huge,
+            recall_reason: "active trajectory is always prioritized".to_string(),
         };
 
         let rendered = render_prompt_context(&context);
@@ -927,7 +986,9 @@ mod tests {
             model_handoff: huge.clone(),
             recent_history: huge.clone(),
             memory_recall: huge.clone(),
+            file_memory_recall: huge.clone(),
             conversation_recall: huge,
+            recall_reason: "active trajectory is always prioritized".to_string(),
         };
 
         let rendered = render_prompt_context(&context);
