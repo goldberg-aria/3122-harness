@@ -128,6 +128,21 @@ Approval behavior:
 - REPL supports `/approval`, `/approval prompt`, `/approval auto`
 - one-shot `prompt` only fails when a request would have prompted or been denied
 
+Provider connection policy:
+
+- `[providers].default_connection_mode = "api"` is the fixed default
+- `[providers].interactive_connection_mode = "auto"` is the fixed interactive default
+- `api` means use BYOK/API lanes first
+- `auth` means prefer authenticated adapters such as `claude-code/...` and `codex/...`
+- `auto` means prefer API when a configured key/profile exists, otherwise use an auth adapter when the route supports it
+- current route policy:
+  - Claude: `api` and `auth`
+  - OpenAI/Codex: `api` and `auth`
+  - Z.AI: `api` first
+  - MiniMax: `api` first
+  - Groq / Qwen API / other OpenAI-compatible routes: `api` first
+  - Ollama: local API only
+
 Verification behavior:
 
 - default verification policy comes from `[verification].policy`
@@ -171,6 +186,17 @@ Saved provider profiles:
 - manual registration supports presets such as `deepseek`, `dashscope-cn`, `dashscope-intl`, and `siliconflow`
 - saved profiles can be used as `profile/<alias>/<model>`
 
+What to prepare:
+
+- Claude API key if you want the API lane
+- OpenAI API key if you want the API lane
+- Z.AI API key and the base URL you want to standardize on
+- MiniMax API key and the compatibility mode you want to use first
+- Groq and Qwen API keys if you want them in the matrix
+- local Ollama models pulled in advance, at least one Gemma and one Qwen model
+- authenticated CLI login for `claude` and `codex` if you want auth-lane smoke tests
+- short aliases for saved profiles such as `zai`, `minimax`, `groq`, `qwen-api`
+
 Live provider tests:
 
 - `HARNESS_RUN_LIVE_PROVIDER_TESTS=1 cargo test --workspace`
@@ -188,4 +214,4 @@ Live provider tests:
 2. Add stronger REPL-level tests for status and handoff presentation.
 3. Add provider-specific output shaping for external CLI adapters.
 4. Add more explicit memory and handoff debugging commands.
-5. Add deeper verifier adapters for project-specific commands beyond manifest hints.
+5. Teach runtime resolution to honor `api/auth/auto` preferences per route.

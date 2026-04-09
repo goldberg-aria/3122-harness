@@ -11,6 +11,8 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub model: ModelConfig,
     #[serde(default)]
+    pub providers: ProvidersConfig,
+    #[serde(default)]
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub approvals: ApprovalsConfig,
@@ -29,6 +31,12 @@ pub struct ModelConfig {
     pub primary: Option<String>,
     #[serde(default)]
     pub fallback: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProvidersConfig {
+    pub default_connection_mode: Option<String>,
+    pub interactive_connection_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -70,6 +78,24 @@ pub struct LoadedConfig {
 }
 
 impl LoadedConfig {
+    pub fn default_connection_mode(&self) -> ConnectionMode {
+        self.data
+            .providers
+            .default_connection_mode
+            .as_deref()
+            .and_then(ConnectionMode::parse)
+            .unwrap_or(ConnectionMode::Api)
+    }
+
+    pub fn interactive_connection_mode(&self) -> ConnectionMode {
+        self.data
+            .providers
+            .interactive_connection_mode
+            .as_deref()
+            .and_then(ConnectionMode::parse)
+            .unwrap_or(ConnectionMode::Auto)
+    }
+
     pub fn default_permission_mode(&self) -> PermissionMode {
         self.data
             .permissions
@@ -213,6 +239,11 @@ impl LoadedConfig {
                 self.default_verification_policy()
             ),
             format!("primary_model: {}", self.primary_model().unwrap_or("-")),
+            format!("default_connection_mode: {}", self.default_connection_mode()),
+            format!(
+                "interactive_connection_mode: {}",
+                self.interactive_connection_mode()
+            ),
             format!(
                 "session_dir: {}",
                 self.session_dir(workspace_root).display()
@@ -224,6 +255,38 @@ impl LoadedConfig {
             ),
         ]
         .join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionMode {
+    Api,
+    Auth,
+    Auto,
+}
+
+impl ConnectionMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "api" => Some(Self::Api),
+            "auth" => Some(Self::Auth),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Auth => "auth",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -289,7 +352,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{load_config, save_config};
-    use crate::{ApprovalPolicy, PermissionMode, VerificationPolicy};
+    use crate::{ApprovalPolicy, ConnectionMode, PermissionMode, VerificationPolicy};
 
     fn temp_workspace(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -315,6 +378,10 @@ mod tests {
 primary = "ollama/qwen2.5-coder:7b"
 fallback = ["openai/gpt-4.1-mini"]
 
+[providers]
+default_connection_mode = "api"
+interactive_connection_mode = "auto"
+
 [permissions]
 default_mode = "read-only"
 
@@ -332,6 +399,8 @@ directory = ".state/sessions"
 
         let loaded = load_config(&workspace).unwrap();
         assert_eq!(loaded.primary_model(), Some("ollama/qwen2.5-coder:7b"));
+        assert_eq!(loaded.default_connection_mode(), ConnectionMode::Api);
+        assert_eq!(loaded.interactive_connection_mode(), ConnectionMode::Auto);
         assert_eq!(loaded.default_permission_mode(), PermissionMode::ReadOnly);
         assert_eq!(loaded.default_approval_policy(), ApprovalPolicy::Auto);
         assert_eq!(
@@ -359,6 +428,8 @@ directory = ".state/sessions"
             PermissionMode::WorkspaceWrite
         );
         assert_eq!(loaded.default_approval_policy(), ApprovalPolicy::Prompt);
+        assert_eq!(loaded.default_connection_mode(), ConnectionMode::Api);
+        assert_eq!(loaded.interactive_connection_mode(), ConnectionMode::Auto);
         assert_eq!(
             loaded.default_verification_policy(),
             VerificationPolicy::Annotate

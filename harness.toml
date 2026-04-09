@@ -2,6 +2,10 @@
 primary = "anthropic/claude-sonnet-4-6"
 fallback = ["openai/gpt-4.1-mini", "ollama/qwen2.5-coder:7b"]
 
+[providers]
+default_connection_mode = "api"
+interactive_connection_mode = "auto"
+
 [permissions]
 default_mode = "workspace-write"
 

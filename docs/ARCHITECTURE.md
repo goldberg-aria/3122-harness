@@ -140,6 +140,26 @@ Important boundary:
 
 This keeps the design defensible and reduces fragile coupling.
 
+Connection policy:
+
+- the fixed default is `api`
+- interactive sessions default to `auto`
+- `api` is the stable and testable path
+- `auth` is a convenience lane for personal subscribed tools
+- `auto` should resolve in this order:
+  1. use an explicit BYOK profile or API key when present
+  2. fall back to an auth adapter only when the route officially supports it
+  3. otherwise surface a clear setup error
+
+Provider policy for v1:
+
+- Claude: `api` and `auth`
+- OpenAI/Codex: `api` and `auth`
+- Z.AI: `api` first
+- MiniMax: `api` first
+- Groq / Qwen API / other OpenAI-compatible routes: `api` first
+- Ollama: local API only
+
 Saved provider profiles:
 
 - the harness can store reusable BYOK profiles locally

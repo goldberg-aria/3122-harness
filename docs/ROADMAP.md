@@ -44,6 +44,7 @@ This layer should eventually handle:
 - provider-native tool calling when available
 - text tool-call fallback when native tool calling is missing
 - model-specific prompt shaping
+- `api/auth/auto` provider connection selection
 - streaming differences
 - structured output differences
 
