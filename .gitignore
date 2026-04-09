@@ -3,6 +3,7 @@ references/
 *.zip
 .DS_Store
 .harness/providers.json
+.harness/memory.db
 .harness/sessions/
 .harness/memory/
 tmp/

@@ -13,6 +13,7 @@ mod provider;
 mod session;
 mod skills;
 mod tools;
+mod trajectory;
 mod verifier;
 
 use std::env;
@@ -61,6 +62,11 @@ pub use skills::{build_skill_packet, resolve_skill, ResolvedSkill, SkillPacket};
 pub use tools::{
     edit_file, exec_command, glob_search, grep_search, parallel_read_only, read_file, write_file,
     ToolOutput,
+};
+pub use trajectory::{
+    active_trajectory, build_trajectory_recall_text, list_recent_trajectories,
+    list_skill_candidates, memory_db_path, promote_skill_candidate, record_session_trajectory,
+    search_trajectories, SkillCandidate, TrajectoryRecord, TrajectoryStep,
 };
 pub use verifier::{assess_verification, VerificationAssessment, VerificationEvent};
 

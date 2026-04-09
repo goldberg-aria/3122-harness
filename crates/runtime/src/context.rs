@@ -853,7 +853,9 @@ mod tests {
         assert!(rendered.contains("boss rules"));
         assert!(rendered.contains("recent_working_history:"));
         assert!(rendered.contains("continue provider integration"));
-        assert!(rendered.contains("Memory title"));
+        assert!(rendered.contains("local_lite_recall:"));
+        assert!(rendered.contains("[active_trajectory]"));
+        assert!(rendered.contains("Goal: continue provider integration"));
         assert!(rendered.contains("conversation_recall:"));
         assert!(rendered.contains("openrouter fallback"));
 

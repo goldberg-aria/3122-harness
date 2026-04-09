@@ -30,6 +30,7 @@ The core value is a durable local runtime that can:
 - switch models without losing continuity
 - preserve session state
 - preserve memory locally across runs
+- preserve active task trajectories across runs and model switches
 - support tool-driven coding flows
 
 The system should maximize the effective quality of each model by compensating for provider differences inside the harness.
@@ -57,6 +58,31 @@ The harness should encode operational rules that keep weaker models useful and s
 - hooks and plugins
 - full MCP lifecycle management
 - Nexus account login or cloud sync
+
+## Memory spine
+
+Local memory now has two layers:
+
+- JSONL transcripts under `.harness/sessions/`
+- SQLite trajectory memory under `.harness/memory.db`
+
+The transcript is the raw event log.
+The trajectory store is the compressed operational memory used for recall.
+
+Trajectory rows capture:
+
+- current goal
+- active model and previous model
+- active files
+- latest attempt
+- latest failure
+- last verification
+- next step
+
+This is the main continuity layer for `/resume`, `/handoff`, `/why-context`, and post-switch handoff boost.
+
+The same store also tracks repeated tool sequences as `skill_candidates`.
+Candidates are suggested first and only become reusable slash commands when promoted.
 
 ## Core loop
 

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::SessionEvent;
 use crate::SessionStore;
+use crate::{active_trajectory, build_trajectory_recall_text, record_session_trajectory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryKind {
@@ -82,6 +83,14 @@ pub struct ModelHandoffSnapshot {
     pub to_model: String,
     pub current_goal: String,
     pub recent_work_summary: String,
+    #[serde(default)]
+    pub active_files: Vec<String>,
+    #[serde(default)]
+    pub latest_attempt: Option<String>,
+    #[serde(default)]
+    pub latest_failure: Option<String>,
+    #[serde(default)]
+    pub last_verification: Option<String>,
     #[serde(default)]
     pub open_tasks: Vec<String>,
     #[serde(default)]
@@ -205,6 +214,7 @@ pub fn save_session_memory_bundle(
     session_path: &Path,
 ) -> Result<SavedMemoryBundle, String> {
     let events = SessionStore::read_events(session_path)?;
+    let _ = record_session_trajectory(workspace_root, session_path);
     let digest = summarize_session_events(&events);
     let existing = list_memory_records(workspace_root)?;
     let session_path_rendered = session_path.display().to_string();
@@ -269,6 +279,10 @@ pub fn save_session_memory_bundle(
 
 pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
     let latest_session = SessionStore::latest(workspace_root)?;
+    if let Some(path) = latest_session.as_deref() {
+        let _ = record_session_trajectory(workspace_root, path);
+    }
+    let active_trajectory = active_trajectory(workspace_root)?;
     let latest_digest = latest_session
         .as_deref()
         .map(SessionStore::read_events)
@@ -292,6 +306,9 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "-".to_string())
     ));
+    if let Some(trajectory) = active_trajectory.as_ref() {
+        out.push_str(&format!("trajectory: {}\n", trajectory.title));
+    }
     if let Some(handoff) = latest_handoff {
         out.push_str(&format!("active_model: {}\n", handoff.snapshot.to_model));
         if let Some(previous) = handoff.snapshot.from_model.as_deref() {
@@ -301,10 +318,46 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
             "current_goal: {}\n",
             handoff.snapshot.current_goal
         ));
+        if !handoff.snapshot.active_files.is_empty() {
+            out.push_str(&format!(
+                "active_files: {}\n",
+                handoff.snapshot.active_files.join(", ")
+            ));
+        }
+        if let Some(attempt) = handoff.snapshot.latest_attempt.as_deref() {
+            out.push_str(&format!("latest_attempt: {attempt}\n"));
+        }
+        if let Some(failure) = handoff.snapshot.latest_failure.as_deref() {
+            out.push_str(&format!("latest_failure: {failure}\n"));
+        }
+        if let Some(verification) = handoff.snapshot.last_verification.as_deref() {
+            out.push_str(&format!("last_verification: {verification}\n"));
+        }
         out.push_str(&format!(
             "next_step: {}\n",
             handoff.snapshot.suggested_next_step
         ));
+    } else if let Some(trajectory) = active_trajectory.as_ref() {
+        if let Some(model) = trajectory.active_model.as_deref() {
+            out.push_str(&format!("active_model: {model}\n"));
+        }
+        out.push_str(&format!("current_goal: {}\n", trajectory.current_goal));
+        if !trajectory.active_files.is_empty() {
+            out.push_str(&format!(
+                "active_files: {}\n",
+                trajectory.active_files.join(", ")
+            ));
+        }
+        if let Some(attempt) = trajectory.latest_attempt.as_deref() {
+            out.push_str(&format!("latest_attempt: {attempt}\n"));
+        }
+        if let Some(failure) = trajectory.latest_failure.as_deref() {
+            out.push_str(&format!("latest_failure: {failure}\n"));
+        }
+        if let Some(verification) = trajectory.last_verification.as_deref() {
+            out.push_str(&format!("last_verification: {verification}\n"));
+        }
+        out.push_str(&format!("next_step: {}\n", trajectory.next_step));
     }
     if let Some(digest) = latest_digest.as_ref() {
         out.push_str(&format!("latest_summary: {}\n", digest.title));
@@ -348,6 +401,10 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
 
 pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
     let latest_session = SessionStore::latest(workspace_root)?;
+    if let Some(path) = latest_session.as_deref() {
+        let _ = record_session_trajectory(workspace_root, path);
+    }
+    let active_trajectory = active_trajectory(workspace_root)?;
     let latest_digest = latest_session
         .as_deref()
         .map(SessionStore::read_events)
@@ -366,6 +423,16 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
     out.push_str("Handoff\n\n");
     if let Some(path) = latest_session {
         out.push_str(&format!("Latest session: {}\n\n", path.display()));
+    }
+    if let Some(trajectory) = active_trajectory.as_ref() {
+        out.push_str(&format!("Trajectory: {}\n", trajectory.title));
+        if let Some(model) = trajectory.active_model.as_deref() {
+            out.push_str(&format!("Active model: {model}\n"));
+        }
+        if !trajectory.active_files.is_empty() {
+            out.push_str(&format!("Active files: {}\n", trajectory.active_files.join(", ")));
+        }
+        out.push('\n');
     }
     if let Some(handoff) = latest_handoff {
         let merged = merge_handoff_with_digest(&handoff.snapshot, latest_digest.as_ref());
@@ -396,6 +463,14 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
 }
 
 pub fn build_memory_recall_text(workspace_root: &Path, limit: usize) -> Result<String, String> {
+    if let Some(path) = SessionStore::latest(workspace_root)? {
+        let _ = record_session_trajectory(workspace_root, &path);
+    }
+    if let Ok(text) = build_trajectory_recall_text(workspace_root, limit) {
+        if text.trim() != "none" {
+            return Ok(text);
+        }
+    }
     let records = list_memory_records(workspace_root)?;
     if records.is_empty() {
         return Ok("none".to_string());
@@ -431,6 +506,7 @@ pub fn build_model_handoff_snapshot(
     let events = SessionStore::read_events(session_path)?;
     let digest = summarize_session_events(&events);
     let records = list_memory_records(workspace_root)?;
+    let active_trajectory = active_trajectory(workspace_root)?;
 
     let latest_summary = records
         .iter()
@@ -465,11 +541,49 @@ pub fn build_model_handoff_snapshot(
     Ok(ModelHandoffSnapshot {
         from_model: from_model.map(ToOwned::to_owned),
         to_model: to_model.to_string(),
-        current_goal,
-        recent_work_summary,
-        open_tasks,
-        recent_errors,
-        suggested_next_step,
+        current_goal: active_trajectory
+            .as_ref()
+            .map(|trajectory| trajectory.current_goal.clone())
+            .unwrap_or(current_goal),
+        recent_work_summary: active_trajectory
+            .as_ref()
+            .map(|trajectory| trajectory.recent_work_summary.clone())
+            .unwrap_or(recent_work_summary),
+        active_files: active_trajectory
+            .as_ref()
+            .map(|trajectory| trajectory.active_files.clone())
+            .unwrap_or_default(),
+        latest_attempt: active_trajectory
+            .as_ref()
+            .and_then(|trajectory| trajectory.latest_attempt.clone()),
+        latest_failure: active_trajectory
+            .as_ref()
+            .and_then(|trajectory| trajectory.latest_failure.clone()),
+        last_verification: active_trajectory
+            .as_ref()
+            .and_then(|trajectory| trajectory.last_verification.clone()),
+        open_tasks: if let Some(trajectory) = active_trajectory.as_ref() {
+            if trajectory.open_tasks.is_empty() {
+                open_tasks
+            } else {
+                trajectory.open_tasks.clone()
+            }
+        } else {
+            open_tasks
+        },
+        recent_errors: if let Some(trajectory) = active_trajectory.as_ref() {
+            if trajectory.recent_errors.is_empty() {
+                recent_errors
+            } else {
+                trajectory.recent_errors.clone()
+            }
+        } else {
+            recent_errors
+        },
+        suggested_next_step: active_trajectory
+            .as_ref()
+            .map(|trajectory| trajectory.next_step.clone())
+            .unwrap_or(suggested_next_step),
         session_path: Some(session_path.display().to_string()),
     })
 }
@@ -524,6 +638,29 @@ pub fn render_model_handoff_text(snapshot: &ModelHandoffSnapshot) -> String {
     out.push_str("\n\nDone recently:\n");
     out.push_str(&snapshot.recent_work_summary);
     out.push('\n');
+    if !snapshot.active_files.is_empty() {
+        out.push_str("\nActive files:\n");
+        for path in &snapshot.active_files {
+            out.push_str("- ");
+            out.push_str(path);
+            out.push('\n');
+        }
+    }
+    if let Some(attempt) = snapshot.latest_attempt.as_deref() {
+        out.push_str("\nLatest attempt:\n");
+        out.push_str(attempt);
+        out.push('\n');
+    }
+    if let Some(failure) = snapshot.latest_failure.as_deref() {
+        out.push_str("\nLatest failure:\n");
+        out.push_str(failure);
+        out.push('\n');
+    }
+    if let Some(verification) = snapshot.last_verification.as_deref() {
+        out.push_str("\nLast verification:\n");
+        out.push_str(verification);
+        out.push('\n');
+    }
     if !snapshot.open_tasks.is_empty() {
         out.push_str("\nOpen tasks:\n");
         for task in &snapshot.open_tasks {

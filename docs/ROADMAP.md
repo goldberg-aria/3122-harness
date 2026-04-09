@@ -17,6 +17,7 @@ The product advantage is:
 - model independence
 - durable local memory
 - safe tool execution
+- trajectory continuity across model switches
 
 ## Core strategy
 
@@ -58,6 +59,7 @@ It should not require signup.
 - memory is stored in the project locally
 - recall is done with simple local indexing and `rg`-style search
 - the user can change models without losing working context
+- active work is compressed into trajectories that survive model switches
 
 This is the v1 memory spine.
 
@@ -83,6 +85,7 @@ Included:
 - `api/auth/auto` provider connection policy with API-first defaults
 - Local-Lite memory stored under `.harness/`
 - session replay and recall
+- SQLite trajectory memory and repeated workflow candidates
 
 Excluded:
 
@@ -103,10 +106,13 @@ Goal:
 Deliverables:
 
 - `.harness/memory/` layout
+- `.harness/memory.db` trajectory store
 - memory record schema
 - save/search/list/prune operations
 - `rg`-based recall
 - session summary promotion into memory
+- trajectory compression and FTS search
+- skill candidate detection and promotion
 
 Suggested files:
 

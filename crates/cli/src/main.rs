@@ -11,19 +11,21 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use runtime::{
-    backend_catalog, blueprint_summary, build_handoff_text, build_memory_recall_text,
-    build_model_handoff_snapshot, build_resume_text, call_mcp_tool, create_slash_command_template,
-    detect_provider_key, discover_mcp_servers, discover_skills, discover_slash_commands,
-    doctor_report, edit_file, exec_command, expand_slash_command, gather_workspace_context,
-    glob_search, grep_search, init_slash_command_dir, latest_model_handoff, list_mcp_tools,
-    list_memory_records, load_config, load_provider_registry, parallel_read_only,
+    active_trajectory, backend_catalog, blueprint_summary, build_handoff_text,
+    build_memory_recall_text, build_model_handoff_snapshot, build_resume_text, call_mcp_tool,
+    create_slash_command_template, detect_provider_key, discover_mcp_servers, discover_skills,
+    discover_slash_commands, doctor_report, edit_file, exec_command, expand_slash_command,
+    gather_workspace_context, glob_search, grep_search, init_slash_command_dir,
+    latest_model_handoff, list_mcp_tools, list_memory_records, list_recent_trajectories,
+    list_skill_candidates, load_config, load_provider_registry, parallel_read_only,
     pending_model_handoff, provider_preset, provider_presets, read_file, remove_provider_profile,
-    render_prompt_context, resolve_skill, resolve_slash_command, run_agent_loop, save_config,
-    save_session_memory_bundle, search_memory_records, slash_command_dir, upsert_provider_profile,
+    promote_skill_candidate, record_session_trajectory, render_prompt_context, resolve_skill,
+    resolve_slash_command, run_agent_loop, save_config, save_session_memory_bundle,
+    search_memory_records, search_trajectories, slash_command_dir, upsert_provider_profile,
     validate_slash_command_args, write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy,
     ApprovalRequest, ConnectionMode, LoadedConfig, MemoryRecord, ModelHandoffSnapshot,
-    PermissionMode, SavedProviderProfile, SessionStore, SlashCommandKind, SlashCommandScope,
-    ToolOutput, VerificationPolicy,
+    PermissionMode, SavedProviderProfile, SessionStore, SlashCommandKind,
+    SlashCommandScope, ToolOutput, TrajectoryRecord, VerificationPolicy,
 };
 use serde_json::json;
 
@@ -58,6 +60,9 @@ fn main() {
         }
         Some("memory") => {
             handle_memory_command(&workspace, &config, &args[1..]);
+        }
+        Some("trajectory") => {
+            handle_trajectory_command(&workspace, &args[1..]);
         }
         Some("commands") => {
             handle_commands_command(&workspace, &args[1..]);
@@ -612,13 +617,14 @@ fn core_slash_suggestions() -> Vec<SlashSuggestion> {
         ("handoff", "Print the latest handoff block"),
         ("why-context", "Show the current prompt context"),
         ("memory", "List, recall, search, or save local memory"),
+        ("trajectory", "Inspect active and recent trajectories"),
         ("commands", "List custom slash commands"),
         ("login", "Show provider setup hints"),
         ("mode", "Show or set permission mode"),
         ("approval", "Show or set approval policy"),
         ("doctor", "Inspect local environment"),
         ("providers", "List saved providers"),
-        ("skills", "List discovered skills"),
+        ("skills", "List skills, suggestions, and promotion"),
         ("mcp", "List discovered MCP servers"),
         ("session", "Show latest session path"),
         ("parallel-read", "Run read/grep/glob in one batch"),
@@ -793,6 +799,10 @@ fn process_repl_input_tui(
             ui.push_result(render_memory_list_text(workspace));
             return ReplDirective::Continue;
         }
+        "/trajectory" => {
+            ui.push_result(render_trajectory_list_text(workspace, 6));
+            return ReplDirective::Continue;
+        }
         "/commands" => {
             ui.push_block(&render_slash_commands_text(workspace));
             return ReplDirective::Continue;
@@ -924,6 +934,32 @@ fn process_repl_input_tui(
     }
     if let Some(query) = trimmed.strip_prefix("/memory search ").map(str::trim) {
         ui.push_result(render_memory_search_text(workspace, query));
+        return ReplDirective::Continue;
+    }
+    if trimmed == "/trajectory active" {
+        ui.push_result(render_active_trajectory_text(workspace));
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/trajectory show ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => ui.push_result(render_trajectory_show_text(workspace, index)),
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(query) = trimmed.strip_prefix("/trajectory search ").map(str::trim) {
+        ui.push_result(render_trajectory_search_text(workspace, query));
+        return ReplDirective::Continue;
+    }
+    if trimmed == "/skills suggest" {
+        ui.push_result(render_skill_candidates_text(workspace, 8));
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/skills promote ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => ui.push_result(run_skill_candidate_promotion_text(workspace, index)),
+            Err(err) => ui.push_error(err),
+        }
         return ReplDirective::Continue;
     }
     if let Some(name) = trimmed.strip_prefix("/commands show ").map(str::trim) {
@@ -1082,6 +1118,10 @@ fn handle_repl_line(
             print_memory_list(workspace);
             return ReplDirective::Continue;
         }
+        "/trajectory" => {
+            print_trajectory_list(workspace, 6);
+            return ReplDirective::Continue;
+        }
         "/commands" => {
             print_slash_commands(workspace);
             return ReplDirective::Continue;
@@ -1194,6 +1234,32 @@ fn handle_repl_line(
         print_memory_search(workspace, query);
         return ReplDirective::Continue;
     }
+    if trimmed == "/trajectory active" {
+        print_active_trajectory(workspace);
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/trajectory show ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => print_trajectory_show(workspace, index),
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(query) = trimmed.strip_prefix("/trajectory search ").map(str::trim) {
+        print_trajectory_search(workspace, query);
+        return ReplDirective::Continue;
+    }
+    if trimmed == "/skills suggest" {
+        print_skill_candidates(workspace, 8);
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/skills promote ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => run_skill_candidate_promotion(workspace, index),
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
     if let Some(name) = trimmed.strip_prefix("/commands show ").map(str::trim) {
         print_slash_command_show(workspace, name);
         return ReplDirective::Continue;
@@ -1300,8 +1366,11 @@ fn render_repl_help_text() -> String {
         "/handoff debug inspect the latest handoff state",
         "/why-context show the current prompt context",
         "/memory     list/search/save local memory",
+        "/trajectory inspect active and recent trajectories",
         "/memory show inspect one recent memory record",
         "/memory recall print rendered recall text",
+        "/skills suggest list repeated workflow candidates",
+        "/skills promote create a prompt-template from a candidate",
         "/commands   list custom slash commands",
         "/commands show inspect one custom slash command",
         "/commands init create a commands directory",
@@ -1677,7 +1746,7 @@ fn render_init_text(
             lines.push(format!("- {entry}"));
         }
     }
-    lines.push("tips: /model, /memory, /commands, /why-context".to_string());
+    lines.push("tips: /model, /trajectory, /memory, /commands".to_string());
     Ok(lines.join("\n"))
 }
 
@@ -1704,6 +1773,138 @@ fn render_memory_list_text(workspace: &Path) -> Result<String, String> {
     }
     lines.push("hint: use `memory show <index>` or `memory recall [limit]`".to_string());
     Ok(lines.join("\n"))
+}
+
+fn render_trajectory_list_text(workspace: &Path, limit: usize) -> Result<String, String> {
+    let trajectories = list_recent_trajectories(workspace, limit)?;
+    if trajectories.is_empty() {
+        return Ok("no trajectories recorded".to_string());
+    }
+    let mut lines = vec![format!("trajectories: {}", trajectories.len())];
+    for (index, trajectory) in trajectories.into_iter().enumerate() {
+        lines.push(format!(
+            "- #{} | {} | goal={} | next={}",
+            index + 1,
+            trajectory.title,
+            compact_line(&trajectory.current_goal, 56),
+            compact_line(&trajectory.next_step, 56)
+        ));
+    }
+    lines.push("hint: use `trajectory active`, `trajectory show <index>`, or `trajectory search <query>`".to_string());
+    Ok(lines.join("\n"))
+}
+
+fn render_active_trajectory_text(workspace: &Path) -> Result<String, String> {
+    match active_trajectory(workspace)? {
+        Some(trajectory) => Ok(render_trajectory_detail(&trajectory)),
+        None => Ok("no active trajectory".to_string()),
+    }
+}
+
+fn render_trajectory_show_text(workspace: &Path, index: usize) -> Result<String, String> {
+    let trajectories = list_recent_trajectories(workspace, index)?;
+    let Some(trajectory) = trajectories.get(index.saturating_sub(1)) else {
+        return Err(format!("trajectory index out of range: {index}"));
+    };
+    Ok(render_trajectory_detail(trajectory))
+}
+
+fn render_trajectory_search_text(workspace: &Path, query: &str) -> Result<String, String> {
+    let results = search_trajectories(workspace, query, 6)?;
+    if results.is_empty() {
+        return Ok("no trajectory matches".to_string());
+    }
+    let mut lines = vec![format!("trajectory_matches: {}", results.len())];
+    for (index, trajectory) in results.into_iter().enumerate() {
+        lines.push(format!(
+            "- #{} | {} | goal={} | next={}",
+            index + 1,
+            trajectory.title,
+            compact_line(&trajectory.current_goal, 52),
+            compact_line(&trajectory.next_step, 52)
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_trajectory_detail(trajectory: &TrajectoryRecord) -> String {
+    let mut lines = vec![
+        format!("title: {}", trajectory.title),
+        format!("session: {}", trajectory.session_path),
+        format!("goal: {}", trajectory.current_goal),
+        format!("next: {}", trajectory.next_step),
+    ];
+    if let Some(model) = trajectory.active_model.as_deref() {
+        lines.push(format!("active_model: {model}"));
+    }
+    if let Some(previous) = trajectory.previous_model.as_deref() {
+        lines.push(format!("previous_model: {previous}"));
+    }
+    if !trajectory.active_files.is_empty() {
+        lines.push(format!("active_files: {}", trajectory.active_files.join(", ")));
+    }
+    if let Some(attempt) = trajectory.latest_attempt.as_deref() {
+        lines.push(format!("latest_attempt: {attempt}"));
+    }
+    if let Some(failure) = trajectory.latest_failure.as_deref() {
+        lines.push(format!("latest_failure: {failure}"));
+    }
+    if let Some(verification) = trajectory.last_verification.as_deref() {
+        lines.push(format!("last_verification: {verification}"));
+    }
+    if !trajectory.open_tasks.is_empty() {
+        lines.push("open_tasks:".to_string());
+        for item in &trajectory.open_tasks {
+            lines.push(format!("- {item}"));
+        }
+    }
+    if !trajectory.recent_errors.is_empty() {
+        lines.push("recent_errors:".to_string());
+        for item in &trajectory.recent_errors {
+            lines.push(format!("- {item}"));
+        }
+    }
+    if !trajectory.verification_hints.is_empty() {
+        lines.push("verification_hints:".to_string());
+        for item in &trajectory.verification_hints {
+            lines.push(format!("- {item}"));
+        }
+    }
+    lines.push("recent_summary:".to_string());
+    lines.push(trajectory.recent_work_summary.clone());
+    lines.join("\n")
+}
+
+fn render_skill_candidates_text(workspace: &Path, limit: usize) -> Result<String, String> {
+    let candidates = list_skill_candidates(workspace, limit)?;
+    if candidates.is_empty() {
+        return Ok("no promoted skill candidates yet".to_string());
+    }
+    let mut lines = vec![format!("skill_candidates: {}", candidates.len())];
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        lines.push(format!(
+            "- #{} | /{} | uses={} | {}",
+            index + 1,
+            candidate.command_name,
+            candidate.occurrence_count,
+            compact_line(&candidate.description, 72)
+        ));
+    }
+    lines.push("hint: use `skills promote <index>` to create a prompt-template command".to_string());
+    Ok(lines.join("\n"))
+}
+
+fn run_skill_candidate_promotion_text(workspace: &Path, index: usize) -> Result<String, String> {
+    let candidates = list_skill_candidates(workspace, index)?;
+    let Some(candidate) = candidates.get(index.saturating_sub(1)) else {
+        return Err(format!("skill candidate index out of range: {index}"));
+    };
+    let path = promote_skill_candidate(workspace, candidate.id)?;
+    Ok(format!(
+        "promoted skill candidate\nname: /{}\npath: {}",
+        candidate.command_name,
+        path.display()
+    ))
 }
 
 fn render_memory_show_text(workspace: &Path, index: usize) -> Result<String, String> {
@@ -2326,8 +2527,11 @@ fn print_repl_help() {
     println!("/handoff debug inspect the latest handoff state");
     println!("/why-context show the current prompt context");
     println!("/memory     list/search/save local memory");
+    println!("/trajectory inspect active and recent trajectories");
     println!("/memory show inspect one recent memory record");
     println!("/memory recall print rendered recall text");
+    println!("/skills suggest list repeated workflow candidates");
+    println!("/skills promote create a prompt-template from a candidate");
     println!("/commands   list custom slash commands");
     println!("/commands show inspect one custom slash command");
     println!("/commands init create a commands directory");
@@ -2568,6 +2772,48 @@ fn print_memory_list(workspace: &Path) {
             }
             println!("hint: use `memory show <index>` or `memory recall [limit]`");
         }
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_trajectory_list(workspace: &Path, limit: usize) {
+    match render_trajectory_list_text(workspace, limit) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_active_trajectory(workspace: &Path) {
+    match render_active_trajectory_text(workspace) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_trajectory_show(workspace: &Path, index: usize) {
+    match render_trajectory_show_text(workspace, index) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_trajectory_search(workspace: &Path, query: &str) {
+    match render_trajectory_search_text(workspace, query) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_skill_candidates(workspace: &Path, limit: usize) {
+    match render_skill_candidates_text(workspace, limit) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn run_skill_candidate_promotion(workspace: &Path, index: usize) {
+    match run_skill_candidate_promotion_text(workspace, index) {
+        Ok(text) => println!("{text}"),
         Err(err) => eprintln!("{err}"),
     }
 }
@@ -3345,6 +3591,20 @@ fn handle_skills_command(workspace: &Path, config: &LoadedConfig, args: &[String
     match args.first().map(String::as_str) {
         None | Some("list") => print_skills(workspace, config, false),
         Some("all") => print_skills(workspace, config, true),
+        Some("suggest") => print_skill_candidates(workspace, 8),
+        Some("promote") => {
+            let Some(index) = args.get(1) else {
+                eprintln!("usage: {} skills promote <index>", APP_NAME);
+                std::process::exit(2);
+            };
+            match parse_positive_index(index) {
+                Ok(index) => run_skill_candidate_promotion(workspace, index),
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("show") => {
             let Some(name) = args.get(1) else {
                 eprintln!("usage: {} skills show <name>", APP_NAME);
@@ -3366,6 +3626,41 @@ fn handle_skills_command(workspace: &Path, config: &LoadedConfig, args: &[String
         }
         Some(other) => {
             eprintln!("unknown skills command: {other}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn handle_trajectory_command(workspace: &Path, args: &[String]) {
+    let _ = SessionStore::latest(workspace)
+        .ok()
+        .flatten()
+        .map(|path| record_session_trajectory(workspace, &path));
+    match args.first().map(String::as_str) {
+        None | Some("list") => print_trajectory_list(workspace, 8),
+        Some("active") => print_active_trajectory(workspace),
+        Some("show") => {
+            let Some(index) = args.get(1) else {
+                eprintln!("usage: {} trajectory show <index>", APP_NAME);
+                std::process::exit(2);
+            };
+            match parse_positive_index(index) {
+                Ok(index) => print_trajectory_show(workspace, index),
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("search") => {
+            let Some(_query) = args.get(1) else {
+                eprintln!("usage: {} trajectory search <query>", APP_NAME);
+                std::process::exit(2);
+            };
+            print_trajectory_search(workspace, &args[1..].join(" "));
+        }
+        Some(other) => {
+            eprintln!("unknown trajectory command: {other}");
             std::process::exit(2);
         }
     }
@@ -3995,6 +4290,7 @@ fn print_help() {
     println!("  config      show resolved config");
     println!("  model       show or set default model config");
     println!("  memory      list/show/search/recall/save local memory");
+    println!("  trajectory  list/show/search active trajectories");
     println!("  commands    list/show custom slash commands");
     println!("  resume      show latest session resume summary");
     println!("  handoff     show or debug the latest handoff block");

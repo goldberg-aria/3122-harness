@@ -40,6 +40,7 @@ This repository currently contains:
 - provider clients for Anthropic BYOK, OpenAI-compatible BYOK, and Ollama
 - external adapter clients for `claude` and `codex`
 - JSONL session files under `.harness/sessions/`
+- SQLite-backed trajectory memory under `.harness/memory.db`
 - built-in tool surfaces for `read`, `write`, `edit`, `grep`, `glob`, and `exec`
 - skill discovery across project and user skill folders
 - skill resolution and prompt-packet generation through `skills show/run` and `/skill`
@@ -55,6 +56,8 @@ This repository currently contains:
 - a dedicated verifier module for task-aware verification that requires checks after the last code mutation while exempting docs-only edits
 - project-aware verifier suggestions that inspect workspace manifests such as `Cargo.toml`
 - automatic model-switch handoff snapshots with first-turn context boost
+- trajectory indexing that compresses work into goal, attempt, failure, verification, and next-step state
+- repeated workflow detection with promotable skill candidates
 - runtime unit tests covering config, permissions, providers, skills, MCP, the harness loop, and verifier behavior
 - env-gated live provider tests for Anthropic, OpenAI-compatible, and Ollama
 - more readable CLI status, memory, approval, and verification feedback
@@ -79,6 +82,9 @@ cargo run -p cli -- memory show 1
 cargo run -p cli -- memory recall 6
 cargo run -p cli -- memory save
 cargo run -p cli -- memory search provider
+cargo run -p cli -- trajectory
+cargo run -p cli -- trajectory active
+cargo run -p cli -- trajectory search provider
 cargo run -p cli -- resume
 cargo run -p cli -- handoff
 cargo run -p cli -- handoff debug
@@ -98,6 +104,8 @@ cargo run -p cli -- providers sync-env
 cargo run -p cli -- providers saved
 cargo run -p cli -- blueprint
 cargo run -p cli -- skills
+cargo run -p cli -- skills suggest
+cargo run -p cli -- skills promote 1
 cargo run -p cli -- skills show project-bootstrap
 cargo run -p cli -- skills run project-bootstrap "start the first runtime slice"
 cargo run -p cli -- mcp
@@ -175,6 +183,7 @@ REPL shape:
 - the input line stays pinned to the bottom of the terminal
 - typing `/` shows matching slash commands above the input line
 - primary session commands are `/status`, `/model`, `/login`, `/memory`, `/resume`, `/handoff`, `/why-context`, `/approval`, `/doctor`
+- trajectory commands are `/trajectory`, `/trajectory active`, `/trajectory show <index>`, `/trajectory search <query>`
 - custom slash commands are loaded from `~/.harness/commands/*.toml` and `.harness/commands/*.toml`
 - built-in shortcut commands are always available first, then `global`, then `workspace`
 - workspace commands override global commands with the same name
@@ -221,6 +230,10 @@ Template placeholders:
 Local-Lite memory:
 
 - `memory save` promotes the latest session into local memory
+- trajectory state is stored in `.harness/memory.db`
+- `trajectory` lists recent compressed work trajectories
+- `trajectory active` shows the current active trajectory with files, failure, and verification hints
+- `trajectory search <query>` runs local FTS search across stored trajectories
 - `memory` lists recent memory records
 - `memory show <index>` prints one saved memory record with tags and source session
 - `memory recall [limit]` prints the exact recall block the harness would inject
@@ -230,6 +243,7 @@ Local-Lite memory:
 - `why-context` prints the exact runtime context injected before a model turn
 - REPL exit autosaves new local memory records for the current session
 - prompt context now includes recent working history, Local-Lite memory recall, and relevant conversation recall from older sessions
+- Local-Lite recall now prioritizes the active trajectory over older free-form memory records
 - the first prompt after `/model <spec>` gets a temporary handoff boost in prompt context
 - prompt context is budgeted so long sessions degrade conversation recall first, then memory, recent history, and finally instructions
 - `/status` shows approval and verification behavior alongside provider and memory state
@@ -239,6 +253,9 @@ Skill summaries:
 
 - discovered skills now expose a routing-friendly summary capped to about 250 characters
 - frontmatter `description:` is preferred when present
+- repeated tool workflows are tracked as skill candidates
+- `skills suggest` lists candidates with repeated occurrence counts
+- `skills promote <index>` turns a candidate into a prompt-template slash command in `.harness/commands/`
 
 Saved provider profiles:
 
