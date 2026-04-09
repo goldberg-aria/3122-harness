@@ -42,7 +42,10 @@ impl VerificationAssessment {
     }
 }
 
-pub fn assess_verification(events: &[VerificationEvent]) -> VerificationAssessment {
+pub fn assess_verification(
+    workspace_root: &Path,
+    events: &[VerificationEvent],
+) -> VerificationAssessment {
     let mutation_events = events
         .iter()
         .filter(|event| event_mutates_workspace(event))
@@ -62,7 +65,7 @@ pub fn assess_verification(events: &[VerificationEvent]) -> VerificationAssessme
         requires_verification: true,
         has_verification_after_last_mutation: has_verification_after_last_mutation(events),
         reason: Some(verification_reason(&mutation_events)),
-        suggestions: verification_suggestions(&mutation_events),
+        suggestions: verification_suggestions(workspace_root, &mutation_events),
     }
 }
 
@@ -165,11 +168,12 @@ fn verification_reason(events: &[&VerificationEvent]) -> String {
     format!("no verification step was recorded after changes to {joined}")
 }
 
-fn verification_suggestions(events: &[&VerificationEvent]) -> Vec<String> {
+fn verification_suggestions(workspace_root: &Path, events: &[&VerificationEvent]) -> Vec<String> {
     let mut rust = false;
     let mut node = false;
     let mut python = false;
     let mut go = false;
+    let mut ruby = false;
 
     for path in events
         .iter()
@@ -180,27 +184,83 @@ fn verification_suggestions(events: &[&VerificationEvent]) -> Vec<String> {
             Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") => node = true,
             Some("py") => python = true,
             Some("go") => go = true,
+            Some("rb") => ruby = true,
             _ => {}
         }
     }
 
+    let mut suggestions = project_verification_suggestions(workspace_root);
+
     if rust {
-        return vec![
-            "cargo test --workspace".to_string(),
-            "cargo check --workspace".to_string(),
-        ];
+        push_unique(&mut suggestions, "cargo test --workspace");
+        push_unique(&mut suggestions, "cargo check --workspace");
     }
     if node {
-        return vec!["npm test".to_string(), "npm run build".to_string()];
+        push_unique(&mut suggestions, "npm test");
+        push_unique(&mut suggestions, "npm run build");
     }
     if python {
-        return vec!["pytest".to_string()];
+        push_unique(&mut suggestions, "pytest");
     }
     if go {
-        return vec!["go test ./...".to_string()];
+        push_unique(&mut suggestions, "go test ./...");
+    }
+    if ruby {
+        push_unique(&mut suggestions, "bundle exec rspec");
+        push_unique(&mut suggestions, "bin/rails test");
+    }
+    if suggestions.is_empty() {
+        suggestions.push("run at least one relevant test, build, or check command".to_string());
     }
 
-    vec!["run at least one relevant test, build, or check command".to_string()]
+    suggestions
+}
+
+fn project_verification_suggestions(workspace_root: &Path) -> Vec<String> {
+    let mut suggestions = Vec::new();
+
+    if workspace_root.join("Cargo.toml").is_file() {
+        push_unique(&mut suggestions, "cargo test --workspace");
+        push_unique(&mut suggestions, "cargo check --workspace");
+        push_unique(&mut suggestions, "cargo build --workspace");
+    }
+
+    if workspace_root.join("package.json").is_file() {
+        if workspace_root.join("pnpm-lock.yaml").is_file() {
+            push_unique(&mut suggestions, "pnpm test");
+            push_unique(&mut suggestions, "pnpm build");
+        } else if workspace_root.join("yarn.lock").is_file() {
+            push_unique(&mut suggestions, "yarn test");
+            push_unique(&mut suggestions, "yarn build");
+        } else {
+            push_unique(&mut suggestions, "npm test");
+            push_unique(&mut suggestions, "npm run build");
+        }
+    }
+
+    if workspace_root.join("pyproject.toml").is_file()
+        || workspace_root.join("pytest.ini").is_file()
+        || workspace_root.join("requirements.txt").is_file()
+    {
+        push_unique(&mut suggestions, "pytest");
+    }
+
+    if workspace_root.join("go.mod").is_file() {
+        push_unique(&mut suggestions, "go test ./...");
+    }
+
+    if workspace_root.join("Gemfile").is_file() {
+        push_unique(&mut suggestions, "bundle exec rspec");
+        push_unique(&mut suggestions, "bin/rails test");
+    }
+
+    suggestions
+}
+
+fn push_unique(suggestions: &mut Vec<String>, value: &str) {
+    if !suggestions.iter().any(|existing| existing == value) {
+        suggestions.push(value.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -208,30 +268,77 @@ mod tests {
     use serde_json::json;
 
     use super::{assess_verification, VerificationEvent};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_workspace(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = fs::remove_dir_all(path);
+    }
 
     #[test]
     fn docs_only_changes_do_not_require_verification() {
-        let assessment = assess_verification(&[VerificationEvent {
-            name: "write".to_string(),
-            arguments: json!({ "path": "docs/ROADMAP.md" }),
-        }]);
+        let workspace = temp_workspace("verifier-docs-only");
+        let assessment = assess_verification(
+            &workspace,
+            &[VerificationEvent {
+                name: "write".to_string(),
+                arguments: json!({ "path": "docs/ROADMAP.md" }),
+            }],
+        );
         assert!(!assessment.requires_verification);
+        cleanup(&workspace);
     }
 
     #[test]
     fn verification_must_follow_last_mutation() {
-        let assessment = assess_verification(&[
-            VerificationEvent {
-                name: "exec".to_string(),
-                arguments: json!({ "command": "cargo test --workspace" }),
-            },
-            VerificationEvent {
-                name: "write".to_string(),
-                arguments: json!({ "path": "src/main.rs" }),
-            },
-        ]);
+        let workspace = temp_workspace("verifier-mutation-order");
+        fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let assessment = assess_verification(
+            &workspace,
+            &[
+                VerificationEvent {
+                    name: "exec".to_string(),
+                    arguments: json!({ "command": "cargo test --workspace" }),
+                },
+                VerificationEvent {
+                    name: "write".to_string(),
+                    arguments: json!({ "path": "src/main.rs" }),
+                },
+            ],
+        );
         assert!(assessment.requires_verification);
         assert!(!assessment.has_verification_after_last_mutation);
         assert!(assessment.guidance().contains("cargo test --workspace"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn uses_project_manifest_to_suggest_verification_commands() {
+        let workspace = temp_workspace("verifier-project-hints");
+        fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+
+        let assessment = assess_verification(
+            &workspace,
+            &[VerificationEvent {
+                name: "edit".to_string(),
+                arguments: json!({ "path": "README-ish", "needle": "a", "replacement": "b" }),
+            }],
+        );
+
+        assert!(assessment.requires_verification);
+        assert!(assessment.guidance().contains("cargo test --workspace"));
+        assert!(assessment.guidance().contains("cargo check --workspace"));
+        cleanup(&workspace);
     }
 }

@@ -53,11 +53,13 @@ This repository currently contains:
 - read-only `parallel_read` batching for one-turn discovery
 - provider-native tool calling for Anthropic, OpenAI-compatible, and Ollama with text-tool fallback
 - a dedicated verifier module for task-aware verification that requires checks after the last code mutation while exempting docs-only edits
+- project-aware verifier suggestions that inspect workspace manifests such as `Cargo.toml`
 - automatic model-switch handoff snapshots with first-turn context boost
 - runtime unit tests covering config, permissions, providers, skills, MCP, the harness loop, and verifier behavior
 - env-gated live provider tests for Anthropic, OpenAI-compatible, and Ollama
 - more readable CLI status, memory, approval, and verification feedback
 - compact prompt shaping for weaker local and open-weight model families such as Ollama, Qwen, Llama, Gemma, Mistral, Phi, and DeepSeek
+- model-aware context budget profiles with compact recall limits for smaller model families
 
 Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/ROADMAP.md).
 
@@ -182,8 +184,8 @@ Live provider tests:
 
 ## Immediate next steps
 
-1. Add model-aware context budgeting instead of fixed heuristics.
-2. Add richer verifier adapters beyond command-pattern heuristics.
-3. Add env-backed smoke coverage for saved provider profiles and external adapters.
-4. Add stronger REPL-level tests for status and handoff presentation.
-5. Add provider-specific output shaping for external CLI adapters.
+1. Add env-backed smoke coverage for saved provider profiles and external adapters.
+2. Add stronger REPL-level tests for status and handoff presentation.
+3. Add provider-specific output shaping for external CLI adapters.
+4. Add more explicit memory and handoff debugging commands.
+5. Add deeper verifier adapters for project-specific commands beyond manifest hints.

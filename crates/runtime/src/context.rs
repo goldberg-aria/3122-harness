@@ -15,13 +15,30 @@ const MAX_RECENT_HISTORY_CHARS: usize = 2000;
 const MAX_MEMORY_RECALL_CHARS: usize = 1800;
 const MAX_CONVERSATION_RECALL_LINES: usize = 6;
 const MAX_CONVERSATION_RECALL_CHARS: usize = 1800;
-const MAX_PROMPT_CONTEXT_CHARS: usize = 12000;
 const MAX_MODEL_HANDOFF_CHARS: usize = 1400;
-const BUDGETED_INSTRUCTION_CHARS: usize = 4000;
-const BUDGETED_MODEL_HANDOFF_CHARS: usize = 700;
-const BUDGETED_RECENT_HISTORY_CHARS: usize = 1200;
-const BUDGETED_MEMORY_RECALL_CHARS: usize = 1200;
-const BUDGETED_CONVERSATION_RECALL_CHARS: usize = 900;
+const DEFAULT_PROMPT_CONTEXT_CHARS: usize = 12000;
+const DEFAULT_BUDGETED_INSTRUCTION_CHARS: usize = 4000;
+const DEFAULT_BUDGETED_MODEL_HANDOFF_CHARS: usize = 700;
+const DEFAULT_BUDGETED_RECENT_HISTORY_CHARS: usize = 1200;
+const DEFAULT_BUDGETED_MEMORY_RECALL_CHARS: usize = 1200;
+const DEFAULT_BUDGETED_CONVERSATION_RECALL_CHARS: usize = 900;
+const COMPACT_PROMPT_CONTEXT_CHARS: usize = 8500;
+const COMPACT_BUDGETED_INSTRUCTION_CHARS: usize = 2200;
+const COMPACT_BUDGETED_MODEL_HANDOFF_CHARS: usize = 550;
+const COMPACT_BUDGETED_RECENT_HISTORY_CHARS: usize = 900;
+const COMPACT_BUDGETED_MEMORY_RECALL_CHARS: usize = 850;
+const COMPACT_BUDGETED_CONVERSATION_RECALL_CHARS: usize = 450;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextBudgetProfile {
+    name: &'static str,
+    total_chars: usize,
+    instructions_chars: usize,
+    model_handoff_chars: usize,
+    recent_history_chars: usize,
+    memory_recall_chars: usize,
+    conversation_recall_chars: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceContext {
@@ -106,6 +123,12 @@ pub fn gather_workspace_context(
 }
 
 pub fn render_prompt_context(context: &WorkspaceContext) -> String {
+    let budget = context_budget_profile(
+        context
+            .active_model
+            .as_deref()
+            .or(context.configured_primary_model.as_deref()),
+    );
     let mut instructions = render_instructions_block(&context.instructions);
     let mut model_handoff = context.model_handoff.clone();
     let mut recent_history = context.recent_history.clone();
@@ -119,12 +142,13 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &recent_history,
         &memory_recall,
         &conversation_recall,
+        budget.name,
     );
-    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+    if out.chars().count() <= budget.total_chars {
         return out;
     }
 
-    conversation_recall = budget_section(&conversation_recall, BUDGETED_CONVERSATION_RECALL_CHARS);
+    conversation_recall = budget_section(&conversation_recall, budget.conversation_recall_chars);
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -132,12 +156,13 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &recent_history,
         &memory_recall,
         &conversation_recall,
+        budget.name,
     );
-    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+    if out.chars().count() <= budget.total_chars {
         return out;
     }
 
-    memory_recall = budget_section(&memory_recall, BUDGETED_MEMORY_RECALL_CHARS);
+    memory_recall = budget_section(&memory_recall, budget.memory_recall_chars);
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -145,12 +170,13 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &recent_history,
         &memory_recall,
         &conversation_recall,
+        budget.name,
     );
-    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+    if out.chars().count() <= budget.total_chars {
         return out;
     }
 
-    recent_history = budget_section(&recent_history, BUDGETED_RECENT_HISTORY_CHARS);
+    recent_history = budget_section(&recent_history, budget.recent_history_chars);
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -158,12 +184,13 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &recent_history,
         &memory_recall,
         &conversation_recall,
+        budget.name,
     );
-    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+    if out.chars().count() <= budget.total_chars {
         return out;
     }
 
-    model_handoff = budget_section(&model_handoff, BUDGETED_MODEL_HANDOFF_CHARS);
+    model_handoff = budget_section(&model_handoff, budget.model_handoff_chars);
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -171,12 +198,13 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &recent_history,
         &memory_recall,
         &conversation_recall,
+        budget.name,
     );
-    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+    if out.chars().count() <= budget.total_chars {
         return out;
     }
 
-    instructions = budget_section(&instructions, BUDGETED_INSTRUCTION_CHARS);
+    instructions = budget_section(&instructions, budget.instructions_chars);
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -184,12 +212,13 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &recent_history,
         &memory_recall,
         &conversation_recall,
+        budget.name,
     );
-    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+    if out.chars().count() <= budget.total_chars {
         return out;
     }
 
-    truncate_text(&out, MAX_PROMPT_CONTEXT_CHARS)
+    truncate_text(&out, budget.total_chars)
 }
 
 fn render_prompt_context_sections(
@@ -199,6 +228,7 @@ fn render_prompt_context_sections(
     recent_history: &str,
     memory_recall: &str,
     conversation_recall: &str,
+    budget_profile: &str,
 ) -> String {
     let mut out = String::new();
     out.push_str("Runtime context:\n");
@@ -223,6 +253,7 @@ fn render_prompt_context_sections(
         "configured_primary_model: {}\n",
         context.configured_primary_model.as_deref().unwrap_or("-")
     ));
+    out.push_str(&format!("context_budget_profile: {budget_profile}\n"));
     out.push_str(&format!(
         "session_id: {}\n",
         context.session_id.as_deref().unwrap_or("-")
@@ -304,6 +335,46 @@ fn budget_section(input: &str, max_chars: usize) -> String {
         return "none".to_string();
     }
     truncate_text(input, max_chars)
+}
+
+fn context_budget_profile(model: Option<&str>) -> ContextBudgetProfile {
+    if uses_compact_context_budget(model) {
+        return ContextBudgetProfile {
+            name: "compact",
+            total_chars: COMPACT_PROMPT_CONTEXT_CHARS,
+            instructions_chars: COMPACT_BUDGETED_INSTRUCTION_CHARS,
+            model_handoff_chars: COMPACT_BUDGETED_MODEL_HANDOFF_CHARS,
+            recent_history_chars: COMPACT_BUDGETED_RECENT_HISTORY_CHARS,
+            memory_recall_chars: COMPACT_BUDGETED_MEMORY_RECALL_CHARS,
+            conversation_recall_chars: COMPACT_BUDGETED_CONVERSATION_RECALL_CHARS,
+        };
+    }
+
+    ContextBudgetProfile {
+        name: "default",
+        total_chars: DEFAULT_PROMPT_CONTEXT_CHARS,
+        instructions_chars: DEFAULT_BUDGETED_INSTRUCTION_CHARS,
+        model_handoff_chars: DEFAULT_BUDGETED_MODEL_HANDOFF_CHARS,
+        recent_history_chars: DEFAULT_BUDGETED_RECENT_HISTORY_CHARS,
+        memory_recall_chars: DEFAULT_BUDGETED_MEMORY_RECALL_CHARS,
+        conversation_recall_chars: DEFAULT_BUDGETED_CONVERSATION_RECALL_CHARS,
+    }
+}
+
+fn uses_compact_context_budget(model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("ollama/") {
+        return true;
+    }
+
+    [
+        "qwen", "llama", "mistral", "gemma", "phi", "deepseek", "yi", "minicpm",
+    ]
+    .iter()
+    .any(|family| model.contains(family))
 }
 
 fn discover_instruction_contexts(workspace_root: &Path) -> Vec<InstructionContext> {
@@ -777,6 +848,7 @@ mod tests {
         assert!(rendered.contains("permission_mode: read-only"));
         assert!(rendered.contains("active_model: openai/gpt-4.1-mini"));
         assert!(rendered.contains("configured_primary_model: ollama/qwen2.5-coder:7b"));
+        assert!(rendered.contains("context_budget_profile: default"));
         assert!(rendered.contains("workspace_boundary: current workspace only"));
         assert!(rendered.contains("boss rules"));
         assert!(rendered.contains("recent_working_history:"));
@@ -821,6 +893,44 @@ mod tests {
 
         let rendered = render_prompt_context(&context);
         assert!(rendered.chars().count() <= 12_003);
+        assert!(rendered.contains("context_budget_profile: default"));
+        assert!(rendered.contains("conversation_recall:"));
+    }
+
+    #[test]
+    fn uses_compact_budget_profile_for_ollama_models() {
+        let huge = "x".repeat(9000);
+        let context = WorkspaceContext {
+            workspace_root: PathBuf::from("/tmp/workspace"),
+            config_source: None,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            active_model: Some("ollama/qwen2.5-coder:7b".to_string()),
+            configured_primary_model: Some("ollama/qwen2.5-coder:7b".to_string()),
+            session_id: Some("session-1".to_string()),
+            session_path: Some(PathBuf::from(
+                "/tmp/workspace/.harness/sessions/session-1.jsonl",
+            )),
+            handoff_boost_active: true,
+            git: GitContext {
+                repo_root: None,
+                branch: None,
+                dirty: false,
+                status_lines: Vec::new(),
+            },
+            instructions: vec![crate::InstructionContext {
+                name: "AGENTS.md".to_string(),
+                path: PathBuf::from("/tmp/workspace/AGENTS.md"),
+                contents: huge.clone(),
+            }],
+            model_handoff: huge.clone(),
+            recent_history: huge.clone(),
+            memory_recall: huge.clone(),
+            conversation_recall: huge,
+        };
+
+        let rendered = render_prompt_context(&context);
+        assert!(rendered.chars().count() <= 8_503);
+        assert!(rendered.contains("context_budget_profile: compact"));
         assert!(rendered.contains("conversation_recall:"));
     }
 }

@@ -227,8 +227,12 @@ where
             continue;
         }
 
-        let final_text =
-            enforce_verification_policy(&text, &tool_events, options.verification_policy)?;
+        let final_text = enforce_verification_policy(
+            workspace_root,
+            &text,
+            &tool_events,
+            options.verification_policy,
+        )?;
         if final_text != text && final_text.starts_with("Not verified:") {
             if let Some(store) = session {
                 let _ = store.append(
@@ -602,11 +606,13 @@ fn strip_thinking_blocks(text: &str) -> String {
 }
 
 fn enforce_verification_policy(
+    workspace_root: &Path,
     text: &str,
     tool_events: &[AgentToolEvent],
     policy: VerificationPolicy,
 ) -> Result<String, String> {
     let assessment = assess_verification(
+        workspace_root,
         &tool_events
             .iter()
             .map(|event| VerificationEvent {
@@ -833,7 +839,9 @@ mod tests {
 
     #[test]
     fn annotates_unverified_completion_after_mutation() {
+        let workspace = temp_workspace("verification-annotate");
         let text = enforce_verification_policy(
+            &workspace,
             "Implemented the fix.",
             &[crate::AgentToolEvent {
                 name: "write".to_string(),
@@ -847,11 +855,14 @@ mod tests {
         assert!(text.starts_with("Not verified:"));
         assert!(text.contains("src/main.rs"));
         assert!(text.contains("cargo test --workspace"));
+        cleanup(&workspace);
     }
 
     #[test]
     fn docs_only_edits_do_not_require_verification() {
+        let workspace = temp_workspace("verification-docs-only");
         let text = enforce_verification_policy(
+            &workspace,
             "Updated the docs.",
             &[crate::AgentToolEvent {
                 name: "write".to_string(),
@@ -863,11 +874,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(text, "Updated the docs.");
+        cleanup(&workspace);
     }
 
     #[test]
     fn verification_must_happen_after_last_mutation() {
+        let workspace = temp_workspace("verification-order");
+        fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
         let error = enforce_verification_policy(
+            &workspace,
             "Implemented the fix.",
             &[
                 crate::AgentToolEvent {
@@ -887,6 +902,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("src/main.rs"));
+        cleanup(&workspace);
     }
 
     #[test]

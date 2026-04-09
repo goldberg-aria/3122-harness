@@ -164,6 +164,11 @@ Exit criteria:
 - prompts stay stable in shape
 - small models do not drown in context noise
 
+Current progress:
+
+- prompt context now exposes a budget profile in `why-context`
+- compact model families get a smaller prompt budget than the default path
+
 ### Workstream 4: Model capability normalization
 
 Goal:
@@ -189,7 +194,7 @@ Current progress:
 - native tool calling is wired for Anthropic, OpenAI-compatible providers, and Ollama
 - text tool calling remains the common fallback path
 - approval refinement is wired with per-risk defaults and critical-command blocking
-- prompt context now has a budget manager for long sessions
+- prompt context now has a model-aware budget manager for long sessions
 - weaker local and open-weight model families now get a more compact prompt shape
 - `/model <spec>` now creates a handoff snapshot, prints a short transition summary, and boosts the first post-switch turn
 
@@ -275,6 +280,7 @@ Exit criteria:
 Current progress:
 
 - task-aware verification is now separated into a verifier module
+- verifier suggestions now inspect workspace manifests such as `Cargo.toml`
 - live provider checks are env-gated so CI and local runs can stay offline by default
 - Anthropic, OpenAI-compatible, and Ollama each have gated live prompt coverage
 

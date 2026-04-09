@@ -86,8 +86,9 @@ Current implementation note:
 - if relevant workspace mutations happen without a recorded verification step, the harness annotates the final answer as `Not verified`
 - verification policy can now be `off`, `annotate`, or `require`
 - `parallel_read` batches multiple safe read-only discovery operations into one turn
-- prompt context is capped to a fixed budget and shrinks conversation recall, memory recall, recent history, and instructions in that order
+- prompt context uses model-aware budget profiles and shrinks conversation recall, memory recall, recent history, handoff detail, and instructions in that order
 - verification decisions are centralized in a verifier module so policy stays separate from the main loop
+- verifier guidance now considers workspace manifests so project-level commands can be suggested even when file extensions are ambiguous
 - weaker local and open-weight model families use a more compact prompt shape with tighter line limits and shorter step guidance
 
 Planned evolution:
