@@ -262,6 +262,7 @@ Deliverables:
 - tests for model switching
 - tests for approval flows
 - env-gated adapter integration tests
+- dedicated verifier abstraction for task-aware completion policy
 - a task-aware verification policy that detects unverified completion claims after the last relevant mutation
 - tests for read-only batch exploration
 
@@ -269,6 +270,12 @@ Exit criteria:
 
 - core runtime paths are covered by automated tests
 - regressions are caught quickly
+
+Current progress:
+
+- task-aware verification is now separated into a verifier module
+- live provider checks are env-gated so CI and local runs can stay offline by default
+- Anthropic, OpenAI-compatible, and Ollama each have gated live prompt coverage
 
 ## Recommended implementation order
 
@@ -279,7 +286,8 @@ Exit criteria:
 5. provider-native tool calling
 6. approval refinement
 7. operator commands
-8. release cleanup
+8. verifier abstraction and live provider checks
+9. release cleanup
 
 ## Release checklist
 

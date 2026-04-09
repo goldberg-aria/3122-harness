@@ -52,9 +52,10 @@ This repository currently contains:
 - routing-friendly skill summaries with a short summary budget
 - read-only `parallel_read` batching for one-turn discovery
 - provider-native tool calling for Anthropic, OpenAI-compatible, and Ollama with text-tool fallback
-- task-aware verification that requires checks after the last code mutation while exempting docs-only edits
+- a dedicated verifier module for task-aware verification that requires checks after the last code mutation while exempting docs-only edits
 - automatic model-switch handoff snapshots with first-turn context boost
-- runtime unit tests covering config, permissions, providers, skills, MCP, and the harness loop
+- runtime unit tests covering config, permissions, providers, skills, MCP, the harness loop, and verifier behavior
+- env-gated live provider tests for Anthropic, OpenAI-compatible, and Ollama
 
 Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/ROADMAP.md).
 
@@ -128,6 +129,7 @@ Verification behavior:
 - default verification policy comes from `[verification].policy`
 - verification must happen after the last workspace mutation to count
 - docs-only edits do not force a verification step
+- verification logic is centralized in a dedicated verifier module
 - `require` rejects completion after relevant workspace mutations unless a verification step was recorded or the model explicitly says `Not verified`
 - `annotate` prefixes the final answer with `Not verified` plus task-aware guidance
 - `off` disables verification enforcement
@@ -163,10 +165,21 @@ Saved provider profiles:
 - manual registration supports presets such as `deepseek`, `dashscope-cn`, `dashscope-intl`, and `siliconflow`
 - saved profiles can be used as `profile/<alias>/<model>`
 
+Live provider tests:
+
+- `HARNESS_RUN_LIVE_PROVIDER_TESTS=1 cargo test --workspace`
+- `OPENAI_API_KEY` enables the OpenAI-compatible live test
+- `ANTHROPIC_API_KEY` enables the Anthropic live test
+- `HARNESS_TEST_OLLAMA_MODEL` or `OLLAMA_HOST` enables the Ollama live test
+- optional model overrides:
+  - `HARNESS_TEST_OPENAI_MODEL`
+  - `HARNESS_TEST_ANTHROPIC_MODEL`
+  - `HARNESS_TEST_OLLAMA_MODEL`
+
 ## Immediate next steps
 
-1. Add env-gated provider integration tests beyond unit coverage.
-2. Introduce a dedicated verifier abstraction beyond heuristics.
-3. Tighten runtime UX around status, memory, approvals, and verification feedback.
-4. Add provider-specific prompt shaping for weaker local models.
-5. Add model-aware context budgeting instead of fixed heuristics.
+1. Tighten runtime UX around status, memory, approvals, and verification feedback.
+2. Add provider-specific prompt shaping for weaker local models.
+3. Add model-aware context budgeting instead of fixed heuristics.
+4. Add richer verifier adapters beyond command-pattern heuristics.
+5. Add env-backed smoke coverage for saved provider profiles and external adapters.

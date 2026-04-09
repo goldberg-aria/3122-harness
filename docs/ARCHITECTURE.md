@@ -87,6 +87,7 @@ Current implementation note:
 - verification policy can now be `off`, `annotate`, or `require`
 - `parallel_read` batches multiple safe read-only discovery operations into one turn
 - prompt context is capped to a fixed budget and shrinks conversation recall, memory recall, recent history, and instructions in that order
+- verification decisions are centralized in a verifier module so policy stays separate from the main loop
 
 Planned evolution:
 
@@ -355,6 +356,8 @@ But the harness should treat that as a backend transport, not as part of the cor
 14. prompt/auto approval policy
 15. context assembly from local instructions and git state
 16. structured model-switch handoff and first-turn boost
+17. dedicated verifier abstraction
+18. env-gated live provider integration tests
 
 ## Test stance
 
@@ -366,12 +369,13 @@ Important runtime boundaries should stay covered by unit tests:
 - skill resolution precedence
 - MCP stdio listing and calling
 - agent loop progress, max-step guard, skill tool, and MCP tool path
+- verifier policy and post-mutation verification timing
 
 The next testing focus should be:
 
-- Local-Lite memory save and recall
-- approval behavior by tool risk
-- env-gated live provider integration checks
+- saved provider profile flows against live endpoints when env credentials exist
+- external adapter smoke coverage for `claude` and `codex`
+- model-aware context budget assertions for smaller local models
 
 ## Planning doc
 

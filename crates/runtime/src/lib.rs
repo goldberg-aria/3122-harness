@@ -11,6 +11,7 @@ mod provider;
 mod session;
 mod skills;
 mod tools;
+mod verifier;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,7 @@ pub use tools::{
     edit_file, exec_command, glob_search, grep_search, parallel_read_only, read_file, write_file,
     ToolOutput,
 };
+pub use verifier::{assess_verification, VerificationAssessment, VerificationEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {

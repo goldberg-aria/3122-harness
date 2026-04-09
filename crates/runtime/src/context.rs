@@ -88,7 +88,12 @@ pub fn gather_workspace_context(
         instructions: discover_instruction_contexts(workspace_root),
         model_handoff: pending_handoff
             .as_ref()
-            .map(|handoff| truncate_text(&render_model_handoff_text(&handoff.snapshot), MAX_MODEL_HANDOFF_CHARS))
+            .map(|handoff| {
+                truncate_text(
+                    &render_model_handoff_text(&handoff.snapshot),
+                    MAX_MODEL_HANDOFF_CHARS,
+                )
+            })
             .unwrap_or_else(|| "none".to_string()),
         recent_history: build_recent_history(config, workspace_root)
             .unwrap_or_else(|_| "none".to_string()),

@@ -303,8 +303,14 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
         if let Some(previous) = handoff.snapshot.from_model.as_deref() {
             out.push_str(&format!("previous_model: {}\n", previous));
         }
-        out.push_str(&format!("current_goal: {}\n", handoff.snapshot.current_goal));
-        out.push_str(&format!("next_step: {}\n", handoff.snapshot.suggested_next_step));
+        out.push_str(&format!(
+            "current_goal: {}\n",
+            handoff.snapshot.current_goal
+        ));
+        out.push_str(&format!(
+            "next_step: {}\n",
+            handoff.snapshot.suggested_next_step
+        ));
     }
     if let Some(summary) = latest_summary {
         out.push_str(&format!("latest_summary: {}\n", summary.title));
@@ -473,16 +479,20 @@ pub fn latest_model_handoff(session_path: &Path) -> Result<Option<StoredModelHan
 
 pub fn pending_model_handoff(session_path: &Path) -> Result<Option<StoredModelHandoff>, String> {
     let events = SessionStore::read_events(session_path)?;
-    let Some(index) = events.iter().rposition(|event| event.kind == "model_handoff") else {
+    let Some(index) = events
+        .iter()
+        .rposition(|event| event.kind == "model_handoff")
+    else {
         return Ok(None);
     };
 
     let handoff_event = &events[index];
-    if events
-        .iter()
-        .skip(index + 1)
-        .any(|event| matches!(event.kind.as_str(), "agent_result" | "prompt_result" | "model_probe_failed"))
-    {
+    if events.iter().skip(index + 1).any(|event| {
+        matches!(
+            event.kind.as_str(),
+            "agent_result" | "prompt_result" | "model_probe_failed"
+        )
+    }) {
         return Ok(None);
     }
 
@@ -666,9 +676,9 @@ mod tests {
 
     use super::{
         append_memory_record, build_handoff_text, build_memory_recall_text,
-        build_model_handoff_snapshot, build_resume_text, latest_model_handoff,
-        list_memory_records, pending_model_handoff, save_session_memory_bundle,
-        save_session_summary, search_memory_records, summarize_session_events, MemoryKind,
+        build_model_handoff_snapshot, build_resume_text, latest_model_handoff, list_memory_records,
+        pending_model_handoff, save_session_memory_bundle, save_session_summary,
+        search_memory_records, summarize_session_events, MemoryKind,
     };
 
     fn temp_workspace(prefix: &str) -> PathBuf {
@@ -846,7 +856,9 @@ mod tests {
             Some("anthropic/claude-sonnet-4-6")
         );
         assert_eq!(snapshot.to_model, "openai/gpt-4.1-mini");
-        assert!(snapshot.current_goal.contains("finish provider switching UX"));
+        assert!(snapshot
+            .current_goal
+            .contains("finish provider switching UX"));
         assert!(!snapshot.open_tasks.is_empty());
         assert!(!snapshot.recent_errors.is_empty());
 

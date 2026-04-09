@@ -907,7 +907,9 @@ struct OllamaFunctionCall {
 
 #[cfg(test)]
 mod tests {
-    use crate::{ProviderRegistry, SavedProviderProfile};
+    use std::env;
+
+    use crate::{send_prompt, ProviderRegistry, SavedProviderProfile};
 
     use super::{
         join_url, parse_anthropic_tool_calls, parse_model_target, parse_ollama_tool_calls,
@@ -1047,5 +1049,73 @@ mod tests {
         assert_eq!(tool_calls[0].id.as_deref(), Some("toolu_123"));
         assert_eq!(tool_calls[0].name, "parallel_read");
         assert_eq!(tool_calls[0].arguments["operations"][0]["tool"], "read");
+    }
+
+    #[test]
+    fn live_openai_compatible_prompt_when_enabled() {
+        if !live_test_enabled("openai") {
+            return;
+        }
+
+        let model =
+            env::var("HARNESS_TEST_OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_string());
+        let reply = send_prompt(
+            &parse_model_target(&format!("openai/{model}")).unwrap(),
+            "Reply with exactly: live-openai-ok",
+        )
+        .unwrap();
+
+        assert_eq!(reply.route, ProviderRoute::OpenAiCompat);
+        assert!(!reply.text.trim().is_empty());
+    }
+
+    #[test]
+    fn live_anthropic_prompt_when_enabled() {
+        if !live_test_enabled("anthropic") {
+            return;
+        }
+
+        let model = env::var("HARNESS_TEST_ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+        let reply = send_prompt(
+            &parse_model_target(&format!("anthropic/{model}")).unwrap(),
+            "Reply with exactly: live-anthropic-ok",
+        )
+        .unwrap();
+
+        assert_eq!(reply.route, ProviderRoute::Anthropic);
+        assert!(!reply.text.trim().is_empty());
+    }
+
+    #[test]
+    fn live_ollama_prompt_when_enabled() {
+        if !live_test_enabled("ollama") {
+            return;
+        }
+
+        let model = env::var("HARNESS_TEST_OLLAMA_MODEL")
+            .unwrap_or_else(|_| "qwen2.5-coder:7b".to_string());
+        let reply = send_prompt(
+            &parse_model_target(&format!("ollama/{model}")).unwrap(),
+            "Reply with exactly: live-ollama-ok",
+        )
+        .unwrap();
+
+        assert_eq!(reply.route, ProviderRoute::Ollama);
+        assert!(!reply.text.trim().is_empty());
+    }
+
+    fn live_test_enabled(provider: &str) -> bool {
+        matches!(
+            env::var("HARNESS_RUN_LIVE_PROVIDER_TESTS").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES")
+        ) && match provider {
+            "openai" => env::var("OPENAI_API_KEY").is_ok(),
+            "anthropic" => env::var("ANTHROPIC_API_KEY").is_ok(),
+            "ollama" => {
+                env::var("HARNESS_TEST_OLLAMA_MODEL").is_ok() || env::var("OLLAMA_HOST").is_ok()
+            }
+            _ => false,
+        }
     }
 }

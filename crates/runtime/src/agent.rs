@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{build_skill_packet, edit_file, exec_command, glob_search, grep_search, read_file};
 use crate::{
-    call_mcp_tool, classify_approval_request, discover_mcp_servers, discover_skills,
-    gather_workspace_context, list_mcp_tools, load_provider_registry, parallel_read_only,
-    render_prompt_context, resolve_model_target, resolve_skill, send_prompt, write_file,
-    ApprovalRisk, LoadedConfig, PermissionMode, ProviderReply, ProviderTarget, ProviderToolCall,
-    SessionStore, ToolOutput, VerificationPolicy,
+    assess_verification, call_mcp_tool, classify_approval_request, discover_mcp_servers,
+    discover_skills, gather_workspace_context, list_mcp_tools, load_provider_registry,
+    parallel_read_only, render_prompt_context, resolve_model_target, resolve_skill, send_prompt,
+    write_file, ApprovalRisk, LoadedConfig, PermissionMode, ProviderReply, ProviderTarget,
+    ProviderToolCall, SessionStore, ToolOutput, VerificationEvent, VerificationPolicy,
 };
+use crate::{build_skill_packet, edit_file, exec_command, glob_search, grep_search, read_file};
 
 #[derive(Debug, Clone)]
 pub struct AgentOptions {
@@ -493,8 +493,16 @@ fn enforce_verification_policy(
     tool_events: &[AgentToolEvent],
     policy: VerificationPolicy,
 ) -> Result<String, String> {
-    let need = assess_verification_need(tool_events);
-    if matches!(need, VerificationNeed::None) || has_verification_after_last_mutation(tool_events) {
+    let assessment = assess_verification(
+        &tool_events
+            .iter()
+            .map(|event| VerificationEvent {
+                name: event.name.clone(),
+                arguments: event.arguments.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    if !assessment.requires_verification || assessment.has_verification_after_last_mutation {
         return Ok(text.to_string());
     }
 
@@ -502,7 +510,7 @@ fn enforce_verification_policy(
         return Ok(text.to_string());
     }
 
-    let guidance = verification_guidance(&need);
+    let guidance = assessment.guidance();
 
     match policy {
         VerificationPolicy::Off => Ok(text.to_string()),
@@ -511,194 +519,6 @@ fn enforce_verification_policy(
             "verification required after workspace changes; {guidance}"
         )),
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum VerificationNeed {
-    None,
-    Required {
-        reason: String,
-        suggestions: Vec<&'static str>,
-    },
-}
-
-fn assess_verification_need(tool_events: &[AgentToolEvent]) -> VerificationNeed {
-    let mutation_events = tool_events
-        .iter()
-        .filter(|event| tool_event_mutates_workspace(event))
-        .collect::<Vec<_>>();
-    if mutation_events.is_empty() {
-        return VerificationNeed::None;
-    }
-
-    if mutation_events
-        .iter()
-        .all(|event| tool_event_is_docs_only(event))
-    {
-        return VerificationNeed::None;
-    }
-
-    VerificationNeed::Required {
-        reason: verification_reason(&mutation_events),
-        suggestions: verification_suggestions(&mutation_events),
-    }
-}
-
-fn has_verification_after_last_mutation(tool_events: &[AgentToolEvent]) -> bool {
-    let Some(last_mutation_index) = tool_events.iter().rposition(tool_event_mutates_workspace)
-    else {
-        return false;
-    };
-    tool_events
-        .iter()
-        .skip(last_mutation_index + 1)
-        .any(tool_event_is_verification)
-}
-
-fn tool_event_mutates_workspace(event: &AgentToolEvent) -> bool {
-    match event.name.as_str() {
-        "write" | "edit" => true,
-        "exec" => !tool_event_is_verification(event),
-        _ => false,
-    }
-}
-
-fn tool_event_is_verification(event: &AgentToolEvent) -> bool {
-    if event.name != "exec" {
-        return false;
-    }
-
-    let Some(command) = event.arguments.get("command").and_then(Value::as_str) else {
-        return false;
-    };
-    let command = command.to_ascii_lowercase();
-    [
-        " test",
-        "cargo test",
-        "cargo check",
-        "cargo build",
-        "npm test",
-        "npm run test",
-        "npm run build",
-        "pnpm test",
-        "pnpm build",
-        "pytest",
-        "vitest",
-        "jest",
-        "lint",
-        "verify",
-        "check",
-    ]
-    .iter()
-    .any(|needle| command.contains(needle))
-}
-
-fn tool_event_is_docs_only(event: &AgentToolEvent) -> bool {
-    if !matches!(event.name.as_str(), "write" | "edit") {
-        return false;
-    }
-    let Some(path) = event.arguments.get("path").and_then(Value::as_str) else {
-        return false;
-    };
-    path_is_docs_only(path)
-}
-
-fn path_is_docs_only(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    let path = Path::new(&normalized);
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if matches!(
-        file_name.as_str(),
-        "readme.md" | "changelog.md" | "license" | "license.md" | "agents.md" | "claude.md"
-    ) {
-        return true;
-    }
-
-    if normalized.starts_with("docs/") {
-        return true;
-    }
-
-    matches!(
-        path.extension().and_then(|value| value.to_str()),
-        Some("md" | "mdx" | "txt" | "rst" | "adoc")
-    )
-}
-
-fn verification_reason(events: &[&AgentToolEvent]) -> String {
-    let touched_paths = events
-        .iter()
-        .filter_map(|event| event.arguments.get("path").and_then(Value::as_str))
-        .map(short_path_label)
-        .collect::<Vec<_>>();
-
-    if touched_paths.is_empty() {
-        return "no verification step was recorded after workspace changes".to_string();
-    }
-
-    let joined = touched_paths.join(", ");
-    format!("no verification step was recorded after changes to {joined}")
-}
-
-fn verification_suggestions(events: &[&AgentToolEvent]) -> Vec<&'static str> {
-    let mut rust = false;
-    let mut node = false;
-    let mut python = false;
-    let mut go = false;
-
-    for path in events
-        .iter()
-        .filter_map(|event| event.arguments.get("path").and_then(Value::as_str))
-    {
-        match Path::new(path).extension().and_then(|value| value.to_str()) {
-            Some("rs") => rust = true,
-            Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") => node = true,
-            Some("py") => python = true,
-            Some("go") => go = true,
-            _ => {}
-        }
-    }
-
-    if rust {
-        return vec!["cargo test --workspace", "cargo check --workspace"];
-    }
-    if node {
-        return vec!["npm test", "npm run build"];
-    }
-    if python {
-        return vec!["pytest"];
-    }
-    if go {
-        return vec!["go test ./..."];
-    }
-
-    vec!["run at least one relevant test, build, or check command"]
-}
-
-fn verification_guidance(need: &VerificationNeed) -> String {
-    match need {
-        VerificationNeed::None => "verification was not required".to_string(),
-        VerificationNeed::Required {
-            reason,
-            suggestions,
-        } => {
-            if suggestions.is_empty() {
-                return format!("{reason}; run a verification step or answer with `Not verified` and the reason");
-            }
-            format!(
-                "{reason}; try {} or answer with `Not verified` and the reason",
-                suggestions.join(" / ")
-            )
-        }
-    }
-}
-
-fn short_path_label(path: &str) -> String {
-    path.replace('\\', "/")
 }
 
 fn parse_tool_call(text: &str) -> Result<Option<ToolCallEnvelope>, String> {

@@ -6,7 +6,7 @@ This document checks the current harness against seven prompt-engineering patter
 
 1. Agent runtime loop: implemented
 2. Do/Don't contrast pattern: implemented in the shared loop prompt
-3. Verification-before-completion: implemented with heuristics
+3. Verification-before-completion: implemented with a dedicated verifier module
 4. Triple repetition for critical rules: implemented in the shared loop prompt
 5. Turn budget and cost awareness: implemented with fixed heuristics
 6. Chain-of-thought stripping: implemented
@@ -51,7 +51,7 @@ Code:
 
 Status:
 
-- implemented with heuristics
+- implemented with a dedicated verifier module
 
 What is implemented:
 
@@ -61,15 +61,16 @@ What is implemented:
 - the harness now supports `off`, `annotate`, and `require` verification policies
 - verification only counts when it occurs after the last mutation
 - docs-only edits are exempt from mandatory verification
+- verification logic now lives in a separate verifier module instead of the main loop
 
 Gap:
 
-- verification detection is still heuristic rather than provider- or build-system-aware
-- there is no dedicated verifier abstraction yet
+- verification detection is still command-pattern and file-pattern aware rather than build-system-native
+- provider and stack specific verifier adapters do not exist yet
 
 Next step:
 
-- add a dedicated verifier abstraction and provider-aware suggestions
+- add richer project-aware verifier adapters and stronger stack-specific suggestions
 
 ### 4. Triple repetition for critical rules
 
@@ -172,10 +173,12 @@ Next step:
 - stripped `<thinking>` blocks from provider final output
 - added recent and relevant conversation recall to prompt context
 - added short skill summaries and read-only batch exploration
-- added tests covering prompt rule presence, thinking-strip behavior, verification policy, and batch exploration
+- added a dedicated verifier module for task-aware completion checks
+- added env-gated live provider tests for Anthropic, OpenAI-compatible backends, and Ollama
+- added tests covering prompt rule presence, thinking-strip behavior, verification policy, live provider gates, and batch exploration
 
 ## Follow-up order
 
-1. dedicated verifier abstraction
-2. model-aware context budgeting
-3. stronger session/task isolation metadata for future forked work
+1. model-aware context budgeting
+2. stronger session/task isolation metadata for future forked work
+3. richer verifier adapters for project-specific test commands
