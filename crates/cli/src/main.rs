@@ -203,6 +203,7 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
             } => {
                 ui.input.clear();
                 ui.sync_slash_navigation(0);
+                ui.clear_history_navigation();
             }
             KeyEvent {
                 code: KeyCode::Backspace,
@@ -211,6 +212,9 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 ui.input.pop();
                 let total = build_slash_suggestions(workspace, &ui.input).len();
                 ui.sync_slash_navigation(total);
+                if ui.history_selection.is_some() {
+                    ui.clear_history_navigation();
+                }
             }
             KeyEvent {
                 code: KeyCode::Up, ..
@@ -218,6 +222,10 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 let total = build_slash_suggestions(workspace, &ui.input).len();
                 if ui.input.starts_with('/') && total > 0 {
                     ui.move_slash_selection(total, -1);
+                } else {
+                    ui.move_history_selection(-1);
+                    let total = build_slash_suggestions(workspace, &ui.input).len();
+                    ui.sync_slash_navigation(total);
                 }
             }
             KeyEvent {
@@ -226,6 +234,10 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 let total = build_slash_suggestions(workspace, &ui.input).len();
                 if ui.input.starts_with('/') && total > 0 {
                     ui.move_slash_selection(total, 1);
+                } else {
+                    ui.move_history_selection(1);
+                    let total = build_slash_suggestions(workspace, &ui.input).len();
+                    ui.sync_slash_navigation(total);
                 }
             }
             KeyEvent {
@@ -245,6 +257,7 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 let line = ui.input.trim().to_string();
                 ui.input.clear();
                 ui.sync_slash_navigation(0);
+                ui.remember_input(&line);
                 if line.is_empty() {
                     continue;
                 }
@@ -291,6 +304,9 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 ui.input.push(ch);
                 let total = build_slash_suggestions(workspace, &ui.input).len();
                 ui.sync_slash_navigation(total);
+                if ui.history_selection.is_some() {
+                    ui.clear_history_navigation();
+                }
             }
             KeyEvent {
                 code: KeyCode::Tab, ..
@@ -318,6 +334,9 @@ struct TuiState {
     model_choices: Vec<String>,
     slash_selection: usize,
     slash_scroll: usize,
+    input_history: Vec<String>,
+    history_selection: Option<usize>,
+    history_draft: String,
 }
 
 impl TuiState {
@@ -328,6 +347,9 @@ impl TuiState {
             model_choices: Vec::new(),
             slash_selection: 0,
             slash_scroll: 0,
+            input_history: Vec::new(),
+            history_selection: None,
+            history_draft: String::new(),
         }
     }
 
@@ -390,6 +412,58 @@ impl TuiState {
             (self.slash_selection + 1).min(last)
         };
         self.sync_slash_navigation(total);
+    }
+
+    fn remember_input(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            self.history_selection = None;
+            self.history_draft.clear();
+            return;
+        }
+        if self.input_history.last().map(String::as_str) != Some(trimmed) {
+            self.input_history.push(trimmed.to_string());
+        }
+        self.history_selection = None;
+        self.history_draft.clear();
+    }
+
+    fn move_history_selection(&mut self, direction: isize) {
+        if self.input_history.is_empty() {
+            return;
+        }
+
+        if self.history_selection.is_none() {
+            self.history_draft = self.input.clone();
+        }
+
+        match direction {
+            d if d < 0 => {
+                let next = match self.history_selection {
+                    Some(index) => index.saturating_sub(1),
+                    None => self.input_history.len().saturating_sub(1),
+                };
+                self.history_selection = Some(next);
+                self.input = self.input_history[next].clone();
+            }
+            _ => match self.history_selection {
+                Some(index) if index + 1 < self.input_history.len() => {
+                    let next = index + 1;
+                    self.history_selection = Some(next);
+                    self.input = self.input_history[next].clone();
+                }
+                Some(_) => {
+                    self.history_selection = None;
+                    self.input = self.history_draft.clone();
+                }
+                None => {}
+            },
+        }
+    }
+
+    fn clear_history_navigation(&mut self) {
+        self.history_selection = None;
+        self.history_draft.clear();
     }
 }
 
@@ -4011,5 +4085,35 @@ mod tests {
         );
         assert!(lines[1].starts_with("  /help"));
         assert!(lines[2].starts_with("> /model"));
+    }
+
+    #[test]
+    fn history_navigation_walks_previous_inputs_and_restores_draft() {
+        let mut ui = TuiState::new();
+        ui.remember_input("first");
+        ui.remember_input("second");
+        ui.input = "par".to_string();
+
+        ui.move_history_selection(-1);
+        assert_eq!(ui.input, "second");
+
+        ui.move_history_selection(-1);
+        assert_eq!(ui.input, "first");
+
+        ui.move_history_selection(1);
+        assert_eq!(ui.input, "second");
+
+        ui.move_history_selection(1);
+        assert_eq!(ui.input, "par");
+    }
+
+    #[test]
+    fn remember_input_avoids_duplicate_consecutive_entries() {
+        let mut ui = TuiState::new();
+        ui.remember_input("same");
+        ui.remember_input("same");
+        ui.remember_input("other");
+
+        assert_eq!(ui.input_history, vec!["same".to_string(), "other".to_string()]);
     }
 }
