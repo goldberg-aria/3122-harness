@@ -462,6 +462,7 @@ fn core_slash_suggestions() -> Vec<SlashSuggestion> {
         ("mcp", "List discovered MCP servers"),
         ("session", "Show latest session path"),
         ("parallel-read", "Run read/grep/glob in one batch"),
+        ("q", "Leave the session"),
         ("exit", "Leave the session"),
     ]
     .into_iter()
@@ -532,7 +533,7 @@ fn process_repl_input_tui(
 
     match trimmed {
         "" => return ReplDirective::Continue,
-        "/exit" | "/quit" => return ReplDirective::Exit,
+        "/exit" | "/quit" | "/q" => return ReplDirective::Exit,
         "/help" => {
             ui.push_block(&render_repl_help_text());
             return ReplDirective::Continue;
@@ -827,7 +828,7 @@ fn handle_repl_line(
 ) -> ReplDirective {
     match trimmed {
         "" => return ReplDirective::Continue,
-        "/exit" | "/quit" => return ReplDirective::Exit,
+        "/exit" | "/quit" | "/q" => return ReplDirective::Exit,
         "/help" => {
             print_repl_help();
             return ReplDirective::Continue;
@@ -1117,6 +1118,7 @@ fn render_repl_help_text() -> String {
         "/glob       find paths",
         "/exec       run a shell command",
         "/parallel-read run read/grep/glob in one batch",
+        "/q          leave the repl",
         "/exit       leave the repl",
     ]
     .join("\n")

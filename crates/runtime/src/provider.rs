@@ -899,8 +899,51 @@ fn parse_anthropic_tool_calls(content: &[AnthropicContentBlock]) -> Vec<Provider
 }
 
 fn parse_tool_arguments(arguments: &str) -> Result<Value, String> {
-    serde_json::from_str(arguments)
-        .map_err(|err| format!("tool call arguments were not valid JSON: {err}"))
+    if let Ok(parsed) = serde_json::from_str(arguments) {
+        return Ok(parsed);
+    }
+
+    let repaired = repair_tool_arguments(arguments);
+    serde_json::from_str(&repaired).map_err(|err| {
+        format!(
+            "tool call arguments were not valid JSON: {err} | raw={} | repaired={}",
+            arguments.trim(),
+            repaired
+        )
+    })
+}
+
+fn repair_tool_arguments(arguments: &str) -> String {
+    let mut repaired = arguments.trim().trim_matches('`').trim().to_string();
+
+    if repaired.ends_with(',') {
+        repaired.pop();
+    }
+
+    let quote_count = repaired
+        .chars()
+        .enumerate()
+        .filter(|(index, ch)| {
+            *ch == '"' && (index == &0 || !repaired[..*index].ends_with('\\'))
+        })
+        .count();
+    if quote_count % 2 == 1 {
+        repaired.push('"');
+    }
+
+    let open_braces = repaired.chars().filter(|ch| *ch == '{').count();
+    let close_braces = repaired.chars().filter(|ch| *ch == '}').count();
+    if open_braces > close_braces {
+        repaired.push_str(&"}".repeat(open_braces - close_braces));
+    }
+
+    let open_brackets = repaired.chars().filter(|ch| *ch == '[').count();
+    let close_brackets = repaired.chars().filter(|ch| *ch == ']').count();
+    if open_brackets > close_brackets {
+        repaired.push_str(&"]".repeat(open_brackets - close_brackets));
+    }
+
+    repaired
 }
 
 #[derive(Debug, Deserialize)]
@@ -1137,6 +1180,20 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "read");
         assert_eq!(tool_calls[0].arguments["path"], "README.md");
+    }
+
+    #[test]
+    fn repairs_truncated_openai_tool_arguments() {
+        let tool_calls = parse_openai_tool_calls(Some(vec![OpenAiToolCall {
+            id: "call_1".to_string(),
+            function: OpenAiFunctionCall {
+                name: "read".to_string(),
+                arguments: "{\"path\":\"AGENT.md".to_string(),
+            },
+        }]))
+        .unwrap();
+
+        assert_eq!(tool_calls[0].arguments["path"], "AGENT.md");
     }
 
     #[test]

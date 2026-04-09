@@ -680,19 +680,71 @@ fn enforce_verification_policy(
 
 fn parse_tool_call(text: &str) -> Result<Option<ToolCallEnvelope>, String> {
     let trimmed = text.trim();
-    if !trimmed.starts_with("<tool_call>") {
+    if !trimmed.contains("<tool_call>") {
         return Ok(None);
     }
-    let body = trimmed
-        .strip_prefix("<tool_call>")
-        .and_then(|value| value.strip_suffix("</tool_call>"))
-        .ok_or_else(|| "invalid tool_call wrapper".to_string())?
-        .trim();
-    let parsed = serde_json::from_str::<ToolCallEnvelope>(body).map_err(|err| err.to_string())?;
+    let body = extract_tool_call_body(trimmed).ok_or_else(|| "invalid tool_call wrapper".to_string())?;
+    let repaired = repair_text_tool_call_body(&body);
+    let parsed = serde_json::from_str::<ToolCallEnvelope>(&repaired).map_err(|err| {
+        format!(
+            "tool call arguments were not valid JSON: {err}; raw={body}; repaired={repaired}"
+        )
+    })?;
     if parsed.tool.trim().is_empty() {
         return Err("tool call is missing tool name".to_string());
     }
     Ok(Some(parsed))
+}
+
+fn extract_tool_call_body(text: &str) -> Option<String> {
+    let start = text.find("<tool_call>")?;
+    let rest = &text[start + "<tool_call>".len()..];
+    let end = rest.find("</tool_call>")?;
+    Some(rest[..end].trim().to_string())
+}
+
+fn repair_text_tool_call_body(body: &str) -> String {
+    let mut repaired = body.trim().replace("</parameter>", "");
+    repaired = repaired.replace("<parameter>", "");
+    repaired = repaired.replace("```json", "");
+    repaired = repaired.replace("```", "");
+    repaired = repaired.trim().to_string();
+    if repaired.ends_with(',') {
+        repaired.pop();
+    }
+    close_unbalanced_quotes(&mut repaired);
+    close_unbalanced_pairs(&mut repaired, '{', '}');
+    close_unbalanced_pairs(&mut repaired, '[', ']');
+    repaired
+}
+
+fn close_unbalanced_quotes(text: &mut String) {
+    let mut quote_count = 0;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quote_count += 1;
+        }
+    }
+    if quote_count % 2 == 1 {
+        text.push('"');
+    }
+}
+
+fn close_unbalanced_pairs(text: &mut String, open: char, close: char) {
+    let opens = text.chars().filter(|ch| *ch == open).count();
+    let closes = text.chars().filter(|ch| *ch == close).count();
+    for _ in 0..opens.saturating_sub(closes) {
+        text.push(close);
+    }
 }
 
 fn execute_tool_request(
@@ -924,6 +976,17 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.tool, "read");
         assert_eq!(parsed.arguments["path"], "README.md");
+    }
+
+    #[test]
+    fn parses_tool_call_blocks_with_wrappers_and_noise() {
+        let parsed = parse_tool_call(
+            "알겠습니다.\n<tool_call>\n{\"tool\":\"exec\",\"arguments\":{\"command\":\"ls -la\"}}</parameter>\n</tool_call>\n진행하겠습니다.",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.tool, "exec");
+        assert_eq!(parsed.arguments["command"], "ls -la");
     }
 
     #[test]
