@@ -75,6 +75,28 @@ pub struct SavedMemoryBundle {
     pub saved_records: Vec<MemoryRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelHandoffSnapshot {
+    #[serde(default)]
+    pub from_model: Option<String>,
+    pub to_model: String,
+    pub current_goal: String,
+    pub recent_work_summary: String,
+    #[serde(default)]
+    pub open_tasks: Vec<String>,
+    #[serde(default)]
+    pub recent_errors: Vec<String>,
+    pub suggested_next_step: String,
+    #[serde(default)]
+    pub session_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredModelHandoff {
+    pub ts_ms: u128,
+    pub snapshot: ModelHandoffSnapshot,
+}
+
 pub fn memory_dir(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".harness").join("memory")
 }
@@ -247,6 +269,11 @@ pub fn save_session_memory_bundle(
 
 pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
     let latest_session = SessionStore::latest(workspace_root)?;
+    let latest_handoff = latest_session
+        .as_deref()
+        .map(latest_model_handoff)
+        .transpose()?
+        .flatten();
     let memories = list_memory_records(workspace_root)?;
     let latest_summary = memories
         .iter()
@@ -271,6 +298,14 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "-".to_string())
     ));
+    if let Some(handoff) = latest_handoff {
+        out.push_str(&format!("active_model: {}\n", handoff.snapshot.to_model));
+        if let Some(previous) = handoff.snapshot.from_model.as_deref() {
+            out.push_str(&format!("previous_model: {}\n", previous));
+        }
+        out.push_str(&format!("current_goal: {}\n", handoff.snapshot.current_goal));
+        out.push_str(&format!("next_step: {}\n", handoff.snapshot.suggested_next_step));
+    }
     if let Some(summary) = latest_summary {
         out.push_str(&format!("latest_summary: {}\n", summary.title));
         out.push_str(&summary.body);
@@ -302,13 +337,21 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
     let summary_record = list_memory_records(workspace_root)?
         .into_iter()
         .find(|record| record.kind == MemoryKind::Summary.as_str());
+    let latest_handoff = latest_session
+        .as_deref()
+        .map(latest_model_handoff)
+        .transpose()?
+        .flatten();
 
     let mut out = String::new();
     out.push_str("Handoff\n\n");
     if let Some(path) = latest_session {
         out.push_str(&format!("Latest session: {}\n\n", path.display()));
     }
-    if let Some(summary) = summary_record {
+    if let Some(handoff) = latest_handoff {
+        out.push_str(&render_model_handoff_text(&handoff.snapshot));
+        out.push_str("\n\n");
+    } else if let Some(summary) = summary_record {
         out.push_str("Session summary:\n");
         out.push_str(&summary.body);
         out.push_str("\n\n");
@@ -358,6 +401,125 @@ pub fn build_memory_recall_text(workspace_root: &Path, limit: usize) -> Result<S
         out.push_str("\n\n");
     }
     Ok(out.trim().to_string())
+}
+
+pub fn build_model_handoff_snapshot(
+    workspace_root: &Path,
+    session_path: &Path,
+    from_model: Option<&str>,
+    to_model: &str,
+) -> Result<ModelHandoffSnapshot, String> {
+    let events = SessionStore::read_events(session_path)?;
+    let digest = summarize_session_events(&events);
+    let records = list_memory_records(workspace_root)?;
+
+    let latest_summary = records
+        .iter()
+        .find(|record| record.kind == MemoryKind::Summary.as_str());
+    let current_goal = digest
+        .goals
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Continue the current task".to_string());
+
+    let recent_work_summary = if digest.summary.trim() != "No significant events captured." {
+        truncate_text(&digest.summary, 600)
+    } else if let Some(summary) = latest_summary {
+        truncate_text(&summary.body, 600)
+    } else {
+        "No recent work summary captured.".to_string()
+    };
+
+    let open_tasks = digest.goals.iter().take(3).cloned().collect::<Vec<_>>();
+    let recent_errors = digest.errors.iter().take(2).cloned().collect::<Vec<_>>();
+    let suggested_next_step = open_tasks
+        .first()
+        .map(|task| format!("Continue with: {task}"))
+        .unwrap_or_else(|| {
+            if current_goal == "Continue the current task" {
+                "Read the latest context and continue.".to_string()
+            } else {
+                format!("Continue the current goal: {current_goal}")
+            }
+        });
+
+    Ok(ModelHandoffSnapshot {
+        from_model: from_model.map(ToOwned::to_owned),
+        to_model: to_model.to_string(),
+        current_goal,
+        recent_work_summary,
+        open_tasks,
+        recent_errors,
+        suggested_next_step,
+        session_path: Some(session_path.display().to_string()),
+    })
+}
+
+pub fn latest_model_handoff(session_path: &Path) -> Result<Option<StoredModelHandoff>, String> {
+    let events = SessionStore::read_events(session_path)?;
+    for event in events.into_iter().rev() {
+        if event.kind != "model_handoff" {
+            continue;
+        }
+        let snapshot = serde_json::from_value::<ModelHandoffSnapshot>(event.payload)
+            .map_err(|err| err.to_string())?;
+        return Ok(Some(StoredModelHandoff {
+            ts_ms: event.ts_ms,
+            snapshot,
+        }));
+    }
+    Ok(None)
+}
+
+pub fn pending_model_handoff(session_path: &Path) -> Result<Option<StoredModelHandoff>, String> {
+    let events = SessionStore::read_events(session_path)?;
+    let Some(index) = events.iter().rposition(|event| event.kind == "model_handoff") else {
+        return Ok(None);
+    };
+
+    let handoff_event = &events[index];
+    if events
+        .iter()
+        .skip(index + 1)
+        .any(|event| matches!(event.kind.as_str(), "agent_result" | "prompt_result" | "model_probe_failed"))
+    {
+        return Ok(None);
+    }
+
+    let snapshot = serde_json::from_value::<ModelHandoffSnapshot>(handoff_event.payload.clone())
+        .map_err(|err| err.to_string())?;
+    Ok(Some(StoredModelHandoff {
+        ts_ms: handoff_event.ts_ms,
+        snapshot,
+    }))
+}
+
+pub fn render_model_handoff_text(snapshot: &ModelHandoffSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str("Current goal:\n");
+    out.push_str(&snapshot.current_goal);
+    out.push_str("\n\nDone recently:\n");
+    out.push_str(&snapshot.recent_work_summary);
+    out.push('\n');
+    if !snapshot.open_tasks.is_empty() {
+        out.push_str("\nOpen tasks:\n");
+        for task in &snapshot.open_tasks {
+            out.push_str("- ");
+            out.push_str(task);
+            out.push('\n');
+        }
+    }
+    if !snapshot.recent_errors.is_empty() {
+        out.push_str("\nWarnings:\n");
+        for error in &snapshot.recent_errors {
+            out.push_str("- ");
+            out.push_str(error);
+            out.push('\n');
+        }
+    }
+    out.push_str("\nNext step:\n");
+    out.push_str(&snapshot.suggested_next_step);
+    out
 }
 
 pub fn summarize_session_events(events: &[SessionEvent]) -> SessionDigest {
@@ -503,9 +665,10 @@ mod tests {
     use crate::session::SessionEvent;
 
     use super::{
-        append_memory_record, build_handoff_text, build_memory_recall_text, build_resume_text,
-        list_memory_records, save_session_memory_bundle, save_session_summary,
-        search_memory_records, summarize_session_events, MemoryKind,
+        append_memory_record, build_handoff_text, build_memory_recall_text,
+        build_model_handoff_snapshot, build_resume_text, latest_model_handoff,
+        list_memory_records, pending_model_handoff, save_session_memory_bundle,
+        save_session_summary, search_memory_records, summarize_session_events, MemoryKind,
     };
 
     fn temp_workspace(prefix: &str) -> PathBuf {
@@ -597,14 +760,157 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let handoff_snapshot = build_model_handoff_snapshot(
+            &workspace,
+            &session_path,
+            Some("anthropic/claude-sonnet-4-6"),
+            "openai/gpt-4.1-mini",
+        )
+        .unwrap();
+        fs::write(
+            &session_path,
+            [
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 1,
+                    kind: "user_input".to_string(),
+                    payload: json!({ "text": "continue provider integration" }),
+                })
+                .unwrap(),
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 2,
+                    kind: "model_handoff".to_string(),
+                    payload: serde_json::to_value(handoff_snapshot).unwrap(),
+                })
+                .unwrap(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
         let _ = save_session_summary(&workspace, &session_path).unwrap();
 
         let resume = build_resume_text(&workspace).unwrap();
         let handoff = build_handoff_text(&workspace).unwrap();
 
         assert!(resume.contains("latest_session:"));
+        assert!(resume.contains("active_model: openai/gpt-4.1-mini"));
         assert!(handoff.contains("Handoff"));
-        assert!(handoff.contains("Continue from this context"));
+        assert!(handoff.contains("Current goal:"));
+        assert!(handoff.contains("Next step:"));
+
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn builds_model_handoff_snapshot_from_session_and_memory() {
+        let workspace = temp_workspace("memory-model-handoff");
+        let session_path = workspace.join(".harness/sessions/session-test.jsonl");
+        fs::write(
+            &session_path,
+            [
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 1,
+                    kind: "user_input".to_string(),
+                    payload: json!({ "text": "finish provider switching UX" }),
+                })
+                .unwrap(),
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 2,
+                    kind: "tool_error".to_string(),
+                    payload: json!({ "error": "missing handoff snapshot" }),
+                })
+                .unwrap(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        append_memory_record(
+            &workspace,
+            MemoryKind::Task,
+            "finish provider switching UX",
+            "finish provider switching UX",
+            &[],
+            Some(&session_path),
+        )
+        .unwrap();
+
+        let snapshot = build_model_handoff_snapshot(
+            &workspace,
+            &session_path,
+            Some("anthropic/claude-sonnet-4-6"),
+            "openai/gpt-4.1-mini",
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.from_model.as_deref(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+        assert_eq!(snapshot.to_model, "openai/gpt-4.1-mini");
+        assert!(snapshot.current_goal.contains("finish provider switching UX"));
+        assert!(!snapshot.open_tasks.is_empty());
+        assert!(!snapshot.recent_errors.is_empty());
+
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn tracks_pending_model_handoff_until_completion() {
+        let workspace = temp_workspace("memory-pending-handoff");
+        let session_path = workspace.join(".harness/sessions/session-test.jsonl");
+        fs::write(
+            &session_path,
+            serde_json::to_string(&SessionEvent {
+                ts_ms: 1,
+                kind: "user_input".to_string(),
+                payload: json!({ "text": "finish handoff wiring" }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let snapshot = build_model_handoff_snapshot(
+            &workspace,
+            &session_path,
+            Some("anthropic/claude-sonnet-4-6"),
+            "openai/gpt-4.1-mini",
+        )
+        .unwrap();
+        fs::write(
+            &session_path,
+            serde_json::to_string(&SessionEvent {
+                ts_ms: 1,
+                kind: "model_handoff".to_string(),
+                payload: serde_json::to_value(&snapshot).unwrap(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let pending = pending_model_handoff(&session_path).unwrap().unwrap();
+        assert_eq!(pending.snapshot.to_model, "openai/gpt-4.1-mini");
+        let latest = latest_model_handoff(&session_path).unwrap().unwrap();
+        assert_eq!(latest.snapshot.current_goal, snapshot.current_goal);
+
+        fs::write(
+            &session_path,
+            [
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 1,
+                    kind: "model_handoff".to_string(),
+                    payload: serde_json::to_value(&snapshot).unwrap(),
+                })
+                .unwrap(),
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 2,
+                    kind: "agent_result".to_string(),
+                    payload: json!({ "text": "done" }),
+                })
+                .unwrap(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        assert!(pending_model_handoff(&session_path).unwrap().is_none());
 
         cleanup(&workspace);
     }

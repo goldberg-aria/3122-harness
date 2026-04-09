@@ -53,6 +53,7 @@ This repository currently contains:
 - read-only `parallel_read` batching for one-turn discovery
 - provider-native tool calling for Anthropic, OpenAI-compatible, and Ollama with text-tool fallback
 - task-aware verification that requires checks after the last code mutation while exempting docs-only edits
+- automatic model-switch handoff snapshots with first-turn context boost
 - runtime unit tests covering config, permissions, providers, skills, MCP, and the harness loop
 
 Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/ROADMAP.md).
@@ -135,7 +136,7 @@ REPL shape:
 
 - the base flow is closer to Codex/Claude-style slash commands
 - primary session commands are `/status`, `/model`, `/login`, `/memory`, `/resume`, `/handoff`, `/why-context`, `/approval`, `/doctor`
-- `/model <spec>` switches the active model for the current session
+- `/model <spec>` switches the active model, stores a handoff snapshot, and prints a short active/previous/next summary
 - `/parallel-read <json-array>` batches read-only discovery work in one turn
 
 Local-Lite memory:
@@ -143,10 +144,11 @@ Local-Lite memory:
 - `memory save` promotes the latest session into local memory
 - `memory` lists recent memory records
 - `memory search <query>` searches saved memory locally
-- `resume` and `handoff` render that memory back into operator-friendly text
+- `resume` and `handoff` render session and handoff state back into operator-friendly text
 - `why-context` prints the exact runtime context injected before a model turn
 - REPL exit autosaves new local memory records for the current session
 - prompt context now includes recent working history, Local-Lite memory recall, and relevant conversation recall from older sessions
+- the first prompt after `/model <spec>` gets a temporary handoff boost in prompt context
 - prompt context is budgeted so long sessions degrade conversation recall first, then memory, recent history, and finally instructions
 
 Skill summaries:
@@ -163,8 +165,8 @@ Saved provider profiles:
 
 ## Immediate next steps
 
-1. Add richer model-switch handoff and session resume flows.
-2. Add env-gated provider integration tests beyond unit coverage.
-3. Introduce a dedicated verifier abstraction beyond heuristics.
-4. Tighten runtime UX around status, memory, approvals, and verification feedback.
-5. Add provider-specific prompt shaping for weaker local models.
+1. Add env-gated provider integration tests beyond unit coverage.
+2. Introduce a dedicated verifier abstraction beyond heuristics.
+3. Tighten runtime UX around status, memory, approvals, and verification feedback.
+4. Add provider-specific prompt shaping for weaker local models.
+5. Add model-aware context budgeting instead of fixed heuristics.

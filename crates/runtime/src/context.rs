@@ -4,7 +4,10 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use crate::{build_memory_recall_text, LoadedConfig, PermissionMode, SessionStore};
+use crate::{
+    build_memory_recall_text, pending_model_handoff, render_model_handoff_text, LoadedConfig,
+    PermissionMode, SessionStore,
+};
 
 const MAX_INSTRUCTION_CHARS: usize = 8000;
 const MAX_RECENT_HISTORY_EVENTS: usize = 8;
@@ -13,7 +16,9 @@ const MAX_MEMORY_RECALL_CHARS: usize = 1800;
 const MAX_CONVERSATION_RECALL_LINES: usize = 6;
 const MAX_CONVERSATION_RECALL_CHARS: usize = 1800;
 const MAX_PROMPT_CONTEXT_CHARS: usize = 12000;
+const MAX_MODEL_HANDOFF_CHARS: usize = 1400;
 const BUDGETED_INSTRUCTION_CHARS: usize = 4000;
+const BUDGETED_MODEL_HANDOFF_CHARS: usize = 700;
 const BUDGETED_RECENT_HISTORY_CHARS: usize = 1200;
 const BUDGETED_MEMORY_RECALL_CHARS: usize = 1200;
 const BUDGETED_CONVERSATION_RECALL_CHARS: usize = 900;
@@ -27,8 +32,10 @@ pub struct WorkspaceContext {
     pub configured_primary_model: Option<String>,
     pub session_id: Option<String>,
     pub session_path: Option<PathBuf>,
+    pub handoff_boost_active: bool,
     pub git: GitContext,
     pub instructions: Vec<InstructionContext>,
+    pub model_handoff: String,
     pub recent_history: String,
     pub memory_recall: String,
     pub conversation_recall: String,
@@ -59,6 +66,13 @@ pub fn gather_workspace_context(
     let latest_session_path = SessionStore::latest_in(&config.session_dir(workspace_root))
         .ok()
         .flatten();
+    let pending_handoff = latest_session_path
+        .as_deref()
+        .map(pending_model_handoff)
+        .transpose()
+        .ok()
+        .flatten()
+        .flatten();
     WorkspaceContext {
         workspace_root: workspace_root.to_path_buf(),
         config_source: config.source.clone(),
@@ -69,8 +83,13 @@ pub fn gather_workspace_context(
             .as_deref()
             .and_then(SessionStore::session_id_from_path),
         session_path: latest_session_path,
+        handoff_boost_active: pending_handoff.is_some(),
         git: detect_git_context(workspace_root),
         instructions: discover_instruction_contexts(workspace_root),
+        model_handoff: pending_handoff
+            .as_ref()
+            .map(|handoff| truncate_text(&render_model_handoff_text(&handoff.snapshot), MAX_MODEL_HANDOFF_CHARS))
+            .unwrap_or_else(|| "none".to_string()),
         recent_history: build_recent_history(config, workspace_root)
             .unwrap_or_else(|_| "none".to_string()),
         memory_recall: build_memory_recall_text(workspace_root, 5)
@@ -83,6 +102,7 @@ pub fn gather_workspace_context(
 
 pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     let mut instructions = render_instructions_block(&context.instructions);
+    let mut model_handoff = context.model_handoff.clone();
     let mut recent_history = context.recent_history.clone();
     let mut memory_recall = context.memory_recall.clone();
     let mut conversation_recall = context.conversation_recall.clone();
@@ -90,6 +110,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     let mut out = render_prompt_context_sections(
         context,
         &instructions,
+        &model_handoff,
         &recent_history,
         &memory_recall,
         &conversation_recall,
@@ -102,6 +123,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     out = render_prompt_context_sections(
         context,
         &instructions,
+        &model_handoff,
         &recent_history,
         &memory_recall,
         &conversation_recall,
@@ -114,6 +136,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     out = render_prompt_context_sections(
         context,
         &instructions,
+        &model_handoff,
         &recent_history,
         &memory_recall,
         &conversation_recall,
@@ -126,6 +149,20 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     out = render_prompt_context_sections(
         context,
         &instructions,
+        &model_handoff,
+        &recent_history,
+        &memory_recall,
+        &conversation_recall,
+    );
+    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+        return out;
+    }
+
+    model_handoff = budget_section(&model_handoff, BUDGETED_MODEL_HANDOFF_CHARS);
+    out = render_prompt_context_sections(
+        context,
+        &instructions,
+        &model_handoff,
         &recent_history,
         &memory_recall,
         &conversation_recall,
@@ -138,6 +175,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     out = render_prompt_context_sections(
         context,
         &instructions,
+        &model_handoff,
         &recent_history,
         &memory_recall,
         &conversation_recall,
@@ -152,6 +190,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
 fn render_prompt_context_sections(
     context: &WorkspaceContext,
     instructions: &str,
+    model_handoff: &str,
     recent_history: &str,
     memory_recall: &str,
     conversation_recall: &str,
@@ -192,6 +231,10 @@ fn render_prompt_context_sections(
             .unwrap_or_else(|| "-".to_string())
     ));
     out.push_str("workspace_boundary: current workspace only\n");
+    out.push_str(&format!(
+        "handoff_boost_active: {}\n",
+        context.handoff_boost_active
+    ));
 
     match &context.git.repo_root {
         Some(repo_root) => {
@@ -218,6 +261,10 @@ fn render_prompt_context_sections(
         out.push_str("instructions:\n");
         out.push_str(instructions);
     }
+
+    out.push_str("model_switch_handoff:\n");
+    out.push_str(model_handoff);
+    out.push('\n');
 
     out.push_str("recent_working_history:\n");
     out.push_str(recent_history);
@@ -306,6 +353,9 @@ fn build_recent_history(config: &LoadedConfig, workspace_root: &Path) -> Result<
 
     for event in events.iter().rev() {
         if let Some(line) = summarize_recent_event(event) {
+            if rendered.last().is_some_and(|existing| existing == &line) {
+                continue;
+            }
             rendered.push(line);
             if rendered.len() >= MAX_RECENT_HISTORY_EVENTS {
                 break;
@@ -463,6 +513,16 @@ fn summarize_recent_event(event: &crate::session::SessionEvent) -> Option<String
             .get("model")
             .and_then(|value| value.as_str())
             .map(|model| format!("model: {}", model)),
+        "model_handoff" => event
+            .payload
+            .get("suggested_next_step")
+            .and_then(|value| value.as_str())
+            .map(|next| format!("handoff: {}", truncate_text(next.trim(), 160))),
+        "model_probe_failed" => event
+            .payload
+            .get("error")
+            .and_then(|value| value.as_str())
+            .map(|reason| format!("model warning: {}", truncate_text(reason.trim(), 160))),
         "verification_warning" => event
             .payload
             .get("reason")
@@ -736,6 +796,7 @@ mod tests {
             session_path: Some(PathBuf::from(
                 "/tmp/workspace/.harness/sessions/session-1.jsonl",
             )),
+            handoff_boost_active: true,
             git: GitContext {
                 repo_root: None,
                 branch: None,
@@ -747,6 +808,7 @@ mod tests {
                 path: PathBuf::from("/tmp/workspace/AGENTS.md"),
                 contents: huge.clone(),
             }],
+            model_handoff: huge.clone(),
             recent_history: huge.clone(),
             memory_recall: huge.clone(),
             conversation_recall: huge,

@@ -210,6 +210,9 @@ Each event should be append-only:
 - tool request
 - tool result
 - approval event
+- model change
+- model handoff
+- model probe failure
 - usage accounting
 
 This keeps resume and audit straightforward.
@@ -218,6 +221,8 @@ Boundary strengthening:
 
 - prompt context includes `session_id`, `session_path`, and an explicit workspace boundary line
 - REPL emits a `session_start` event with workspace scope metadata
+- model switching stores a structured handoff snapshot in the session event log
+- the first turn after a model switch gets a temporary handoff boost in prompt context
 
 ## Local-Lite memory
 
@@ -349,6 +354,7 @@ But the harness should treat that as a backend transport, not as part of the cor
 13. tested provider-agnostic tool loop
 14. prompt/auto approval policy
 15. context assembly from local instructions and git state
+16. structured model-switch handoff and first-turn boost
 
 ## Test stance
 
@@ -364,8 +370,8 @@ Important runtime boundaries should stay covered by unit tests:
 The next testing focus should be:
 
 - Local-Lite memory save and recall
-- model switch handoff
 - approval behavior by tool risk
+- env-gated live provider integration checks
 
 ## Planning doc
 

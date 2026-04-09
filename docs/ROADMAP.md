@@ -190,6 +190,7 @@ Current progress:
 - text tool calling remains the common fallback path
 - approval refinement is wired with per-risk defaults and critical-command blocking
 - prompt context now has a budget manager for long sessions
+- `/model <spec>` now creates a handoff snapshot, prints a short transition summary, and boosts the first post-switch turn
 
 ### Workstream 5: Model switching
 
@@ -208,6 +209,7 @@ Exit criteria:
 
 - user can switch models mid-session
 - the next model starts with enough context to continue
+- first-call failures keep the new model active and record a probe failure event
 
 ### Workstream 6: Approval refinement
 

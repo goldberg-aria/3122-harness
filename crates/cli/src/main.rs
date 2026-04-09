@@ -3,14 +3,16 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use runtime::{
-    backend_catalog, blueprint_summary, build_handoff_text, build_resume_text, call_mcp_tool,
-    detect_provider_key, discover_mcp_servers, discover_skills, doctor_report, edit_file,
-    exec_command, gather_workspace_context, glob_search, grep_search, list_mcp_tools,
-    list_memory_records, load_config, load_provider_registry, parallel_read_only, provider_preset,
+    backend_catalog, blueprint_summary, build_handoff_text, build_model_handoff_snapshot,
+    build_resume_text, call_mcp_tool, detect_provider_key, discover_mcp_servers, discover_skills,
+    doctor_report, edit_file, exec_command, gather_workspace_context, glob_search, grep_search,
+    latest_model_handoff, list_mcp_tools, list_memory_records, load_config,
+    load_provider_registry, parallel_read_only, pending_model_handoff, provider_preset,
     provider_presets, read_file, remove_provider_profile, render_prompt_context, resolve_skill,
     run_agent_loop, save_config, save_session_memory_bundle, search_memory_records,
     upsert_provider_profile, write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy,
-    ApprovalRequest, LoadedConfig, PermissionMode, SavedProviderProfile, SessionStore, ToolOutput,
+    ApprovalRequest, LoadedConfig, ModelHandoffSnapshot, PermissionMode, SavedProviderProfile,
+    SessionStore, ToolOutput,
 };
 use serde_json::json;
 
@@ -257,9 +259,33 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                         eprintln!("usage: /model <provider/model | profile/alias/model>");
                         continue;
                     }
+                    let previous_model = current_model
+                        .as_deref()
+                        .or_else(|| config.primary_model())
+                        .map(ToOwned::to_owned);
                     current_model = Some(model.to_string());
-                    let _ = session.append("model_change", json!({ "model": model }));
-                    println!("model set to {model}");
+                    let _ = session.append(
+                        "model_change",
+                        json!({ "from": previous_model, "model": model }),
+                    );
+                    match build_model_handoff_snapshot(
+                        workspace,
+                        session.path(),
+                        previous_model.as_deref(),
+                        model,
+                    ) {
+                        Ok(snapshot) => {
+                            let _ = session.append(
+                                "model_handoff",
+                                serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
+                            );
+                            print_model_switch_summary(&snapshot);
+                        }
+                        Err(err) => {
+                            eprintln!("model set to {model}");
+                            eprintln!("warning: failed to build handoff: {err}");
+                        }
+                    }
                     continue;
                 }
                 if trimmed == "/memory save" {
@@ -347,6 +373,12 @@ fn print_repl_status(
     println!("workspace: {}", workspace.display());
     println!("session: {}", session.path().display());
     println!("model: {}", current_model.unwrap_or("-"));
+    if let Ok(Some(handoff)) = latest_model_handoff(session.path()) {
+        if let Some(previous) = handoff.snapshot.from_model.as_deref() {
+            println!("previous_model: {previous}");
+        }
+        println!("next_step: {}", handoff.snapshot.suggested_next_step);
+    }
     println!("mode: {mode}");
     println!(
         "approval: {} ({})",
@@ -359,6 +391,15 @@ fn print_repl_status(
 fn print_model_status(workspace: &Path, config: &LoadedConfig, current_model: Option<&str>) {
     println!("active: {}", current_model.unwrap_or("-"));
     println!("default: {}", config.primary_model().unwrap_or("-"));
+    if let Ok(Some(session_path)) = SessionStore::latest(workspace) {
+        if let Ok(Some(handoff)) = latest_model_handoff(&session_path) {
+            if let Some(previous) = handoff.snapshot.from_model.as_deref() {
+                println!("previous: {previous}");
+            }
+            println!("current_goal: {}", handoff.snapshot.current_goal);
+            println!("next: {}", handoff.snapshot.suggested_next_step);
+        }
+    }
     if !config.data.model.fallback.is_empty() {
         println!("fallback: {}", config.data.model.fallback.join(", "));
     }
@@ -455,6 +496,30 @@ fn save_latest_session_memory(workspace: &Path, session: &SessionStore) {
         }
         Err(err) => eprintln!("{err}"),
     }
+}
+
+fn print_model_switch_summary(snapshot: &ModelHandoffSnapshot) {
+    println!("active: {}", snapshot.to_model);
+    println!(
+        "previous: {}",
+        snapshot.from_model.as_deref().unwrap_or("-")
+    );
+    println!("handoff: {}", compact_line(&snapshot.current_goal, 96));
+    println!("next: {}", compact_line(&snapshot.suggested_next_step, 96));
+    if !snapshot.recent_errors.is_empty() {
+        println!(
+            "warning: {}",
+            compact_line(snapshot.recent_errors[0].as_str(), 96)
+        );
+    }
+}
+
+fn compact_line(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let truncated = input.chars().take(max_chars).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn autosave_session_memory(workspace: &Path, session: &SessionStore) {
@@ -1213,6 +1278,15 @@ fn run_prompt(
             let rendered = errors.join("\n");
             if let Some(store) = session {
                 let _ = store.append("prompt_error", json!({ "errors": errors }));
+                if let Ok(Some(handoff)) = pending_model_handoff(store.path()) {
+                    let _ = store.append(
+                        "model_probe_failed",
+                        json!({
+                            "model": handoff.snapshot.to_model,
+                            "error": rendered,
+                        }),
+                    );
+                }
             }
             eprintln!("{rendered}");
             if session.is_none() {

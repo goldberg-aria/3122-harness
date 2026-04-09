@@ -30,10 +30,11 @@ pub use context::{
 pub use discovery::{discover_mcp_servers, discover_skills, McpServerEntry, SkillEntry};
 pub use mcp::{call_tool as call_mcp_tool, list_tools as list_mcp_tools, McpToolInfo};
 pub use memory::{
-    append_memory_record, build_handoff_text, build_memory_recall_text, build_resume_text,
-    list_memory_records, memory_dir, save_session_memory_bundle, save_session_summary,
-    search_memory_records, summarize_session_events, MemoryKind, MemoryRecord, SavedMemoryBundle,
-    SessionDigest,
+    append_memory_record, build_handoff_text, build_memory_recall_text,
+    build_model_handoff_snapshot, build_resume_text, latest_model_handoff, list_memory_records,
+    memory_dir, pending_model_handoff, render_model_handoff_text, save_session_memory_bundle,
+    save_session_summary, search_memory_records, summarize_session_events, MemoryKind,
+    MemoryRecord, ModelHandoffSnapshot, SavedMemoryBundle, SessionDigest, StoredModelHandoff,
 };
 pub use permissions::{can_exec, can_read, can_write, PermissionDecision, PermissionMode};
 pub use profiles::{
