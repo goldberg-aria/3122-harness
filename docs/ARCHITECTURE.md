@@ -86,6 +86,7 @@ Current implementation note:
 - if relevant workspace mutations happen without a recorded verification step, the harness annotates the final answer as `Not verified`
 - verification policy can now be `off`, `annotate`, or `require`
 - `parallel_read` batches multiple safe read-only discovery operations into one turn
+- prompt context is capped to a fixed budget and shrinks conversation recall, memory recall, recent history, and instructions in that order
 
 Planned evolution:
 
@@ -155,19 +156,20 @@ Rules:
 - file writes outside workspace require escalation
 - shell commands are classified conservatively
 - destructive commands are denied or escalated
-- prompt mode can be added later for interactive approval
 
 Current approval behavior:
 
 - model-requested tools go through an approval gate
 - default approval policy is `prompt`
-- `auto` mode skips the prompt and approves automatically
+- every request is classified as `low`, `medium`, `high`, or `critical`
+- `prompt` mode auto-approves low-risk tools, prompts for medium/high, and blocks critical
+- `auto` mode auto-approves low/medium/high and still blocks critical
 - REPL can switch policy at runtime
 
-Planned approval behavior:
+Context budget behavior:
 
-- add risk classes so low-risk tools can flow with less friction
-- keep the current policies as the top-level override
+- recent history, Local-Lite recall, and conversation recall are all trimmed before the final prompt is assembled
+- if the total prompt context still exceeds budget, instruction text is truncated last
 
 ## Workspace context
 

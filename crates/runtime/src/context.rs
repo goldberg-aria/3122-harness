@@ -12,6 +12,11 @@ const MAX_RECENT_HISTORY_CHARS: usize = 2000;
 const MAX_MEMORY_RECALL_CHARS: usize = 1800;
 const MAX_CONVERSATION_RECALL_LINES: usize = 6;
 const MAX_CONVERSATION_RECALL_CHARS: usize = 1800;
+const MAX_PROMPT_CONTEXT_CHARS: usize = 12000;
+const BUDGETED_INSTRUCTION_CHARS: usize = 4000;
+const BUDGETED_RECENT_HISTORY_CHARS: usize = 1200;
+const BUDGETED_MEMORY_RECALL_CHARS: usize = 1200;
+const BUDGETED_CONVERSATION_RECALL_CHARS: usize = 900;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceContext {
@@ -77,6 +82,80 @@ pub fn gather_workspace_context(
 }
 
 pub fn render_prompt_context(context: &WorkspaceContext) -> String {
+    let mut instructions = render_instructions_block(&context.instructions);
+    let mut recent_history = context.recent_history.clone();
+    let mut memory_recall = context.memory_recall.clone();
+    let mut conversation_recall = context.conversation_recall.clone();
+
+    let mut out = render_prompt_context_sections(
+        context,
+        &instructions,
+        &recent_history,
+        &memory_recall,
+        &conversation_recall,
+    );
+    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+        return out;
+    }
+
+    conversation_recall = budget_section(&conversation_recall, BUDGETED_CONVERSATION_RECALL_CHARS);
+    out = render_prompt_context_sections(
+        context,
+        &instructions,
+        &recent_history,
+        &memory_recall,
+        &conversation_recall,
+    );
+    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+        return out;
+    }
+
+    memory_recall = budget_section(&memory_recall, BUDGETED_MEMORY_RECALL_CHARS);
+    out = render_prompt_context_sections(
+        context,
+        &instructions,
+        &recent_history,
+        &memory_recall,
+        &conversation_recall,
+    );
+    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+        return out;
+    }
+
+    recent_history = budget_section(&recent_history, BUDGETED_RECENT_HISTORY_CHARS);
+    out = render_prompt_context_sections(
+        context,
+        &instructions,
+        &recent_history,
+        &memory_recall,
+        &conversation_recall,
+    );
+    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+        return out;
+    }
+
+    instructions = budget_section(&instructions, BUDGETED_INSTRUCTION_CHARS);
+    out = render_prompt_context_sections(
+        context,
+        &instructions,
+        &recent_history,
+        &memory_recall,
+        &conversation_recall,
+    );
+    if out.chars().count() <= MAX_PROMPT_CONTEXT_CHARS {
+        return out;
+    }
+
+    truncate_text(&out, MAX_PROMPT_CONTEXT_CHARS)
+}
+
+fn render_prompt_context_sections(
+    context: &WorkspaceContext,
+    instructions: &str,
+    recent_history: &str,
+    memory_recall: &str,
+    conversation_recall: &str,
+) -> String {
     let mut out = String::new();
     out.push_str("Runtime context:\n");
     out.push_str(&format!(
@@ -137,29 +216,42 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         out.push_str("instructions: none found\n");
     } else {
         out.push_str("instructions:\n");
-        for instruction in &context.instructions {
-            out.push_str(&format!(
-                "[{}] {}\n{}\n\n",
-                instruction.name,
-                instruction.path.display(),
-                instruction.contents
-            ));
-        }
+        out.push_str(instructions);
     }
 
     out.push_str("recent_working_history:\n");
-    out.push_str(&context.recent_history);
+    out.push_str(recent_history);
     out.push('\n');
 
     out.push_str("local_lite_recall:\n");
-    out.push_str(&context.memory_recall);
+    out.push_str(memory_recall);
     out.push('\n');
 
     out.push_str("conversation_recall:\n");
-    out.push_str(&context.conversation_recall);
+    out.push_str(conversation_recall);
     out.push('\n');
 
     out
+}
+
+fn render_instructions_block(instructions: &[InstructionContext]) -> String {
+    let mut out = String::new();
+    for instruction in instructions {
+        out.push_str(&format!(
+            "[{}] {}\n{}\n\n",
+            instruction.name,
+            instruction.path.display(),
+            instruction.contents
+        ));
+    }
+    out
+}
+
+fn budget_section(input: &str, max_chars: usize) -> String {
+    if input == "none" {
+        return "none".to_string();
+    }
+    truncate_text(input, max_chars)
 }
 
 fn discover_instruction_contexts(workspace_root: &Path) -> Vec<InstructionContext> {
@@ -495,9 +587,11 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::{append_memory_record, LoadedConfig, MemoryKind, PermissionMode};
+    use crate::{append_memory_record, GitContext, LoadedConfig, MemoryKind, PermissionMode};
 
-    use super::{gather_workspace_context, parse_git_status_output, render_prompt_context};
+    use super::{
+        gather_workspace_context, parse_git_status_output, render_prompt_context, WorkspaceContext,
+    };
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -627,5 +721,39 @@ mod tests {
         assert!(rendered.contains("openrouter fallback"));
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn keeps_rendered_context_within_budget() {
+        let huge = "x".repeat(9000);
+        let context = WorkspaceContext {
+            workspace_root: PathBuf::from("/tmp/workspace"),
+            config_source: None,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            active_model: Some("anthropic/claude-sonnet-4-6".to_string()),
+            configured_primary_model: Some("anthropic/claude-sonnet-4-6".to_string()),
+            session_id: Some("session-1".to_string()),
+            session_path: Some(PathBuf::from(
+                "/tmp/workspace/.harness/sessions/session-1.jsonl",
+            )),
+            git: GitContext {
+                repo_root: None,
+                branch: None,
+                dirty: false,
+                status_lines: Vec::new(),
+            },
+            instructions: vec![crate::InstructionContext {
+                name: "AGENTS.md".to_string(),
+                path: PathBuf::from("/tmp/workspace/AGENTS.md"),
+                contents: huge.clone(),
+            }],
+            recent_history: huge.clone(),
+            memory_recall: huge.clone(),
+            conversation_recall: huge,
+        };
+
+        let rendered = render_prompt_context(&context);
+        assert!(rendered.chars().count() <= 12_003);
+        assert!(rendered.contains("conversation_recall:"));
     }
 }

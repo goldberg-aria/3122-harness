@@ -5,10 +5,11 @@ use serde_json::{json, Value};
 
 use crate::{build_skill_packet, edit_file, exec_command, glob_search, grep_search, read_file};
 use crate::{
-    call_mcp_tool, discover_mcp_servers, discover_skills, gather_workspace_context, list_mcp_tools,
-    load_provider_registry, parallel_read_only, render_prompt_context, resolve_model_target,
-    resolve_skill, send_prompt, write_file, LoadedConfig, PermissionMode, ProviderReply,
-    ProviderTarget, ProviderToolCall, SessionStore, ToolOutput, VerificationPolicy,
+    call_mcp_tool, classify_approval_request, discover_mcp_servers, discover_skills,
+    gather_workspace_context, list_mcp_tools, load_provider_registry, parallel_read_only,
+    render_prompt_context, resolve_model_target, resolve_skill, send_prompt, write_file,
+    ApprovalRisk, LoadedConfig, PermissionMode, ProviderReply, ProviderTarget, ProviderToolCall,
+    SessionStore, ToolOutput, VerificationPolicy,
 };
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,8 @@ pub struct AgentReply {
 pub struct ApprovalRequest {
     pub tool: String,
     pub arguments: Value,
+    pub risk: ApprovalRisk,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,9 +318,12 @@ fn execute_model_tool_call<G>(
 where
     G: FnMut(&ApprovalRequest) -> Result<ApprovalOutcome, String>,
 {
+    let (risk, reason) = classify_approval_request(&tool_name, &arguments);
     let approval = approval_handler(&ApprovalRequest {
         tool: tool_name.clone(),
         arguments: arguments.clone(),
+        risk,
+        reason,
     })?;
     if let ApprovalOutcome::Reject { reason } = approval {
         return Err(format!("tool request rejected: {reason}"));

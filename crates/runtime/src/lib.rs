@@ -18,7 +18,10 @@ use std::path::{Path, PathBuf};
 pub use agent::{
     run_agent_loop, AgentOptions, AgentReply, AgentToolEvent, ApprovalOutcome, ApprovalRequest,
 };
-pub use approvals::{ApprovalPolicy, VerificationPolicy};
+pub use approvals::{
+    approval_action_for_policy, classify_approval_request, ApprovalAction, ApprovalPolicy,
+    ApprovalRisk, VerificationPolicy,
+};
 pub use config::{load_config, save_config, HarnessConfig, LoadedConfig};
 pub use context::{
     gather_workspace_context, render_prompt_context, GitContext, InstructionContext,

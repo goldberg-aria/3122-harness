@@ -45,10 +45,10 @@ This repository currently contains:
 - skill resolution and prompt-packet generation through `skills show/run` and `/skill`
 - MCP discovery plus stdio tool listing/calls through `mcp tools/call`
 - a tested agent loop that can request built-in tools, skills, and MCP calls through a provider-agnostic tool-call block
-- approval gating for model-requested tools with `prompt` and `auto` policies
+- approval gating for model-requested tools with risk-aware `prompt` and `auto` policies
 - saved BYOK provider profiles with key detection and preset-based registration
 - verification policy with `off`, `annotate`, and `require`
-- prompt context with recent history, local memory recall, and relevant conversation recall
+- prompt context with recent history, local memory recall, relevant conversation recall, and a context budget cap
 - routing-friendly skill summaries with a short summary budget
 - read-only `parallel_read` batching for one-turn discovery
 - provider-native tool calling for Anthropic, OpenAI-compatible, and Ollama with text-tool fallback
@@ -117,8 +117,10 @@ Provider-native tool calling:
 Approval behavior:
 
 - default policy is `[approvals].policy = "prompt"`
+- `prompt` mode auto-approves low-risk tools, prompts for medium/high-risk tools, and blocks critical tools
+- `auto` mode auto-approves low/medium/high-risk tools and still blocks critical tools
 - REPL supports `/approval`, `/approval prompt`, `/approval auto`
-- one-shot `prompt` requires `auto` if the model wants tools
+- one-shot `prompt` only fails when a request would have prompted or been denied
 
 Verification behavior:
 
@@ -145,6 +147,7 @@ Local-Lite memory:
 - `why-context` prints the exact runtime context injected before a model turn
 - REPL exit autosaves new local memory records for the current session
 - prompt context now includes recent working history, Local-Lite memory recall, and relevant conversation recall from older sessions
+- prompt context is budgeted so long sessions degrade conversation recall first, then memory, recent history, and finally instructions
 
 Skill summaries:
 
@@ -160,8 +163,8 @@ Saved provider profiles:
 
 ## Immediate next steps
 
-1. Refine approvals by tool risk and command class.
-2. Add richer model-switch handoff and session resume flows.
-3. Add context-budget compaction for long sessions.
-4. Add env-gated provider integration tests beyond unit coverage.
-5. Tighten runtime UX around status, memory, and verification feedback.
+1. Add richer model-switch handoff and session resume flows.
+2. Add env-gated provider integration tests beyond unit coverage.
+3. Introduce a dedicated verifier abstraction beyond heuristics.
+4. Tighten runtime UX around status, memory, approvals, and verification feedback.
+5. Add provider-specific prompt shaping for weaker local models.

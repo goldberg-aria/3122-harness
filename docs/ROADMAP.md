@@ -188,6 +188,8 @@ Current progress:
 
 - native tool calling is wired for Anthropic, OpenAI-compatible providers, and Ollama
 - text tool calling remains the common fallback path
+- approval refinement is wired with per-risk defaults and critical-command blocking
+- prompt context now has a budget manager for long sessions
 
 ### Workstream 5: Model switching
 
@@ -223,6 +225,7 @@ Exit criteria:
 
 - low-risk tools do not create unnecessary prompts
 - high-risk tools still require strong review
+- critical commands are blocked by default
 
 ### Workstream 7: Operator commands
 

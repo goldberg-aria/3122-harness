@@ -8,7 +8,7 @@ This document checks the current harness against seven prompt-engineering patter
 2. Do/Don't contrast pattern: implemented in the shared loop prompt
 3. Verification-before-completion: implemented with heuristics
 4. Triple repetition for critical rules: implemented in the shared loop prompt
-5. Turn budget and cost awareness: mostly implemented
+5. Turn budget and cost awareness: implemented with fixed heuristics
 6. Chain-of-thought stripping: implemented
 7. Skill description budget: implemented
 8. Context contamination prevention: mostly implemented
@@ -91,21 +91,22 @@ Code:
 
 Status:
 
-- mostly implemented
+- implemented with fixed heuristics
 
 What is implemented:
 
 - `max_steps` exists in the loop
 - prompt guidance now biases toward `read/grep/glob` before mutations
 - `parallel_read` batches multiple safe read-only exploration operations into one turn
+- prompt context now applies a fixed-size budget and trims lower-priority recall sections first
 
 Gap:
 
-- no token-budget-aware context compaction policy beyond basic recall truncation
+- there is no model-specific token estimator yet
 
 Next step:
 
-- add a context budget manager
+- make the budget manager model-aware
 
 ### 6. Chain-of-thought stripping
 
@@ -175,6 +176,6 @@ Next step:
 
 ## Follow-up order
 
-1. stronger context budget manager
-2. dedicated verifier abstraction
+1. dedicated verifier abstraction
+2. model-aware context budgeting
 3. stronger session/task isolation metadata for future forked work

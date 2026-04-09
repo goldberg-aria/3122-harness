@@ -9,8 +9,8 @@ use runtime::{
     list_memory_records, load_config, load_provider_registry, parallel_read_only, provider_preset,
     provider_presets, read_file, remove_provider_profile, render_prompt_context, resolve_skill,
     run_agent_loop, save_config, save_session_memory_bundle, search_memory_records,
-    upsert_provider_profile, write_file, ApprovalOutcome, ApprovalPolicy, ApprovalRequest,
-    LoadedConfig, PermissionMode, SavedProviderProfile, SessionStore, ToolOutput,
+    upsert_provider_profile, write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy,
+    ApprovalRequest, LoadedConfig, PermissionMode, SavedProviderProfile, SessionStore, ToolOutput,
 };
 use serde_json::json;
 
@@ -140,7 +140,11 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
     );
     println!("session: {}", session.path().display());
     println!("mode: {mode}");
-    println!("approval: {approval_policy}");
+    println!(
+        "approval: {} ({})",
+        approval_policy,
+        approval_policy_hint(approval_policy)
+    );
     if let Some(model) = current_model.as_deref() {
         println!("model: {model}");
     }
@@ -224,7 +228,11 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
             "/memory" => print_memory_list(workspace),
             "/login" => print_login_status(workspace),
             "/mode" => println!("{mode}"),
-            "/approval" => println!("{approval_policy}"),
+            "/approval" => println!(
+                "{} ({})",
+                approval_policy,
+                approval_policy_hint(approval_policy)
+            ),
             "/doctor" => print!("{}", doctor_report(workspace, config).render()),
             "/config" => println!("{}", config.render_summary(workspace)),
             "/skills" => print_skills(workspace, config),
@@ -340,7 +348,11 @@ fn print_repl_status(
     println!("session: {}", session.path().display());
     println!("model: {}", current_model.unwrap_or("-"));
     println!("mode: {mode}");
-    println!("approval: {approval_policy}");
+    println!(
+        "approval: {} ({})",
+        approval_policy,
+        approval_policy_hint(approval_policy)
+    );
     println!("saved_providers: {provider_count}");
 }
 
@@ -1215,20 +1227,55 @@ fn approval_for_request(
     approval_policy: &mut ApprovalPolicy,
     session: Option<&SessionStore>,
 ) -> Result<ApprovalOutcome, String> {
-    if *approval_policy == ApprovalPolicy::Auto {
-        return Ok(ApprovalOutcome::Approve);
+    let action = runtime::approval_action_for_policy(*approval_policy, request.risk);
+    match action {
+        ApprovalAction::AutoApprove => {
+            if let Some(store) = session {
+                let _ = store.append(
+                    "approval_result",
+                    json!({
+                        "tool": request.tool,
+                        "risk": request.risk.as_str(),
+                        "decision": "auto-approve",
+                        "reason": request.reason,
+                    }),
+                );
+            }
+            return Ok(ApprovalOutcome::Approve);
+        }
+        ApprovalAction::Deny => {
+            let reason = format!(
+                "blocked {}-risk tool `{}`: {}",
+                request.risk, request.tool, request.reason
+            );
+            if let Some(store) = session {
+                let _ = store.append(
+                    "approval_result",
+                    json!({
+                        "tool": request.tool,
+                        "risk": request.risk.as_str(),
+                        "decision": "deny",
+                        "reason": reason,
+                    }),
+                );
+            }
+            return Ok(ApprovalOutcome::Reject { reason });
+        }
+        ApprovalAction::Prompt => {}
     }
 
     if session.is_none() {
         return Err(format!(
-            "approval required for tool `{}` in non-interactive mode; use the REPL or set [approvals].policy = \"auto\"",
-            request.tool
+            "approval required for {}-risk tool `{}` in non-interactive mode: {}; use the REPL or set [approvals].policy = \"auto\"",
+            request.risk, request.tool, request.reason
         ));
     }
 
     println!();
     println!("approval required");
     println!("tool: {}", request.tool);
+    println!("risk: {}", request.risk);
+    println!("why: {}", request.reason);
     println!(
         "arguments: {}",
         serde_json::to_string_pretty(&request.arguments).unwrap_or_else(|_| "{}".to_string())
@@ -1246,7 +1293,12 @@ fn approval_for_request(
             if let Some(store) = session {
                 let _ = store.append(
                     "approval_result",
-                    json!({ "tool": request.tool, "decision": "approve" }),
+                    json!({
+                        "tool": request.tool,
+                        "risk": request.risk.as_str(),
+                        "decision": "approve",
+                        "reason": request.reason,
+                    }),
                 );
             }
             Ok(ApprovalOutcome::Approve)
@@ -1260,7 +1312,12 @@ fn approval_for_request(
                 );
                 let _ = store.append(
                     "approval_result",
-                    json!({ "tool": request.tool, "decision": "approve" }),
+                    json!({
+                        "tool": request.tool,
+                        "risk": request.risk.as_str(),
+                        "decision": "approve",
+                        "reason": request.reason,
+                    }),
                 );
             }
             Ok(ApprovalOutcome::Approve)
@@ -1269,13 +1326,28 @@ fn approval_for_request(
             if let Some(store) = session {
                 let _ = store.append(
                     "approval_result",
-                    json!({ "tool": request.tool, "decision": "reject" }),
+                    json!({
+                        "tool": request.tool,
+                        "risk": request.risk.as_str(),
+                        "decision": "reject",
+                        "reason": request.reason,
+                    }),
                 );
             }
             Ok(ApprovalOutcome::Reject {
-                reason: format!("rejected by user for tool `{}`", request.tool),
+                reason: format!(
+                    "rejected by user for {}-risk tool `{}`",
+                    request.risk, request.tool
+                ),
             })
         }
+    }
+}
+
+fn approval_policy_hint(policy: ApprovalPolicy) -> &'static str {
+    match policy {
+        ApprovalPolicy::Prompt => "low-risk auto, medium/high prompt, critical deny",
+        ApprovalPolicy::Auto => "low/medium/high auto, critical deny",
     }
 }
 
