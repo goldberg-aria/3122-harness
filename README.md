@@ -170,6 +170,7 @@ REPL shape:
 - the base flow is closer to Codex/Claude-style slash commands
 - primary session commands are `/status`, `/model`, `/login`, `/memory`, `/resume`, `/handoff`, `/why-context`, `/approval`, `/doctor`
 - custom slash commands are loaded from `~/.harness/commands/*.toml` and `.harness/commands/*.toml`
+- built-in shortcut commands are always available first, then `global`, then `workspace`
 - workspace commands override global commands with the same name
 - `/model <spec>` switches the active model, stores a handoff snapshot, and prints a short active/previous/next summary
 - `/parallel-read <json-array>` batches read-only discovery work in one turn
@@ -192,6 +193,16 @@ Supported kinds:
 - `alias`
 - `macro`
 - `prompt-template`
+
+Built-in shortcuts:
+
+- `/ctx` -> `/why-context`
+- `/mem` -> `/memory`
+- `/sum` -> `/resume`
+- `/hf` -> `/handoff`
+- `/models` -> `/model`
+- `/check` -> `/doctor`
+- `/checkpoint` -> `/memory save` + `/resume` + `/handoff`
 
 Template placeholders:
 

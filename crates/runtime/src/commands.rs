@@ -69,6 +69,9 @@ struct SlashCommandConfig {
 
 pub fn discover_slash_commands(workspace_root: &Path) -> Vec<SlashCommand> {
     let mut merged = BTreeMap::new();
+    for command in built_in_commands() {
+        merged.insert(command.name.clone(), command);
+    }
 
     for (scope, dir) in command_sources(workspace_root) {
         if !dir.is_dir() {
@@ -177,6 +180,49 @@ fn command_sources(workspace_root: &Path) -> Vec<(String, PathBuf)> {
             .unwrap_or_else(|_| workspace_root.join(".harness").join("commands")),
     ));
     sources
+}
+
+fn built_in_commands() -> Vec<SlashCommand> {
+    vec![
+        built_in_alias("ctx", "Show the current prompt context", "/why-context"),
+        built_in_alias("mem", "List local memory records", "/memory"),
+        built_in_alias("sum", "Show the latest resume summary", "/resume"),
+        built_in_alias("hf", "Show the latest handoff block", "/handoff"),
+        built_in_alias("models", "Show the active and saved model state", "/model"),
+        built_in_alias("check", "Run doctor checks", "/doctor"),
+        built_in_alias("notes", "List saved local memory", "/memory"),
+        built_in_macro(
+            "checkpoint",
+            "Save memory, show resume, and print the current handoff",
+            &["/memory save", "/resume", "/handoff"],
+        ),
+    ]
+}
+
+fn built_in_alias(name: &str, description: &str, target: &str) -> SlashCommand {
+    SlashCommand {
+        name: name.to_string(),
+        description: description.to_string(),
+        kind: SlashCommandKind::Alias,
+        source: "builtin".to_string(),
+        path: PathBuf::from(format!("<builtin:{name}>")),
+        target: Some(target.to_string()),
+        steps: Vec::new(),
+        prompt: None,
+    }
+}
+
+fn built_in_macro(name: &str, description: &str, steps: &[&str]) -> SlashCommand {
+    SlashCommand {
+        name: name.to_string(),
+        description: description.to_string(),
+        kind: SlashCommandKind::Macro,
+        source: "builtin".to_string(),
+        path: PathBuf::from(format!("<builtin:{name}>")),
+        target: None,
+        steps: steps.iter().map(|step| (*step).to_string()).collect(),
+        prompt: None,
+    }
 }
 
 fn parse_slash_command(path: &Path, scope: &str) -> Result<SlashCommand, String> {
@@ -318,7 +364,7 @@ prompt = "Review the risk of {arg1} in 3 bullets. Extra: {args}"
         .unwrap();
 
         let commands = discover_slash_commands(&workspace);
-        assert_eq!(commands.len(), 3);
+        assert!(commands.len() >= 3);
 
         let ctx = resolve_slash_command(&commands, "ctx").unwrap();
         assert_eq!(expand_slash_command(ctx, ""), vec!["/why-context"]);
@@ -351,6 +397,33 @@ prompt = "Review the risk of {arg1} in 3 bullets. Extra: {args}"
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("kind = \"alias\""));
         assert!(contents.contains("target = \"/why-context\""));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn builtin_commands_are_available_and_workspace_can_override() {
+        let workspace = temp_workspace("slash-commands-override");
+        let commands = discover_slash_commands(&workspace);
+        let builtin = resolve_slash_command(&commands, "ctx").unwrap();
+        assert_eq!(builtin.source, "builtin");
+        assert_eq!(expand_slash_command(builtin, ""), vec!["/why-context"]);
+
+        let dir = workspace.join(".harness").join("commands");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("ctx.toml"),
+            r#"
+description = "Workspace override"
+kind = "alias"
+target = "/memory recall 3"
+"#,
+        )
+        .unwrap();
+
+        let commands = discover_slash_commands(&workspace);
+        let overridden = resolve_slash_command(&commands, "ctx").unwrap();
+        assert_eq!(overridden.source, "workspace");
+        assert_eq!(expand_slash_command(overridden, ""), vec!["/memory recall 3"]);
         cleanup(&workspace);
     }
 }
