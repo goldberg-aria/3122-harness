@@ -57,6 +57,7 @@ This repository currently contains:
 - runtime unit tests covering config, permissions, providers, skills, MCP, the harness loop, and verifier behavior
 - env-gated live provider tests for Anthropic, OpenAI-compatible, and Ollama
 - more readable CLI status, memory, approval, and verification feedback
+- compact prompt shaping for weaker local and open-weight model families such as Ollama, Qwen, Llama, Gemma, Mistral, Phi, and DeepSeek
 
 Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/ROADMAP.md).
 
@@ -181,8 +182,8 @@ Live provider tests:
 
 ## Immediate next steps
 
-1. Add provider-specific prompt shaping for weaker local models.
-2. Add model-aware context budgeting instead of fixed heuristics.
-3. Add richer verifier adapters beyond command-pattern heuristics.
-4. Add env-backed smoke coverage for saved provider profiles and external adapters.
-5. Add stronger REPL-level tests for status and handoff presentation.
+1. Add model-aware context budgeting instead of fixed heuristics.
+2. Add richer verifier adapters beyond command-pattern heuristics.
+3. Add env-backed smoke coverage for saved provider profiles and external adapters.
+4. Add stronger REPL-level tests for status and handoff presentation.
+5. Add provider-specific output shaping for external CLI adapters.

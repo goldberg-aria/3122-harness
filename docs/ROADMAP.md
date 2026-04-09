@@ -190,6 +190,7 @@ Current progress:
 - text tool calling remains the common fallback path
 - approval refinement is wired with per-risk defaults and critical-command blocking
 - prompt context now has a budget manager for long sessions
+- weaker local and open-weight model families now get a more compact prompt shape
 - `/model <spec>` now creates a handoff snapshot, prints a short transition summary, and boosts the first post-switch turn
 
 ### Workstream 5: Model switching

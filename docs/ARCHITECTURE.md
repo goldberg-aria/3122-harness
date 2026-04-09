@@ -88,6 +88,7 @@ Current implementation note:
 - `parallel_read` batches multiple safe read-only discovery operations into one turn
 - prompt context is capped to a fixed budget and shrinks conversation recall, memory recall, recent history, and instructions in that order
 - verification decisions are centralized in a verifier module so policy stays separate from the main loop
+- weaker local and open-weight model families use a more compact prompt shape with tighter line limits and shorter step guidance
 
 Planned evolution:
 

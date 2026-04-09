@@ -7,8 +7,9 @@ use crate::{
     assess_verification, call_mcp_tool, classify_approval_request, discover_mcp_servers,
     discover_skills, gather_workspace_context, list_mcp_tools, load_provider_registry,
     parallel_read_only, render_prompt_context, resolve_model_target, resolve_skill, send_prompt,
-    write_file, ApprovalRisk, LoadedConfig, PermissionMode, ProviderReply, ProviderTarget,
-    ProviderToolCall, SessionStore, ToolOutput, VerificationEvent, VerificationPolicy,
+    write_file, ApprovalRisk, LoadedConfig, PermissionMode, ProviderReply, ProviderRoute,
+    ProviderTarget, ProviderToolCall, SessionStore, ToolOutput, VerificationEvent,
+    VerificationPolicy,
 };
 use crate::{build_skill_packet, edit_file, exec_command, glob_search, grep_search, read_file};
 
@@ -170,7 +171,7 @@ where
     let mut tool_events = Vec::new();
 
     for step in 0..options.max_steps {
-        let composed_prompt = compose_prompt(prompt_context, &events);
+        let composed_prompt = compose_prompt(target, prompt_context, &events);
         if let Some(store) = session {
             let _ = store.append(
                 "agent_turn",
@@ -375,15 +376,36 @@ where
     Ok(())
 }
 
-fn compose_prompt(prompt_context: &str, events: &[AgentEvent]) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptShape {
+    Default,
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PromptProfile {
+    shape: PromptShape,
+    answer_line_limit: usize,
+}
+
+fn compose_prompt(target: &ProviderTarget, prompt_context: &str, events: &[AgentEvent]) -> String {
+    let profile = prompt_profile(target);
     let mut prompt = String::new();
-    prompt.push_str(
-        "You are a terminal coding agent running inside a harness.\n\
+    let header = match profile.shape {
+        PromptShape::Default => {
+            let mut header = String::new();
+            header.push_str(
+                "You are a terminal coding agent running inside a harness.\n\
 Critical rules:\n\
 - Verify before you claim success. Run at least 1 concrete check when a check is possible.\n\
-- If you cannot verify, say so explicitly in 1 sentence.\n\
-- Keep the final answer short by default, usually within 12 lines unless the user asks for depth.\n\
-- Treat this session as isolated to the current workspace and prompt context only.\n\
+- If you cannot verify, say so explicitly in 1 sentence.\n",
+            );
+            header.push_str(&format!(
+                "- Keep the final answer short by default, usually within {} lines unless the user asks for depth.\n",
+                profile.answer_line_limit
+            ));
+            header.push_str(
+                "- Treat this session as isolated to the current workspace and prompt context only.\n\
 \n\
 Do:\n\
 - use read, grep, and glob before write, edit, or exec when more context is needed\n\
@@ -419,15 +441,70 @@ Verification reminder:\n\
 - if verification is impossible, say `Not verified` and give the reason\n\
 \n\
 When a tool result appears, use it to decide the next step. When you are done, answer normally without a tool block.\n\n",
-    );
+            );
+            header
+        }
+        PromptShape::Compact => {
+            let mut header = String::new();
+            header.push_str(
+                "You are a terminal coding agent running inside a harness.\n\
+Compact rules for this model:\n\
+- Stay inside the current workspace and prompt context only.\n\
+- Prefer the shortest path to evidence: grep, glob, read, then mutate.\n\
+- Request exactly 1 tool call at a time.\n\
+- After code edits, run 1 concrete verification step before claiming success.\n\
+- If verification is impossible, say `Not verified` in 1 sentence.\n",
+            );
+            header.push_str(&format!(
+                "- Keep the final answer within about {} lines unless the user asks for more.\n",
+                profile.answer_line_limit
+            ));
+            header.push_str(
+                "- Do not emit chain-of-thought or `<thinking>`.\n\
+\n\
+Tool request format:\n\
+<tool_call>\n\
+{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n\
+</tool_call>\n\
+\n\
+Tools:\n\
+- read { path }\n\
+- write { path, contents }\n\
+- edit { path, needle, replacement }\n\
+- grep { query, path? }\n\
+- glob { pattern, path? }\n\
+- exec { command }\n\
+- parallel_read { operations[{ tool, path?/query?/pattern? }] }\n\
+- skill { name, task? }\n\
+- mcp_list_tools { server }\n\
+- mcp_call { server, tool, arguments? }\n\
+\n\
+When a tool result appears, use it to decide the next step. Keep each step atomic.\n\n",
+            );
+            header
+        }
+    };
+    prompt.push_str(&header);
     prompt.push_str(prompt_context);
-    prompt.push_str(
-        "\nReminder:\n\
+    let reminder = match profile.shape {
+        PromptShape::Default => format!(
+            "\nReminder:\n\
 - verify before claiming success\n\
 - request exactly one tool call if needed\n\
-- keep the final answer concise\n\
+- keep the final answer concise, usually within {} lines\n\
 - stay within the current workspace boundary\n\n",
-    );
+            profile.answer_line_limit
+        ),
+        PromptShape::Compact => format!(
+            "\nReminder:\n\
+- use the shortest next step\n\
+- request exactly one tool call if needed\n\
+- verify after edits\n\
+- keep the final answer within about {} lines\n\n",
+            profile.answer_line_limit
+        ),
+    };
+    prompt.push_str(&reminder);
 
     for event in events {
         match event {
@@ -458,14 +535,50 @@ When a tool result appears, use it to decide the next step. When you are done, a
         }
     }
 
-    prompt.push_str(
-        "Final reminder:\n\
+    let final_reminder = match profile.shape {
+        PromptShape::Default => {
+            "Final reminder:\n\
 - verify before claiming completion\n\
 - do not emit `<thinking>`\n\
-- either output one tool block or a normal answer\n",
-    );
+- either output one tool block or a normal answer\n"
+        }
+        PromptShape::Compact => {
+            "Final reminder:\n\
+- verify before claiming completion\n\
+- either output one tool block or one short normal answer\n\
+- do not emit `<thinking>`\n"
+        }
+    };
+    prompt.push_str(final_reminder);
 
     prompt
+}
+
+fn prompt_profile(target: &ProviderTarget) -> PromptProfile {
+    if uses_compact_prompt(target) {
+        return PromptProfile {
+            shape: PromptShape::Compact,
+            answer_line_limit: 8,
+        };
+    }
+
+    PromptProfile {
+        shape: PromptShape::Default,
+        answer_line_limit: 12,
+    }
+}
+
+fn uses_compact_prompt(target: &ProviderTarget) -> bool {
+    if target.route == ProviderRoute::Ollama {
+        return true;
+    }
+
+    let model = target.model.to_ascii_lowercase();
+    [
+        "qwen", "llama", "mistral", "gemma", "phi", "deepseek", "yi", "minicpm",
+    ]
+    .iter()
+    .any(|family| model.contains(family))
 }
 
 fn strip_thinking_blocks(text: &str) -> String {
@@ -781,7 +894,7 @@ mod tests {
         let workspace = temp_workspace("agent-loop-read");
         fs::write(workspace.join("README.md"), "hello from tool").unwrap();
         fs::write(workspace.join("AGENTS.md"), "workspace instructions").unwrap();
-        let target = parse_model_target("ollama/test-model").unwrap();
+        let target = parse_model_target("anthropic/claude-sonnet-4-6").unwrap();
         let options = AgentOptions {
             max_steps: 4,
             permission_mode: PermissionMode::WorkspaceWrite,
@@ -931,6 +1044,59 @@ mod tests {
         assert!(prompts[2].contains("hello"));
         assert!(prompts[2].contains("mock-echo"));
         assert_eq!(reply.provider.text, "Skill and MCP both worked.");
+
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn uses_compact_prompt_shape_for_ollama_models() {
+        let workspace = temp_workspace("agent-loop-compact-prompt");
+        fs::write(workspace.join("README.md"), "hello").unwrap();
+
+        let target = parse_model_target("ollama/qwen2.5-coder:7b").unwrap();
+        let options = AgentOptions {
+            max_steps: 2,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            verification_policy: VerificationPolicy::Annotate,
+        };
+        let skill_sources = vec![(workspace.join(".harness/skills"), "workspace".to_string())];
+        let mcp_sources = vec![(workspace.join(".harness/mcp.json"), "workspace".to_string())];
+        let prompt_context = render_prompt_context(&gather_workspace_context(
+            &workspace,
+            &LoadedConfig::default(),
+            PermissionMode::WorkspaceWrite,
+            Some("ollama/qwen2.5-coder:7b"),
+            None,
+        ));
+        let mut prompts = Vec::new();
+
+        let reply = run_agent_loop_with_runner(
+            &target,
+            &workspace,
+            &skill_sources,
+            &mcp_sources,
+            &prompt_context,
+            "read the readme and summarize it",
+            &options,
+            None,
+            |_, prompt| {
+                prompts.push(prompt.to_string());
+                Ok(crate::ProviderReply {
+                    route: target.route,
+                    model: target.model.clone(),
+                    text: "Short answer.".to_string(),
+                    tool_calls: Vec::new(),
+                })
+            },
+            |_| Ok(ApprovalOutcome::Approve),
+        )
+        .unwrap();
+
+        assert_eq!(reply.provider.text, "Short answer.");
+        assert!(prompts[0].contains("Compact rules for this model:"));
+        assert!(prompts[0].contains("Keep the final answer within about 8 lines"));
+        assert!(prompts[0].contains("Keep each step atomic."));
+        assert!(!prompts[0].contains("Do:\n"));
 
         cleanup(&workspace);
     }
