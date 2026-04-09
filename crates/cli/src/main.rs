@@ -203,15 +203,29 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
             }
             KeyEvent {
                 code: KeyCode::Enter,
+                modifiers,
                 ..
             } => {
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    ui.input.push('\n');
+                    continue;
+                }
                 let line = ui.input.trim().to_string();
                 ui.input.clear();
                 if line.is_empty() {
                     continue;
                 }
-                let _ = session.append("user_input", json!({ "text": line }));
                 ui.push_user(line.clone());
+                let _ = redraw_tui(
+                    &mut stdout,
+                    workspace,
+                    config,
+                    &session,
+                    &current_model,
+                    mode,
+                    approval_policy,
+                    &ui,
+                );
                 match process_repl_input_tui(
                     workspace,
                     config,
@@ -236,6 +250,13 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
             {
                 ui.input.push(ch);
             }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => {
+                if let Some(suggestion) = build_slash_suggestions(workspace, &ui.input).first() {
+                    ui.input = format!("/{}", suggestion.name);
+                }
+            }
             _ => {}
         }
     }
@@ -248,6 +269,7 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
 struct TuiState {
     transcript: Vec<String>,
     input: String,
+    model_choices: Vec<String>,
 }
 
 impl TuiState {
@@ -255,6 +277,7 @@ impl TuiState {
         Self {
             transcript: Vec::new(),
             input: String::new(),
+            model_choices: Vec::new(),
         }
     }
 
@@ -373,7 +396,7 @@ fn redraw_tui(
         stdout,
         MoveTo(0, input_row.saturating_sub(1)),
         SetAttribute(Attribute::Dim),
-        Print("Enter to send. Ctrl-C to exit. Esc clears input."),
+        Print("Enter send | Shift-Enter newline | Tab complete | Ctrl-C exit"),
         SetAttribute(Attribute::Reset),
         MoveTo(0, input_row),
         Print(truncate_for_terminal(&format!("> {}", ui.input), width as usize)),
@@ -424,6 +447,7 @@ fn core_slash_suggestions() -> Vec<SlashSuggestion> {
         ("help", "Show commands"),
         ("status", "Show current session state"),
         ("model", "Show or set the active model"),
+        ("init", "Show the current project summary"),
         ("resume", "Show latest session resume summary"),
         ("handoff", "Print the latest handoff block"),
         ("why-context", "Show the current prompt context"),
@@ -501,6 +525,11 @@ fn process_repl_input_tui(
     ui: &mut TuiState,
     custom_depth: usize,
 ) -> ReplDirective {
+    let should_log_input = !(trimmed.parse::<usize>().is_ok() && !ui.model_choices.is_empty());
+    if should_log_input {
+        let _ = session.append("user_input", json!({ "text": trimmed }));
+    }
+
     match trimmed {
         "" => return ReplDirective::Continue,
         "/exit" | "/quit" => return ReplDirective::Exit,
@@ -521,11 +550,17 @@ fn process_repl_input_tui(
             return ReplDirective::Continue;
         }
         "/model" => {
-            ui.push_block(&render_model_status_text(
+            let (text, choices) = render_model_status_text(
                 workspace,
                 config,
                 current_model.as_deref(),
-            ));
+            );
+            ui.model_choices = choices;
+            ui.push_block(&text);
+            return ReplDirective::Continue;
+        }
+        "/init" => {
+            ui.push_result(render_init_text(workspace, config, current_model.as_deref()));
             return ReplDirective::Continue;
         }
         "/resume" => {
@@ -596,6 +631,38 @@ fn process_repl_input_tui(
         _ => {}
     }
 
+    if let Ok(index) = trimmed.parse::<usize>() {
+        if !ui.model_choices.is_empty() {
+            if let Some(model) = ui.model_choices.get(index.saturating_sub(1)).cloned() {
+                let previous_model = current_model
+                    .as_deref()
+                    .or_else(|| config.primary_model())
+                    .map(ToOwned::to_owned);
+                *current_model = Some(model.clone());
+                let _ = session.append("model_change", json!({ "from": previous_model, "model": model }));
+                match build_model_handoff_snapshot(
+                    workspace,
+                    session.path(),
+                    previous_model.as_deref(),
+                    &model,
+                ) {
+                    Ok(snapshot) => {
+                        let _ = session.append(
+                            "model_handoff",
+                            serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
+                        );
+                        ui.push_block(&render_model_switch_summary_text(&snapshot));
+                    }
+                    Err(err) => ui.push_error(format!("model set to {model}; failed to build handoff: {err}")),
+                }
+                ui.model_choices.clear();
+                return ReplDirective::Continue;
+            }
+            ui.push_error(format!("unknown model selection: {index}"));
+            return ReplDirective::Continue;
+        }
+    }
+
     if let Some(next_mode) = trimmed.strip_prefix("/mode ").and_then(PermissionMode::parse) {
         *mode = next_mode;
         let _ = session.append("mode_change", json!({ "mode": mode.as_str() }));
@@ -607,6 +674,7 @@ fn process_repl_input_tui(
             ui.push_error("usage: /model <provider/model | profile/alias/model>".to_string());
             return ReplDirective::Continue;
         }
+        ui.model_choices.clear();
         let previous_model = current_model
             .as_deref()
             .or_else(|| config.primary_model())
@@ -627,6 +695,7 @@ fn process_repl_input_tui(
         return ReplDirective::Continue;
     }
     if trimmed == "/memory save" {
+        ui.model_choices.clear();
         ui.push_result(render_save_latest_session_memory(workspace, session));
         return ReplDirective::Continue;
     }
@@ -725,8 +794,10 @@ fn process_repl_input_tui(
     }
 
     if trimmed.starts_with('/') {
+        ui.model_choices.clear();
         ui.push_result(render_repl_tool_output(workspace, trimmed, *mode, session));
     } else {
+        ui.model_choices.clear();
         let _ = session.append("prompt_start", json!({ "text": trimmed }));
         let result = run_prompt_capture(
             workspace,
@@ -1014,6 +1085,7 @@ fn render_repl_help_text() -> String {
         "/help       show commands",
         "/status     show current session state",
         "/model      show or set the active model",
+        "/init       show the current project summary",
         "/resume     show latest session resume summary",
         "/handoff    print a handoff block",
         "/handoff debug inspect the latest handoff state",
@@ -1102,7 +1174,8 @@ fn render_model_status_text(
     workspace: &Path,
     config: &LoadedConfig,
     current_model: Option<&str>,
-) -> String {
+) -> (String, Vec<String>) {
+    let choices = build_model_choices(workspace, config, current_model);
     let mut lines = vec![
         format!("active: {}", current_model.unwrap_or("-")),
         format!("default: {}", config.primary_model().unwrap_or("-")),
@@ -1119,6 +1192,13 @@ fn render_model_status_text(
     if !config.data.model.fallback.is_empty() {
         lines.push(format!("fallback: {}", config.data.model.fallback.join(", ")));
     }
+    if !choices.is_empty() {
+        lines.push("switch:".to_string());
+        for (index, model) in choices.iter().enumerate() {
+            lines.push(format!("{}. {}", index + 1, model));
+        }
+        lines.push("tip: type the number to switch".to_string());
+    }
     let registry = load_provider_registry(workspace).unwrap_or_default();
     if registry.profiles.is_empty() {
         lines.push("saved_profiles: none".to_string());
@@ -1131,7 +1211,7 @@ fn render_model_status_text(
             ));
         }
     }
-    lines.join("\n")
+    (lines.join("\n"), choices)
 }
 
 fn render_login_status_text(workspace: &Path) -> String {
@@ -1155,6 +1235,70 @@ fn render_login_status_text(workspace: &Path) -> String {
     lines.push("External CLIs:".to_string());
     lines.push(format!("- run `{APP_NAME} doctor` to inspect `claude` and `codex`"));
     lines.join("\n")
+}
+
+fn build_model_choices(
+    workspace: &Path,
+    config: &LoadedConfig,
+    current_model: Option<&str>,
+) -> Vec<String> {
+    let mut choices = Vec::new();
+    if let Some(model) = current_model {
+        push_unique_choice(&mut choices, model.to_string());
+    }
+    if let Some(model) = config.primary_model() {
+        push_unique_choice(&mut choices, model.to_string());
+    }
+    for model in &config.data.model.fallback {
+        push_unique_choice(&mut choices, model.clone());
+    }
+
+    let registry = load_provider_registry(workspace).unwrap_or_default();
+    for profile in registry.profiles {
+        if let Some(model) = default_model_for_profile(&profile.alias, &profile.route) {
+            push_unique_choice(
+                &mut choices,
+                format!("profile/{}/{}", profile.alias, model),
+            );
+        }
+    }
+    choices
+}
+
+fn push_unique_choice(choices: &mut Vec<String>, model: String) {
+    if !choices.iter().any(|existing| existing == &model) {
+        choices.push(model);
+    }
+}
+
+fn default_model_for_profile(alias: &str, route: &str) -> Option<String> {
+    let env_key = match alias {
+        "groq" => Some("HARNESS_TEST_GROQ_MODEL"),
+        "qwen-api" => Some("HARNESS_TEST_QWEN_API_MODEL"),
+        "zai" => Some("HARNESS_TEST_ZAI_MODEL"),
+        "minimax" => Some("HARNESS_TEST_MINIMAX_MODEL"),
+        "deepinfra" => Some("HARNESS_TEST_DEEPINFRA_MODEL"),
+        "openai-api" => Some("OPENAI_DEFAULT_MODEL"),
+        "anthropic-api" => Some("ANTHROPIC_DEFAULT_MODEL"),
+        _ => None,
+    };
+    if let Some(key) = env_key {
+        if let Ok(value) = env::var(key) {
+            if !value.trim().is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    match (alias, route) {
+        ("anthropic-api", "anthropic") => Some("claude-sonnet-4-6".to_string()),
+        ("openai-api", "openai-compat") => Some("gpt-4.1-mini".to_string()),
+        ("groq", "openai-compat") => Some("openai/gpt-oss-20b".to_string()),
+        ("qwen-api", "openai-compat") => Some("qwen/qwen3.6-plus".to_string()),
+        ("zai", "openai-compat") => Some("glm-5".to_string()),
+        ("minimax", "openai-compat") => Some("MiniMax-M2.7".to_string()),
+        ("deepinfra", "openai-compat") => Some("nvidia/Nemotron-3-Nano-30B-A3B".to_string()),
+        _ => None,
+    }
 }
 
 fn render_slash_commands_text(workspace: &Path) -> String {
@@ -1282,6 +1426,49 @@ fn render_saved_providers_text(workspace: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_init_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    current_model: Option<&str>,
+) -> Result<String, String> {
+    let mut entries = std::fs::read_dir(workspace)
+        .map_err(|err| err.to_string())?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                format!("{name}/")
+            } else {
+                name
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries.truncate(12);
+
+    let mut lines = vec![
+        format!("project: {}", workspace.display()),
+        format!("active_model: {}", current_model.unwrap_or_else(|| config.primary_model().unwrap_or("-"))),
+        format!(
+            "config: {}",
+            config
+                .source
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+    ];
+    if !entries.is_empty() {
+        lines.push("top_level:".to_string());
+        for entry in entries {
+            lines.push(format!("- {entry}"));
+        }
+    }
+    lines.push("tips: /model, /memory, /commands, /why-context".to_string());
+    Ok(lines.join("\n"))
 }
 
 fn render_memory_list_text(workspace: &Path) -> Result<String, String> {

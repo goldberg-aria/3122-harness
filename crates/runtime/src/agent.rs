@@ -350,13 +350,39 @@ where
         tool: tool_name.clone(),
         arguments: arguments.clone(),
     };
-    let output = execute_tool_request(
+    let output = match execute_tool_request(
         workspace_root,
         skill_sources,
         mcp_sources,
         &request,
         permission_mode,
-    )?;
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            events.push(AgentEvent::ToolCall {
+                name: tool_name.clone(),
+                arguments: arguments.clone(),
+            });
+            events.push(AgentEvent::ToolResult {
+                name: tool_name.clone(),
+                summary: format!("tool error: {err}"),
+                content: err.clone(),
+            });
+            if let Some(store) = session {
+                let _ = store.append(
+                    "agent_tool_error",
+                    json!({
+                        "step": step,
+                        "source": source,
+                        "name": tool_name,
+                        "arguments": arguments,
+                        "error": err,
+                    }),
+                );
+            }
+            return Ok(());
+        }
+    };
 
     let event = AgentToolEvent {
         name: tool_name.clone(),
@@ -678,16 +704,28 @@ fn execute_tool_request(
 ) -> Result<ToolOutput, String> {
     match request.tool.as_str() {
         "read" => {
-            let path = required_string(&request.arguments, "path")?;
+            let path = required_string_aliases(
+                &request.arguments,
+                "path",
+                &["filepath", "file_path", "file", "filename", "target"],
+            )?;
             read_file(Path::new(&path), workspace_root, permission_mode)
         }
         "write" => {
-            let path = required_string(&request.arguments, "path")?;
+            let path = required_string_aliases(
+                &request.arguments,
+                "path",
+                &["filepath", "file_path", "file", "filename", "target"],
+            )?;
             let contents = required_string(&request.arguments, "contents")?;
             write_file(Path::new(&path), &contents, workspace_root, permission_mode)
         }
         "edit" => {
-            let path = required_string(&request.arguments, "path")?;
+            let path = required_string_aliases(
+                &request.arguments,
+                "path",
+                &["filepath", "file_path", "file", "filename", "target"],
+            )?;
             let needle = required_string(&request.arguments, "needle")?;
             let replacement = required_string(&request.arguments, "replacement")?;
             edit_file(
@@ -700,7 +738,11 @@ fn execute_tool_request(
         }
         "grep" => {
             let query = required_string(&request.arguments, "query")?;
-            let scope = optional_string(&request.arguments, "path");
+            let scope = optional_string_aliases(
+                &request.arguments,
+                "path",
+                &["filepath", "file_path", "file", "directory", "dir", "target"],
+            );
             grep_search(
                 &query,
                 scope.as_deref().map(Path::new),
@@ -710,7 +752,11 @@ fn execute_tool_request(
         }
         "glob" => {
             let pattern = required_string(&request.arguments, "pattern")?;
-            let scope = optional_string(&request.arguments, "path");
+            let scope = optional_string_aliases(
+                &request.arguments,
+                "path",
+                &["filepath", "file_path", "file", "directory", "dir", "target"],
+            );
             glob_search(
                 &pattern,
                 scope.as_deref().map(Path::new),
@@ -785,18 +831,56 @@ fn tools_to_json(tools: &[crate::McpToolInfo]) -> Value {
 }
 
 fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
-    arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("tool argument `{key}` must be a string"))
+    required_string_aliases(arguments, key, &[])
 }
 
 fn optional_string(arguments: &Value, key: &str) -> Option<String> {
-    arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+    optional_string_aliases(arguments, key, &[])
+}
+
+fn required_string_aliases(
+    arguments: &Value,
+    primary: &str,
+    aliases: &[&str],
+) -> Result<String, String> {
+    optional_string_aliases(arguments, primary, aliases)
+        .ok_or_else(|| format!("tool argument `{primary}` must be a string"))
+}
+
+fn optional_string_aliases(arguments: &Value, primary: &str, aliases: &[&str]) -> Option<String> {
+    if let Some(value) = arguments.get(primary).and_then(coerce_string_value) {
+        return Some(value);
+    }
+    for alias in aliases {
+        if let Some(value) = arguments.get(*alias).and_then(coerce_string_value) {
+            return Some(value);
+        }
+    }
+    if aliases.iter().any(|alias| *alias == primary) {
+        return None;
+    }
+    if let Value::String(_) | Value::Array(_) | Value::Object(_) = arguments {
+        return coerce_string_value(arguments);
+    }
+    None
+}
+
+fn coerce_string_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Array(items) if items.len() == 1 => items.first().and_then(coerce_string_value),
+        Value::Object(map) => {
+            for key in ["value", "path", "file", "name", "text"] {
+                if let Some(next) = map.get(key).and_then(coerce_string_value) {
+                    return Some(next);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -813,7 +897,7 @@ mod tests {
     };
 
     use super::{
-        enforce_verification_policy, parse_tool_call, run_agent_loop_with_runner,
+        coerce_string_value, enforce_verification_policy, parse_tool_call, run_agent_loop_with_runner,
         strip_thinking_blocks, AgentOptions, ApprovalOutcome, ApprovalRequest,
     };
 
@@ -1127,6 +1211,22 @@ mod tests {
         assert!(!prompts[0].contains("Do:\n"));
 
         cleanup(&workspace);
+    }
+
+    #[test]
+    fn coerces_nested_string_like_tool_arguments() {
+        assert_eq!(
+            coerce_string_value(&json!({"value":"README.md"})).as_deref(),
+            Some("README.md")
+        );
+        assert_eq!(
+            coerce_string_value(&json!(["src/main.rs"])).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            coerce_string_value(&json!({"path":{"value":"Cargo.toml"}})).as_deref(),
+            Some("Cargo.toml")
+        );
     }
 
     #[test]

@@ -82,9 +82,41 @@ fn has_verification_after_last_mutation(events: &[VerificationEvent]) -> bool {
 fn event_mutates_workspace(event: &VerificationEvent) -> bool {
     match event.name.as_str() {
         "write" | "edit" => true,
-        "exec" => !event_is_verification(event),
+        "exec" => exec_command_mutates_workspace(event),
         _ => false,
     }
+}
+
+fn exec_command_mutates_workspace(event: &VerificationEvent) -> bool {
+    if event_is_verification(event) {
+        return false;
+    }
+    let Some(command) = event.arguments.get("command").and_then(Value::as_str) else {
+        return true;
+    };
+    let command = command.trim().to_ascii_lowercase();
+    let read_only_prefixes = [
+        "ls",
+        "pwd",
+        "cat ",
+        "head ",
+        "tail ",
+        "sed ",
+        "grep ",
+        "rg ",
+        "find ",
+        "tree",
+        "git status",
+        "git diff",
+        "git log",
+        "git show",
+        "cargo tree",
+        "cargo metadata",
+        "ollama list",
+    ];
+    !read_only_prefixes
+        .iter()
+        .any(|prefix| command == *prefix || command.starts_with(prefix))
 }
 
 fn event_is_verification(event: &VerificationEvent) -> bool {
@@ -320,6 +352,20 @@ mod tests {
         assert!(assessment.requires_verification);
         assert!(!assessment.has_verification_after_last_mutation);
         assert!(assessment.guidance().contains("cargo test --workspace"));
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn read_only_exec_does_not_force_verification() {
+        let workspace = temp_workspace("verifier-readonly-exec");
+        let assessment = assess_verification(
+            &workspace,
+            &[VerificationEvent {
+                name: "exec".to_string(),
+                arguments: json!({ "command": "ls -la" }),
+            }],
+        );
+        assert!(!assessment.requires_verification);
         cleanup(&workspace);
     }
 
