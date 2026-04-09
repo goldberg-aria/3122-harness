@@ -56,6 +56,7 @@ This repository currently contains:
 - automatic model-switch handoff snapshots with first-turn context boost
 - runtime unit tests covering config, permissions, providers, skills, MCP, the harness loop, and verifier behavior
 - env-gated live provider tests for Anthropic, OpenAI-compatible, and Ollama
+- more readable CLI status, memory, approval, and verification feedback
 
 Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/ROADMAP.md).
 
@@ -152,6 +153,8 @@ Local-Lite memory:
 - prompt context now includes recent working history, Local-Lite memory recall, and relevant conversation recall from older sessions
 - the first prompt after `/model <spec>` gets a temporary handoff boost in prompt context
 - prompt context is budgeted so long sessions degrade conversation recall first, then memory, recent history, and finally instructions
+- `/status` shows approval and verification behavior alongside provider and memory state
+- `/memory` shows per-kind counts plus the most recent records
 
 Skill summaries:
 
@@ -178,8 +181,8 @@ Live provider tests:
 
 ## Immediate next steps
 
-1. Tighten runtime UX around status, memory, approvals, and verification feedback.
-2. Add provider-specific prompt shaping for weaker local models.
-3. Add model-aware context budgeting instead of fixed heuristics.
-4. Add richer verifier adapters beyond command-pattern heuristics.
-5. Add env-backed smoke coverage for saved provider profiles and external adapters.
+1. Add provider-specific prompt shaping for weaker local models.
+2. Add model-aware context budgeting instead of fixed heuristics.
+3. Add richer verifier adapters beyond command-pattern heuristics.
+4. Add env-backed smoke coverage for saved provider profiles and external adapters.
+5. Add stronger REPL-level tests for status and handoff presentation.

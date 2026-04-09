@@ -10,8 +10,9 @@ use runtime::{
     parallel_read_only, pending_model_handoff, provider_preset, provider_presets, read_file,
     remove_provider_profile, render_prompt_context, resolve_skill, run_agent_loop, save_config,
     save_session_memory_bundle, search_memory_records, upsert_provider_profile, write_file,
-    ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, LoadedConfig,
+    ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, LoadedConfig, MemoryRecord,
     ModelHandoffSnapshot, PermissionMode, SavedProviderProfile, SessionStore, ToolOutput,
+    VerificationPolicy,
 };
 use serde_json::json;
 
@@ -146,6 +147,11 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
         approval_policy,
         approval_policy_hint(approval_policy)
     );
+    println!(
+        "verification: {} ({})",
+        config.default_verification_policy(),
+        verification_policy_hint(config.default_verification_policy())
+    );
     if let Some(model) = current_model.as_deref() {
         println!("model: {model}");
     }
@@ -212,6 +218,7 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 current_model.as_deref(),
                 mode,
                 approval_policy,
+                config.default_verification_policy(),
             ),
             "/model" => print_model_status(workspace, config, current_model.as_deref()),
             "/resume" => match build_resume_text(workspace) {
@@ -229,11 +236,7 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
             "/memory" => print_memory_list(workspace),
             "/login" => print_login_status(workspace),
             "/mode" => println!("{mode}"),
-            "/approval" => println!(
-                "{} ({})",
-                approval_policy,
-                approval_policy_hint(approval_policy)
-            ),
+            "/approval" => print_approval_status(approval_policy),
             "/doctor" => print!("{}", doctor_report(workspace, config).render()),
             "/config" => println!("{}", config.render_summary(workspace)),
             "/skills" => print_skills(workspace, config),
@@ -365,10 +368,12 @@ fn print_repl_status(
     current_model: Option<&str>,
     mode: PermissionMode,
     approval_policy: ApprovalPolicy,
+    verification_policy: VerificationPolicy,
 ) {
     let provider_count = load_provider_registry(workspace)
         .map(|registry| registry.profiles.len())
         .unwrap_or(0);
+    let memory_records = list_memory_records(workspace).unwrap_or_default();
     println!("workspace: {}", workspace.display());
     println!("session: {}", session.path().display());
     println!("model: {}", current_model.unwrap_or("-"));
@@ -378,13 +383,22 @@ fn print_repl_status(
         }
         println!("next_step: {}", handoff.snapshot.suggested_next_step);
     }
+    if let Ok(Some(handoff)) = pending_model_handoff(session.path()) {
+        println!("handoff_boost: pending for {}", handoff.snapshot.to_model);
+    }
     println!("mode: {mode}");
+    println!("approval: {}", approval_policy);
     println!(
-        "approval: {} ({})",
-        approval_policy,
+        "approval_behavior: {}",
         approval_policy_hint(approval_policy)
     );
+    println!("verification: {}", verification_policy);
+    println!(
+        "verification_behavior: {}",
+        verification_policy_hint(verification_policy)
+    );
     println!("saved_providers: {provider_count}");
+    println!("memory_records: {}", memory_records.len());
 }
 
 fn print_model_status(workspace: &Path, config: &LoadedConfig, current_model: Option<&str>) {
@@ -456,8 +470,15 @@ fn print_memory_list(workspace: &Path) {
                 println!("no memory records");
                 return;
             }
-            for record in records.into_iter().take(10) {
-                println!("{} | {} | {}", record.kind, record.title, record.ts_ms);
+            println!("memory_records: {}", records.len());
+            let (summaries, decisions, tasks, errors, notes) = memory_kind_counts(&records);
+            println!(
+                "kinds: summary={} decision={} task={} error={} note={}",
+                summaries, decisions, tasks, errors, notes
+            );
+            println!("recent:");
+            for record in records.into_iter().take(5) {
+                println!("- {} | {} | {}", record.kind, record.title, record.ts_ms);
             }
         }
         Err(err) => eprintln!("{err}"),
@@ -471,6 +492,7 @@ fn print_memory_search(workspace: &Path, query: &str) {
                 println!("no memory matches");
                 return;
             }
+            println!("matches: {}", records.len());
             for record in records {
                 println!("{} | {}", record.kind, record.title);
                 println!("{}", record.body.trim());
@@ -1258,6 +1280,9 @@ fn run_prompt(
         Ok(reply) => {
             println!("provider: {}", reply.provider.route.as_str());
             println!("model: {}", reply.provider.model);
+            if reply.provider.text.starts_with("Not verified:") {
+                println!("verification: not verified");
+            }
             if !reply.tool_events.is_empty() {
                 println!();
                 for (index, event) in reply.tool_events.iter().enumerate() {
@@ -1422,6 +1447,40 @@ fn approval_policy_hint(policy: ApprovalPolicy) -> &'static str {
         ApprovalPolicy::Prompt => "low-risk auto, medium/high prompt, critical deny",
         ApprovalPolicy::Auto => "low/medium/high auto, critical deny",
     }
+}
+
+fn verification_policy_hint(policy: VerificationPolicy) -> &'static str {
+    match policy {
+        VerificationPolicy::Off => "no completion checks",
+        VerificationPolicy::Annotate => "warn when completion is unverified",
+        VerificationPolicy::Require => "reject unverified completion after code changes",
+    }
+}
+
+fn print_approval_status(policy: ApprovalPolicy) {
+    println!("approval: {policy}");
+    println!("behavior: {}", approval_policy_hint(policy));
+}
+
+fn memory_kind_counts(records: &[MemoryRecord]) -> (usize, usize, usize, usize, usize) {
+    let mut summaries = 0;
+    let mut decisions = 0;
+    let mut tasks = 0;
+    let mut errors = 0;
+    let mut notes = 0;
+
+    for record in records {
+        match record.kind.as_str() {
+            "summary" => summaries += 1,
+            "decision" => decisions += 1,
+            "task" => tasks += 1,
+            "error" => errors += 1,
+            "note" => notes += 1,
+            _ => {}
+        }
+    }
+
+    (summaries, decisions, tasks, errors, notes)
 }
 
 fn parse_prompt_args(args: &[String]) -> (Option<String>, String) {
