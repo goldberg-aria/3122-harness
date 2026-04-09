@@ -1,0 +1,21 @@
+[model]
+primary = "anthropic/claude-sonnet-4-6"
+fallback = ["openai/gpt-4.1-mini", "ollama/qwen2.5-coder:7b"]
+
+[permissions]
+default_mode = "workspace-write"
+
+[approvals]
+policy = "prompt"
+
+[verification]
+policy = "require"
+
+[skills]
+extra_dirs = [".harness/skills"]
+
+[mcp]
+config_files = [".harness/mcp.json"]
+
+[session]
+directory = ".harness/sessions"

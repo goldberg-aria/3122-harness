@@ -1,0 +1,8 @@
+target/
+references/
+*.zip
+.DS_Store
+.harness/providers.json
+.harness/sessions/
+.harness/memory/
+tmp/

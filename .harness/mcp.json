@@ -1,0 +1,16 @@
+{
+  "servers": [
+    {
+      "name": "mock-echo",
+      "transport": "stdio",
+      "command": "node scripts/mock_mcp_echo.js",
+      "enabled": true
+    },
+    {
+      "name": "filesystem",
+      "transport": "stdio",
+      "command": "npx @modelcontextprotocol/server-filesystem .",
+      "enabled": false
+    }
+  ]
+}
