@@ -214,7 +214,9 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 modifiers,
                 ..
             } => {
-                if modifiers.contains(KeyModifiers::SHIFT) {
+                if modifiers.contains(KeyModifiers::SHIFT)
+                    || modifiers.contains(KeyModifiers::ALT)
+                {
                     ui.input.push('\n');
                     continue;
                 }
@@ -248,6 +250,13 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                     ReplDirective::Continue => {}
                     ReplDirective::Exit => break,
                 }
+            }
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                ui.input.push('\n');
             }
             KeyEvent {
                 code: KeyCode::Char(ch),
@@ -404,7 +413,7 @@ fn redraw_tui(
         stdout,
         MoveTo(0, input_row.saturating_sub(1)),
         SetAttribute(Attribute::Dim),
-        Print("Enter send | Shift-Enter newline | Tab complete | Ctrl-C exit"),
+        Print("Enter send | Shift/Alt-Enter or Ctrl-J newline | Tab complete | Ctrl-C exit"),
         SetAttribute(Attribute::Reset),
         MoveTo(0, input_row),
         Print(truncate_for_terminal(&format!("> {}", ui.input), width as usize)),
@@ -3640,10 +3649,11 @@ fn approval_for_request(
     }
 
     if session.is_none() {
-        return Err(format!(
-            "approval required for {}-risk tool `{}` in non-interactive mode: {}; use the REPL or set [approvals].policy = \"auto\"",
+        let reason = format!(
+            "approval required for {}-risk tool `{}` in non-interactive mode: {}; the harness rejected it and asked the model to continue without that tool",
             request.risk, request.tool, request.reason
-        ));
+        );
+        return Ok(ApprovalOutcome::Reject { reason });
     }
 
     println!();

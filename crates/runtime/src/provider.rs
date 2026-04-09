@@ -2,6 +2,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::{find_provider_profile, ConnectionMode, ProviderRegistry};
 
@@ -309,7 +310,7 @@ fn openai_compat_prompt_with_overrides(
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     let url = join_url(&base, "/chat/completions");
 
-    let client = Client::new();
+    let client = http_client()?;
     let response = client
         .post(url)
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
@@ -370,7 +371,7 @@ fn openai_compat_prompt_without_tools(
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
     let url = join_url(&base, "/chat/completions");
 
-    let response = Client::new()
+    let response = http_client()?
         .post(url)
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
         .header(CONTENT_TYPE, "application/json")
@@ -409,7 +410,8 @@ fn ollama_prompt(model: &str, prompt: &str) -> Result<ProviderReply, String> {
         std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
     let url = join_url(&base, "/api/chat");
 
-    let response = Client::new()
+    let client = http_client()?;
+    let response = client
         .post(url)
         .header(CONTENT_TYPE, "application/json")
         .json(&json!({
@@ -426,6 +428,13 @@ fn ollama_prompt(model: &str, prompt: &str) -> Result<ProviderReply, String> {
     let status = response.status();
     let body = response.text().map_err(|err| err.to_string())?;
     if !status.is_success() {
+        if status.as_u16() == 404 && body.contains("not found") {
+            if let Some(fallback_model) = resolve_ollama_fallback_model(&client, &base, model) {
+                if fallback_model != model {
+                    return ollama_prompt(&fallback_model, prompt);
+                }
+            }
+        }
         return Err(format!("ollama error {status}: {body}"));
     }
 
@@ -436,6 +445,56 @@ fn ollama_prompt(model: &str, prompt: &str) -> Result<ProviderReply, String> {
         text: parsed.message.content,
         tool_calls: parse_ollama_tool_calls(parsed.message.tool_calls),
     })
+}
+
+fn http_client() -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|err| err.to_string())
+}
+
+fn resolve_ollama_fallback_model(client: &Client, base: &str, requested_model: &str) -> Option<String> {
+    let url = join_url(base, "/api/tags");
+    let response = client.get(url).send().ok()?;
+    let status = response.status();
+    if !status.is_success() {
+        return None;
+    }
+    let parsed = response.json::<OllamaTagsResponse>().ok()?;
+    let names = parsed.models.into_iter().map(|model| model.name).collect::<Vec<_>>();
+    pick_ollama_fallback_model(&names, requested_model)
+}
+
+fn pick_ollama_fallback_model(names: &[String], requested_model: &str) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+
+    let requested = requested_model.to_ascii_lowercase();
+    let family_candidates = if requested.contains("qwen") {
+        vec!["qwen2.5", "qwen3", "qwen"]
+    } else if requested.contains("gemma") {
+        vec!["gemma"]
+    } else if requested.contains("llama") {
+        vec!["llama"]
+    } else if requested.contains("phi") {
+        vec!["phi"]
+    } else {
+        vec![]
+    };
+
+    for family in family_candidates {
+        if let Some(name) = names
+            .iter()
+            .find(|name| name.to_ascii_lowercase().contains(family))
+        {
+            return Some(name.clone());
+        }
+    }
+
+    names.first().cloned()
 }
 
 fn join_url(base: &str, suffix: &str) -> String {
@@ -1001,6 +1060,17 @@ struct OllamaResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    #[serde(default)]
+    models: Vec<OllamaTagModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagModel {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OllamaMessage {
     content: String,
     tool_calls: Option<Vec<OllamaToolCall>>,
@@ -1025,7 +1095,8 @@ mod tests {
 
     use super::{
         join_url, parse_anthropic_tool_calls, parse_model_target, parse_ollama_tool_calls,
-        parse_openai_tool_calls, resolve_model_target, resolve_model_target_with_mode,
+        parse_openai_tool_calls, pick_ollama_fallback_model, resolve_model_target,
+        resolve_model_target_with_mode,
         AnthropicContentBlock, OllamaFunctionCall, OllamaToolCall, OpenAiFunctionCall,
         OpenAiToolCall, ProviderRoute,
     };
@@ -1086,6 +1157,24 @@ mod tests {
         assert_eq!(
             join_url("http://localhost:11434/api", "/api/chat"),
             "http://localhost:11434/api/chat"
+        );
+    }
+
+    #[test]
+    fn picks_ollama_family_fallback_model() {
+        let names = vec![
+            "gemma4:latest".to_string(),
+            "qwen2.5:latest".to_string(),
+            "llama3.2:3b".to_string(),
+        ];
+
+        assert_eq!(
+            pick_ollama_fallback_model(&names, "qwen2.5-coder:7b").as_deref(),
+            Some("qwen2.5:latest")
+        );
+        assert_eq!(
+            pick_ollama_fallback_model(&names, "gemma3:latest").as_deref(),
+            Some("gemma4:latest")
         );
     }
 

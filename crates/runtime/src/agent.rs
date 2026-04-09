@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     assess_verification, call_mcp_tool, classify_approval_request, discover_mcp_servers,
@@ -343,7 +343,30 @@ where
         reason,
     })?;
     if let ApprovalOutcome::Reject { reason } = approval {
-        return Err(format!("tool request rejected: {reason}"));
+        events.push(AgentEvent::ToolCall {
+            name: tool_name.clone(),
+            arguments: arguments.clone(),
+        });
+        events.push(AgentEvent::ToolResult {
+            name: tool_name.clone(),
+            summary: format!("approval rejected: {reason}"),
+            content: format!(
+                "The harness rejected tool `{tool_name}` with arguments {arguments}: {reason}"
+            ),
+        });
+        if let Some(store) = session {
+            let _ = store.append(
+                "agent_tool_rejected",
+                json!({
+                    "step": step,
+                    "source": source,
+                    "name": tool_name,
+                    "arguments": arguments,
+                    "reason": reason,
+                }),
+            );
+        }
+        return Ok(());
     }
 
     let request = ToolCallEnvelope {
@@ -462,7 +485,7 @@ Do:\n\
 \n\
 Don't:\n\
 - do not claim completion without verification\n\
-- do not emit chain-of-thought or `<thinking>` blocks\n\
+- do not emit chain-of-thought or `<thinking>` / `<think>` blocks\n\
 - do not mix other tasks, repos, or assumptions into this session\n\
 - do not return prose alongside a tool block\n\
 \n\
@@ -509,7 +532,7 @@ Compact rules for this model:\n\
                 "- If the user asked for explanation, summary, or analysis, answer directly.\n\
 - Do not create or edit files unless the user clearly asked for file changes.\n\
 - The current User request overrides older recall and prior file-writing tasks.\n\
-- Do not emit chain-of-thought or `<thinking>`.\n\
+- Do not emit chain-of-thought or `<thinking>` / `<think>`.\n\
 \n\
 Tool request format:\n\
 <tool_call>\n\
@@ -588,14 +611,14 @@ When a tool result appears, use it to decide the next step. Keep each step atomi
         PromptShape::Default => {
             "Final reminder:\n\
 - verify before claiming completion\n\
-- do not emit `<thinking>`\n\
+- do not emit `<thinking>` or `<think>`\n\
 - either output one tool block or a normal answer\n"
         }
         PromptShape::Compact => {
             "Final reminder:\n\
 - verify before claiming completion\n\
 - either output one tool block or one short normal answer\n\
-- do not emit `<thinking>`\n"
+- do not emit `<thinking>` or `<think>`\n"
         }
     };
     prompt.push_str(final_reminder);
@@ -631,23 +654,9 @@ fn uses_compact_prompt(target: &ProviderTarget) -> bool {
 }
 
 fn strip_thinking_blocks(text: &str) -> String {
-    let mut remaining = text;
-    let mut cleaned = String::new();
-
-    loop {
-        let Some(start) = remaining.find("<thinking>") else {
-            cleaned.push_str(remaining);
-            break;
-        };
-        cleaned.push_str(&remaining[..start]);
-        let after_start = &remaining[start + "<thinking>".len()..];
-        let Some(end) = after_start.find("</thinking>") else {
-            break;
-        };
-        remaining = &after_start[end + "</thinking>".len()..];
-    }
-
-    cleaned.trim().to_string()
+    let without_thinking = strip_tagged_blocks(text, "thinking");
+    let without_think = strip_tagged_blocks(&without_thinking, "think");
+    without_think.trim().to_string()
 }
 
 fn enforce_verification_policy(
@@ -688,10 +697,18 @@ fn enforce_verification_policy(
 fn parse_tool_call(text: &str) -> Result<Option<ToolCallEnvelope>, String> {
     let trimmed = text.trim();
     if !trimmed.contains("<tool_call>") {
+        if let Some(parsed) = parse_loose_tool_call(trimmed)? {
+            return Ok(Some(parsed));
+        }
+        if let Some(parsed) = parse_xml_invoke_tool_call(trimmed)? {
+            return Ok(Some(parsed));
+        }
         return Ok(None);
     }
-    let body = extract_tool_call_body(trimmed).ok_or_else(|| "invalid tool_call wrapper".to_string())?;
-    let repaired = repair_text_tool_call_body(&body);
+    let body =
+        extract_tool_call_body(trimmed).ok_or_else(|| "invalid tool_call wrapper".to_string())?;
+    let json_body = extract_first_json_object(&body).unwrap_or_else(|| body.clone());
+    let repaired = repair_text_tool_call_body(&json_body);
     let parsed = serde_json::from_str::<ToolCallEnvelope>(&repaired).map_err(|err| {
         format!(
             "tool call arguments were not valid JSON: {err}; raw={body}; repaired={repaired}"
@@ -701,6 +718,73 @@ fn parse_tool_call(text: &str) -> Result<Option<ToolCallEnvelope>, String> {
         return Err("tool call is missing tool name".to_string());
     }
     Ok(Some(parsed))
+}
+
+fn parse_loose_tool_call(text: &str) -> Result<Option<ToolCallEnvelope>, String> {
+    let Some(start) = text.find("{\"tool\"") else {
+        return Ok(None);
+    };
+    let candidate = &text[start..];
+    let json_body = extract_first_json_object(candidate).unwrap_or_else(|| candidate.to_string());
+    let repaired = repair_text_tool_call_body(&json_body);
+    let parsed = serde_json::from_str::<ToolCallEnvelope>(&repaired).map_err(|err| {
+        format!(
+            "tool call arguments were not valid JSON: {err}; raw={candidate}; repaired={repaired}"
+        )
+    })?;
+    if parsed.tool.trim().is_empty() {
+        return Err("tool call is missing tool name".to_string());
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_xml_invoke_tool_call(text: &str) -> Result<Option<ToolCallEnvelope>, String> {
+    let marker = "<invoke name=\"";
+    let Some(start) = text.find(marker) else {
+        return Ok(None);
+    };
+    let rest = &text[start + marker.len()..];
+    let Some(name_end) = rest.find('"') else {
+        return Err("xml invoke tool call is missing tool name terminator".to_string());
+    };
+    let tool = rest[..name_end].trim().to_string();
+    if tool.is_empty() {
+        return Err("xml invoke tool call is missing tool name".to_string());
+    }
+
+    let mut arguments = Map::new();
+    let mut remaining = &rest[name_end + 1..];
+    let parameter_marker = "<parameter name=\"";
+    while let Some(param_start) = remaining.find(parameter_marker) {
+        let after_marker = &remaining[param_start + parameter_marker.len()..];
+        let Some(param_name_end) = after_marker.find('"') else {
+            break;
+        };
+        let param_name = after_marker[..param_name_end].trim();
+        if param_name.is_empty() {
+            break;
+        }
+        let after_name = &after_marker[param_name_end + 1..];
+        let Some(value_start) = after_name.find('>') else {
+            break;
+        };
+        let after_value_start = &after_name[value_start + 1..];
+        let (value, tail) = if let Some(value_end) = after_value_start.find("</parameter>") {
+            (
+                after_value_start[..value_end].trim().to_string(),
+                &after_value_start[value_end + "</parameter>".len()..],
+            )
+        } else {
+            (after_value_start.trim().to_string(), "")
+        };
+        arguments.insert(param_name.to_string(), Value::String(value));
+        remaining = tail;
+    }
+
+    Ok(Some(ToolCallEnvelope {
+        tool,
+        arguments: Value::Object(arguments),
+    }))
 }
 
 fn extract_tool_call_body(text: &str) -> Option<String> {
@@ -713,6 +797,7 @@ fn extract_tool_call_body(text: &str) -> Option<String> {
 fn repair_text_tool_call_body(body: &str) -> String {
     let mut repaired = body.trim().replace("</parameter>", "");
     repaired = repaired.replace("<parameter>", "");
+    repaired = repaired.replace("</tool_call>", "");
     repaired = repaired.replace("```json", "");
     repaired = repaired.replace("```", "");
     repaired = repaired.trim().to_string();
@@ -723,6 +808,65 @@ fn repair_text_tool_call_body(body: &str) -> String {
     close_unbalanced_pairs(&mut repaired, '{', '}');
     close_unbalanced_pairs(&mut repaired, '[', ']');
     repaired
+}
+
+fn strip_tagged_blocks(text: &str, tag: &str) -> String {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let mut remaining = text;
+    let mut cleaned = String::new();
+
+    loop {
+        let Some(start) = remaining.find(&start_tag) else {
+            cleaned.push_str(remaining);
+            break;
+        };
+        cleaned.push_str(&remaining[..start]);
+        let after_start = &remaining[start + start_tag.len()..];
+        let Some(end) = after_start.find(&end_tag) else {
+            break;
+        };
+        remaining = &after_start[end + end_tag.len()..];
+    }
+
+    cleaned
+}
+
+fn extract_first_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let slice = &text[start..];
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, ch) in slice.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(slice[..=index].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(slice.to_string())
 }
 
 fn close_unbalanced_quotes(text: &mut String) {
@@ -997,9 +1141,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_loose_tool_call_without_opening_tag() {
+        let parsed = parse_tool_call(
+            "portun\n{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n</tool_call>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.tool, "read");
+        assert_eq!(parsed.arguments["path"], "README.md");
+    }
+
+    #[test]
+    fn parses_first_json_object_when_xml_noise_follows() {
+        let parsed = parse_tool_call(
+            "<tool_call>{\"tool\":\"glob\",\"arguments\":{\"pattern\":\"**/*.toml\"}}</tool_call>\n<invoke name=\"glob\">\n<parameter name=\"pattern\">**/*.rs</parameter>\n</tool_call>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.tool, "glob");
+        assert_eq!(parsed.arguments["pattern"], "**/*.toml");
+    }
+
+    #[test]
+    fn parses_xml_invoke_tool_call_blocks() {
+        let parsed = parse_tool_call(
+            "<invoke name=\"exec\">\n<parameter name=\"command\">ls -la /tmp</parameter>",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.tool, "exec");
+        assert_eq!(parsed.arguments["command"], "ls -la /tmp");
+    }
+
+    #[test]
     fn strips_thinking_blocks_from_provider_text() {
         let cleaned =
             strip_thinking_blocks("<thinking>private reasoning</thinking>\nFinal answer only");
+        assert_eq!(cleaned, "Final answer only");
+    }
+
+    #[test]
+    fn strips_think_blocks_from_provider_text() {
+        let cleaned = strip_thinking_blocks("<think>private reasoning</think>\nFinal answer only");
         assert_eq!(cleaned, "Final answer only");
     }
 
@@ -1406,11 +1589,11 @@ mod tests {
     }
 
     #[test]
-    fn stops_when_tool_request_is_rejected() {
+    fn continues_when_tool_request_is_rejected() {
         let workspace = temp_workspace("agent-loop-reject");
         let target = parse_model_target("ollama/test-model").unwrap();
         let options = AgentOptions {
-            max_steps: 2,
+            max_steps: 3,
             permission_mode: PermissionMode::WorkspaceWrite,
             verification_policy: VerificationPolicy::Annotate,
         };
@@ -1422,7 +1605,8 @@ mod tests {
             Some("do a read"),
         ));
 
-        let error = run_agent_loop_with_runner(
+        let mut turns = 0usize;
+        let reply = run_agent_loop_with_runner(
             &target,
             &workspace,
             &[],
@@ -1432,11 +1616,20 @@ mod tests {
             &options,
             None,
             |_, _| {
+                turns += 1;
+                if turns == 1 {
+                    return Ok(crate::ProviderReply {
+                        route: target.route,
+                        model: target.model.clone(),
+                        text: "<tool_call>{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}</tool_call>"
+                            .to_string(),
+                        tool_calls: Vec::new(),
+                    });
+                }
                 Ok(crate::ProviderReply {
                     route: target.route,
                     model: target.model.clone(),
-                    text: "<tool_call>{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}</tool_call>"
-                        .to_string(),
+                    text: "I could not read the file because the harness rejected that tool request. The workspace is a Rust coding-agent harness project.".to_string(),
                     tool_calls: Vec::new(),
                 })
             },
@@ -1447,9 +1640,13 @@ mod tests {
                 })
             },
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("boss rejected"));
+        assert!(reply
+            .provider
+            .text
+            .contains("The workspace is a Rust coding-agent harness project"));
+        assert!(reply.tool_events.is_empty());
         cleanup(&workspace);
     }
 
