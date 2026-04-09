@@ -160,6 +160,7 @@ Provider policy for v1:
 - Groq / Qwen API / other OpenAI-compatible routes: `api` first
 - Ollama: local API only
 - runtime target resolution now follows this policy
+- the CLI auto-loads workspace `.env` files so local BYOK setup can stay project-scoped
 
 Saved provider profiles:
 

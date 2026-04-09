@@ -83,6 +83,7 @@ cargo run -p cli -- providers
 cargo run -p cli -- providers presets
 cargo run -p cli -- providers detect-key <api-key>
 cargo run -p cli -- providers add router --api-key <api-key>
+cargo run -p cli -- providers sync-env
 cargo run -p cli -- providers saved
 cargo run -p cli -- blueprint
 cargo run -p cli -- skills
@@ -144,6 +145,7 @@ Provider connection policy:
   - MiniMax: `api` first
   - Groq / Qwen API / other OpenAI-compatible routes: `api` first
   - Ollama: local API only
+- the CLI now auto-loads `.env` and `.env.local` from the workspace root
 
 Verification behavior:
 
@@ -186,8 +188,9 @@ Saved provider profiles:
 
 - `providers add` stores BYOK profiles in `.harness/providers.json`
 - auto-detection currently recognizes some key formats such as OpenRouter and OpenAI
-- manual registration supports presets such as `deepseek`, `dashscope-cn`, `dashscope-intl`, and `siliconflow`
+- manual registration supports presets such as `deepseek`, `dashscope-cn`, `dashscope-intl`, `siliconflow`, `groq`, `minimax`, and `zai-coding`
 - saved profiles can be used as `profile/<alias>/<model>`
+- `providers sync-env` saves env-backed profiles such as `anthropic-api`, `openai-api`, `groq`, `qwen-api`, `zai`, and `minimax`
 
 What to prepare:
 
@@ -217,6 +220,7 @@ Live provider tests:
   - `HARNESS_TEST_SAVED_PROFILE_ALIAS`
   - `HARNESS_TEST_CLAUDE_CODE_MODEL`
   - `HARNESS_TEST_CODEX_MODEL`
+- `scripts/run_provider_matrix.sh` syncs env-backed profiles, chooses local Ollama defaults, and runs the live smoke test suite
 
 ## Immediate next steps
 

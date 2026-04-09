@@ -6,3 +6,5 @@ references/
 .harness/sessions/
 .harness/memory/
 tmp/
+.env
+.env.local

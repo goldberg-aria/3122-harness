@@ -19,6 +19,7 @@ use serde_json::json;
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let workspace = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let _ = runtime::load_workspace_env(&workspace);
     let config = match load_config(&workspace) {
         Ok(config) => config,
         Err(err) => {
@@ -747,6 +748,7 @@ fn handle_providers_command(workspace: &Path, args: &[String]) {
                 std::process::exit(1);
             }
         },
+        Some("sync-env") => sync_provider_profiles_from_env(workspace),
         Some("detect-key") => {
             let Some(api_key) = args.get(1) else {
                 eprintln!("usage: harness providers detect-key <api-key>");
@@ -887,6 +889,101 @@ fn add_provider_profile_command(workspace: &Path, args: &[String]) {
             eprintln!("{err}");
             std::process::exit(1);
         }
+    }
+}
+
+fn sync_provider_profiles_from_env(workspace: &Path) {
+    let specs = [
+        (
+            "anthropic-api",
+            "anthropic",
+            "ANTHROPIC_API_KEY",
+            Some("ANTHROPIC_BASE_URL"),
+            Some("anthropic"),
+            "env:anthropic",
+        ),
+        (
+            "openai-api",
+            "openai-compat",
+            "OPENAI_API_KEY",
+            Some("OPENAI_BASE_URL"),
+            Some("openai"),
+            "env:openai",
+        ),
+        (
+            "groq",
+            "openai-compat",
+            "GROQ_API_KEY",
+            Some("GROQ_BASE_URL"),
+            Some("groq"),
+            "env:groq",
+        ),
+        (
+            "qwen-api",
+            "openai-compat",
+            "QWEN_API_KEY",
+            Some("QWEN_BASE_URL"),
+            Some("openrouter"),
+            "env:qwen-api",
+        ),
+        (
+            "zai",
+            "openai-compat",
+            "ZAI_API_KEY",
+            Some("ZAI_BASE_URL"),
+            Some("zai-coding"),
+            "env:zai",
+        ),
+        (
+            "minimax",
+            "openai-compat",
+            "MINIMAX_API_KEY",
+            Some("MINIMAX_BASE_URL"),
+            Some("minimax"),
+            "env:minimax",
+        ),
+    ];
+
+    let mut saved = Vec::new();
+    for (alias, route, api_key_env, base_url_env, preset_name, source) in specs {
+        let Some(api_key) = env::var(api_key_env).ok().filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+
+        let base_url = base_url_env
+            .and_then(|name| env::var(name).ok())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| preset_name.and_then(provider_preset).map(|preset| preset.base_url.to_string()));
+
+        let Some(base_url) = base_url else {
+            eprintln!("skipping {alias}: no base URL configured");
+            continue;
+        };
+
+        let profile = SavedProviderProfile {
+            alias: alias.to_string(),
+            route: route.to_string(),
+            base_url,
+            api_key,
+            source: source.to_string(),
+        };
+        match upsert_provider_profile(workspace, profile) {
+            Ok(_) => saved.push(alias.to_string()),
+            Err(err) => {
+                eprintln!("failed to save {alias}: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if saved.is_empty() {
+        println!("no env-backed provider profiles found");
+        return;
+    }
+
+    println!("saved {} provider profile(s)", saved.len());
+    for alias in saved {
+        println!("- {alias}");
     }
 }
 

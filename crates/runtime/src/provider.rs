@@ -1300,6 +1300,7 @@ mod tests {
     }
 
     fn live_test_enabled(provider: &str) -> bool {
+        let _ = crate::load_workspace_env(&std::env::current_dir().unwrap_or_else(|_| ".".into()));
         matches!(
             env::var("HARNESS_RUN_LIVE_PROVIDER_TESTS").ok().as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "YES")
@@ -1314,6 +1315,7 @@ mod tests {
     }
 
     fn saved_profile_live_test_enabled() -> bool {
+        let _ = crate::load_workspace_env(&std::env::current_dir().unwrap_or_else(|_| ".".into()));
         matches!(
             env::var("HARNESS_RUN_LIVE_PROVIDER_TESTS").ok().as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "YES")
@@ -1322,6 +1324,7 @@ mod tests {
     }
 
     fn auth_adapter_live_test_enabled(adapter: &str) -> bool {
+        let _ = crate::load_workspace_env(&std::env::current_dir().unwrap_or_else(|_| ".".into()));
         matches!(
             env::var("HARNESS_RUN_AUTH_ADAPTER_TESTS").ok().as_deref(),
             Some("1" | "true" | "TRUE" | "yes" | "YES")

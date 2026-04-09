@@ -170,6 +170,24 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             description: "SiliconFlow OpenAI-compatible API",
         },
         ProviderPreset {
+            name: "groq",
+            route: ProviderRoute::OpenAiCompat,
+            base_url: "https://api.groq.com/openai/v1",
+            description: "Groq OpenAI-compatible API",
+        },
+        ProviderPreset {
+            name: "minimax",
+            route: ProviderRoute::OpenAiCompat,
+            base_url: "https://api.minimax.io/v1",
+            description: "MiniMax OpenAI-compatible API",
+        },
+        ProviderPreset {
+            name: "zai-coding",
+            route: ProviderRoute::OpenAiCompat,
+            base_url: "https://api.z.ai/api/coding/paas/v4",
+            description: "Z.AI coding OpenAI-compatible API",
+        },
+        ProviderPreset {
             name: "anthropic",
             route: ProviderRoute::Anthropic,
             base_url: "https://api.anthropic.com",
@@ -255,5 +273,11 @@ mod tests {
         let preset = provider_preset("deepseek").unwrap();
         assert_eq!(preset.route, ProviderRoute::OpenAiCompat);
         assert!(preset.base_url.contains("api.deepseek.com"));
+
+        let groq = provider_preset("groq").unwrap();
+        assert_eq!(groq.base_url, "https://api.groq.com/openai/v1");
+
+        let minimax = provider_preset("minimax").unwrap();
+        assert_eq!(minimax.base_url, "https://api.minimax.io/v1");
     }
 }

@@ -239,7 +239,10 @@ impl LoadedConfig {
                 self.default_verification_policy()
             ),
             format!("primary_model: {}", self.primary_model().unwrap_or("-")),
-            format!("default_connection_mode: {}", self.default_connection_mode()),
+            format!(
+                "default_connection_mode: {}",
+                self.default_connection_mode()
+            ),
             format!(
                 "interactive_connection_mode: {}",
                 self.interactive_connection_mode()

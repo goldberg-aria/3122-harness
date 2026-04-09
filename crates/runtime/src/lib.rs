@@ -3,6 +3,7 @@ mod approvals;
 mod config;
 mod context;
 mod discovery;
+mod envfile;
 mod mcp;
 mod memory;
 mod permissions;
@@ -29,6 +30,7 @@ pub use context::{
     WorkspaceContext,
 };
 pub use discovery::{discover_mcp_servers, discover_skills, McpServerEntry, SkillEntry};
+pub use envfile::load_workspace_env;
 pub use mcp::{call_tool as call_mcp_tool, list_tools as list_mcp_tools, McpToolInfo};
 pub use memory::{
     append_memory_record, build_handoff_text, build_memory_recall_text,
@@ -45,8 +47,8 @@ pub use profiles::{
     ProviderRegistry, SavedProviderProfile,
 };
 pub use provider::{
-    parse_model_target, resolve_model_target, send_prompt, ProviderReply, ProviderRoute,
-    ProviderTarget, ProviderToolCall,
+    parse_model_target, resolve_model_target, resolve_model_target_with_mode, send_prompt,
+    ProviderReply, ProviderRoute, ProviderTarget, ProviderToolCall,
 };
 pub use session::SessionStore;
 pub use skills::{build_skill_packet, resolve_skill, ResolvedSkill, SkillPacket};

@@ -285,6 +285,8 @@ Current progress:
 - verifier suggestions now inspect workspace manifests such as `Cargo.toml`
 - live provider checks are env-gated so CI and local runs can stay offline by default
 - Anthropic, OpenAI-compatible, and Ollama each have gated live prompt coverage
+- saved profile and auth adapter smoke-test gates now exist for future matrix runs
+- env-backed profile syncing and a provider matrix runner script now exist for local execution
 
 ## Recommended implementation order
 
