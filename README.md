@@ -72,10 +72,13 @@ cargo run -p cli -- config
 cargo run -p cli -- model show
 cargo run -p cli -- model set-primary openai/gpt-4.1-mini
 cargo run -p cli -- memory
+cargo run -p cli -- memory show 1
+cargo run -p cli -- memory recall 6
 cargo run -p cli -- memory save
 cargo run -p cli -- memory search provider
 cargo run -p cli -- resume
 cargo run -p cli -- handoff
+cargo run -p cli -- handoff debug
 cargo run -p cli -- why-context
 cargo run -p cli -- tool parallel-read '[{"tool":"read","path":"README.md"},{"tool":"glob","pattern":"src/*.rs"}]'
 cargo run -p cli -- prompt "say hello"
@@ -169,8 +172,11 @@ Local-Lite memory:
 
 - `memory save` promotes the latest session into local memory
 - `memory` lists recent memory records
+- `memory show <index>` prints one saved memory record with tags and source session
+- `memory recall [limit]` prints the exact recall block the harness would inject
 - `memory search <query>` searches saved memory locally
 - `resume` and `handoff` render session and handoff state back into operator-friendly text
+- `handoff debug` shows the latest structured handoff snapshot plus pending boost state
 - `why-context` prints the exact runtime context injected before a model turn
 - REPL exit autosaves new local memory records for the current session
 - prompt context now includes recent working history, Local-Lite memory recall, and relevant conversation recall from older sessions

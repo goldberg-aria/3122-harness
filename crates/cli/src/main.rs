@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 
 use runtime::{
     backend_catalog, blueprint_summary, build_handoff_text, build_model_handoff_snapshot,
-    build_resume_text, call_mcp_tool, detect_provider_key, discover_mcp_servers, discover_skills,
-    doctor_report, edit_file, exec_command, gather_workspace_context, glob_search, grep_search,
-    latest_model_handoff, list_mcp_tools, list_memory_records, load_config, load_provider_registry,
-    parallel_read_only, pending_model_handoff, provider_preset, provider_presets, read_file,
-    remove_provider_profile, render_prompt_context, resolve_skill, run_agent_loop, save_config,
-    save_session_memory_bundle, search_memory_records, upsert_provider_profile, write_file,
+    build_memory_recall_text, build_resume_text, call_mcp_tool, detect_provider_key,
+    discover_mcp_servers, discover_skills, doctor_report, edit_file, exec_command,
+    gather_workspace_context, glob_search, grep_search, latest_model_handoff, list_mcp_tools,
+    list_memory_records, load_config, load_provider_registry, parallel_read_only,
+    pending_model_handoff, provider_preset, provider_presets, read_file, remove_provider_profile,
+    render_prompt_context, resolve_skill, run_agent_loop, save_config, save_session_memory_bundle,
+    search_memory_records, upsert_provider_profile, write_file,
     ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ConnectionMode, LoadedConfig,
     MemoryRecord, ModelHandoffSnapshot, PermissionMode, SavedProviderProfile, SessionStore,
     ToolOutput, VerificationPolicy,
@@ -52,13 +53,7 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Some("handoff") => match build_handoff_text(&workspace) {
-            Ok(text) => print!("{text}"),
-            Err(err) => {
-                eprintln!("{err}");
-                std::process::exit(1);
-            }
-        },
+        Some("handoff") => handle_handoff_command(&workspace, &args[1..]),
         Some("why-context") => {
             print!("{}", build_context_dump(&workspace, &config, None, None));
         }
@@ -193,8 +188,11 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 println!("/model      show or set the active model");
                 println!("/resume     show latest session resume summary");
                 println!("/handoff    print a handoff block");
+                println!("/handoff debug inspect the latest handoff state");
                 println!("/why-context show the current prompt context");
                 println!("/memory     list/search/save local memory");
+                println!("/memory show inspect one recent memory record");
+                println!("/memory recall print rendered recall text");
                 println!("/login      show provider setup hints");
                 println!("/mode       show or set permission mode");
                 println!("/approval   show or set approval policy");
@@ -301,8 +299,26 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                     save_latest_session_memory(workspace, &session);
                     continue;
                 }
+                if let Some(index) = trimmed.strip_prefix("/memory show ").map(str::trim) {
+                    match parse_positive_index(index) {
+                        Ok(index) => print_memory_show(workspace, index),
+                        Err(err) => eprintln!("{err}"),
+                    }
+                    continue;
+                }
+                if let Some(limit) = trimmed.strip_prefix("/memory recall").map(str::trim) {
+                    match parse_optional_limit(limit, 6) {
+                        Ok(limit) => print_memory_recall(workspace, limit),
+                        Err(err) => eprintln!("{err}"),
+                    }
+                    continue;
+                }
                 if let Some(query) = trimmed.strip_prefix("/memory search ").map(str::trim) {
                     print_memory_search(workspace, query);
+                    continue;
+                }
+                if trimmed == "/handoff debug" {
+                    print_handoff_debug(workspace);
                     continue;
                 }
                 if let Some(next_policy) = trimmed
@@ -490,10 +506,116 @@ fn print_memory_list(workspace: &Path) {
                 summaries, decisions, tasks, errors, notes
             );
             println!("recent:");
-            for record in records.into_iter().take(5) {
-                println!("- {} | {} | {}", record.kind, record.title, record.ts_ms);
+            for (index, record) in records.into_iter().take(5).enumerate() {
+                println!(
+                    "- #{} | {} | {} | {}",
+                    index + 1,
+                    record.kind,
+                    record.title,
+                    record.ts_ms
+                );
             }
+            println!("hint: use `memory show <index>` or `memory recall [limit]`");
         }
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_memory_show(workspace: &Path, index: usize) {
+    match list_memory_records(workspace) {
+        Ok(records) => {
+            if records.is_empty() {
+                println!("no memory records");
+                return;
+            }
+            let Some(record) = records.get(index - 1) else {
+                eprintln!("memory index out of range: {index}");
+                return;
+            };
+            println!("index: {index}");
+            println!("kind: {}", record.kind);
+            println!("title: {}", record.title);
+            println!("ts_ms: {}", record.ts_ms);
+            println!(
+                "session: {}",
+                record.session_path.as_deref().unwrap_or("-")
+            );
+            if record.tags.is_empty() {
+                println!("tags: -");
+            } else {
+                println!("tags: {}", record.tags.join(", "));
+            }
+            println!("body:");
+            println!("{}", record.body.trim());
+        }
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_memory_recall(workspace: &Path, limit: usize) {
+    match build_memory_recall_text(workspace, limit) {
+        Ok(text) => print!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_handoff_debug(workspace: &Path) {
+    let latest_session = match SessionStore::latest(workspace) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("{err}");
+            return;
+        }
+    };
+
+    let Some(session_path) = latest_session else {
+        println!("no sessions found");
+        return;
+    };
+
+    println!("session: {}", session_path.display());
+
+    match latest_model_handoff(&session_path) {
+        Ok(Some(handoff)) => {
+            println!("latest_handoff_ts_ms: {}", handoff.ts_ms);
+            println!(
+                "from_model: {}",
+                handoff.snapshot.from_model.as_deref().unwrap_or("-")
+            );
+            println!("to_model: {}", handoff.snapshot.to_model);
+            println!("current_goal: {}", handoff.snapshot.current_goal);
+            println!("recent_work_summary: {}", handoff.snapshot.recent_work_summary);
+            if handoff.snapshot.open_tasks.is_empty() {
+                println!("open_tasks: -");
+            } else {
+                println!("open_tasks:");
+                for task in &handoff.snapshot.open_tasks {
+                    println!("- {task}");
+                }
+            }
+            if handoff.snapshot.recent_errors.is_empty() {
+                println!("recent_errors: -");
+            } else {
+                println!("recent_errors:");
+                for error in &handoff.snapshot.recent_errors {
+                    println!("- {error}");
+                }
+            }
+            println!("suggested_next_step: {}", handoff.snapshot.suggested_next_step);
+        }
+        Ok(None) => println!("latest_handoff: -"),
+        Err(err) => {
+            eprintln!("{err}");
+            return;
+        }
+    }
+
+    match pending_model_handoff(&session_path) {
+        Ok(Some(handoff)) => {
+            println!("pending_handoff: yes");
+            println!("pending_to_model: {}", handoff.snapshot.to_model);
+        }
+        Ok(None) => println!("pending_handoff: no"),
         Err(err) => eprintln!("{err}"),
     }
 }
@@ -655,6 +777,29 @@ fn handle_model_command(workspace: &Path, config: &LoadedConfig, args: &[String]
 fn handle_memory_command(workspace: &Path, _config: &LoadedConfig, args: &[String]) {
     match args.first().map(String::as_str) {
         None | Some("list") => print_memory_list(workspace),
+        Some("show") => {
+            let Some(index) = args.get(1) else {
+                eprintln!("usage: harness memory show <index>");
+                std::process::exit(2);
+            };
+            match parse_positive_index(index) {
+                Ok(index) => print_memory_show(workspace, index),
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("recall") => {
+            let limit = match parse_optional_limit(args.get(1).map(String::as_str).unwrap_or(""), 6) {
+                Ok(limit) => limit,
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
+            };
+            print_memory_recall(workspace, limit);
+        }
         Some("search") => {
             let Some(query) = args.get(1) else {
                 eprintln!("usage: harness memory search <query>");
@@ -787,6 +932,48 @@ fn handle_providers_command(workspace: &Path, args: &[String]) {
         }
         Some(other) => {
             eprintln!("unknown providers command: {other}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_positive_index(input: &str) -> Result<usize, String> {
+    let value = input
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("invalid index: {input}"))?;
+    if value == 0 {
+        return Err("index must be >= 1".to_string());
+    }
+    Ok(value)
+}
+
+fn parse_optional_limit(input: &str, default: usize) -> Result<usize, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    let value = trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("invalid limit: {trimmed}"))?;
+    if value == 0 {
+        return Err("limit must be >= 1".to_string());
+    }
+    Ok(value)
+}
+
+fn handle_handoff_command(workspace: &Path, args: &[String]) {
+    match args.first().map(String::as_str) {
+        None | Some("show") => match build_handoff_text(workspace) {
+            Ok(text) => print!("{text}"),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        },
+        Some("debug") => print_handoff_debug(workspace),
+        Some(other) => {
+            eprintln!("unknown handoff command: {other}");
             std::process::exit(2);
         }
     }
@@ -1623,9 +1810,9 @@ fn print_help() {
     println!("  doctor      inspect local auth and binary availability");
     println!("  config      show resolved config");
     println!("  model       show or set default model config");
-    println!("  memory      list/search/save local memory");
+    println!("  memory      list/show/search/recall/save local memory");
     println!("  resume      show latest session resume summary");
-    println!("  handoff     print a handoff block");
+    println!("  handoff     show or debug the latest handoff block");
     println!("  why-context print the current prompt context");
     println!("  providers   list backend catalog");
     println!("  blueprint   print architecture summary");
