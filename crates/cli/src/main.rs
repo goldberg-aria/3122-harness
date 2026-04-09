@@ -77,6 +77,14 @@ fn main() {
             println!("{}", blueprint_summary());
         }
         Some("prompt") => {
+            if args
+                .get(1)
+                .map(String::as_str)
+                .is_some_and(|value| matches!(value, "--help" | "-h" | "help"))
+            {
+                print_prompt_help();
+                return;
+            }
             let (override_model, prompt) = parse_prompt_args(&args[1..]);
             if prompt.trim().is_empty() {
                 eprintln!("usage: {} prompt [--model <spec>] <text...>", APP_NAME);
@@ -3778,4 +3786,16 @@ fn print_help() {
     println!("  session     inspect session files");
     println!("  tool        run built-in tools without entering the repl");
     println!("  help        show this text");
+}
+
+fn print_prompt_help() {
+    println!("{APP_NAME} prompt");
+    println!();
+    println!("usage:");
+    println!("  {APP_NAME} prompt [--model <spec>] <text...>");
+    println!();
+    println!("examples:");
+    println!("  {APP_NAME} prompt \"say hello\"");
+    println!("  {APP_NAME} prompt --model openai/gpt-4.1-mini \"summarize this project\"");
+    println!("  {APP_NAME} prompt --model profile/groq/openai/gpt-oss-20b \"read README.md and summarize\"");
 }
