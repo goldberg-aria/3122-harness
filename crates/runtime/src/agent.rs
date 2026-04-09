@@ -1090,6 +1090,7 @@ fn coerce_string_value(value: &Value) -> Option<String> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -1116,6 +1117,10 @@ mod tests {
 
     fn cleanup(path: &Path) {
         let _ = fs::remove_dir_all(path);
+    }
+
+    fn has_node() -> bool {
+        Command::new("node").arg("--version").output().is_ok()
     }
 
     #[test]
@@ -1326,6 +1331,10 @@ mod tests {
 
     #[test]
     fn runs_loop_with_skill_and_mcp_tools() {
+        if !has_node() {
+            eprintln!("node not found; skipping MCP-backed agent test");
+            return;
+        }
         let workspace = temp_workspace("agent-loop-skill-mcp");
         let skill_dir = workspace.join(".harness/skills/bootstrap");
         fs::create_dir_all(&skill_dir).unwrap();

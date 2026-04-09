@@ -131,6 +131,10 @@ fn is_read_only_command(command: &str) -> bool {
         .next()
         .unwrap_or_default();
 
+    if token == "git" {
+        return is_safe_git_command(command);
+    }
+
     matches!(
         token,
         "cat"
@@ -146,7 +150,6 @@ fn is_read_only_command(command: &str) -> bool {
             | "which"
             | "where"
             | "whoami"
-            | "git"
             | "stat"
             | "file"
             | "wc"
@@ -165,6 +168,34 @@ fn contains_write_flags(command: &str) -> bool {
         || lowered.contains(" >>")
         || lowered.contains(" rm ")
         || lowered.starts_with("rm ")
+}
+
+fn is_safe_git_command(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if first.rsplit('/').next().unwrap_or_default() != "git" {
+        return false;
+    }
+
+    while let Some(token) = tokens.next() {
+        match token {
+            "-C" | "-c" | "--git-dir" | "--work-tree" => {
+                let _ = tokens.next();
+            }
+            "--no-pager" | "--paginate" => {}
+            value if value.starts_with('-') => {}
+            subcommand => {
+                return matches!(
+                    subcommand,
+                    "status" | "diff" | "show" | "log" | "rev-parse" | "branch"
+                );
+            }
+        }
+    }
+
+    false
 }
 
 fn is_dangerous_command(command: &str) -> bool {
@@ -247,5 +278,33 @@ mod tests {
     fn read_only_allows_safe_read_commands() {
         let decision = can_exec("rg harness src", PermissionMode::ReadOnly);
         assert_eq!(decision, PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn read_only_allows_safe_git_subcommands_only() {
+        let decision = can_exec("git -C repo status", PermissionMode::ReadOnly);
+        assert_eq!(decision, PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn read_only_blocks_destructive_git_subcommands() {
+        let decision = can_exec("git reset --hard", PermissionMode::ReadOnly);
+        assert_eq!(
+            decision,
+            PermissionDecision::Deny {
+                reason: "command may mutate state; blocked in read-only mode".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn read_only_blocks_sed_in_place_edits() {
+        let decision = can_exec("sed -i 's/foo/bar/' README.md", PermissionMode::ReadOnly);
+        assert_eq!(
+            decision,
+            PermissionDecision::Deny {
+                reason: "command may mutate state; blocked in read-only mode".to_string(),
+            }
+        );
     }
 }

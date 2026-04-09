@@ -1,7 +1,9 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -40,7 +42,7 @@ pub fn write_file(
     if let Some(parent) = resolved.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
-    fs::write(&resolved, contents).map_err(|err| err.to_string())?;
+    atomic_write(&resolved, contents)?;
     Ok(ToolOutput {
         summary: format!("wrote {}", resolved.display()),
         content: format!("{} bytes", contents.len()),
@@ -55,20 +57,27 @@ pub fn edit_file(
     mode: PermissionMode,
 ) -> Result<ToolOutput, String> {
     can_write(path, workspace_root, mode).into_result()?;
+    if needle.is_empty() {
+        return Err("needle must not be empty".to_string());
+    }
     let resolved = resolve_path(path, workspace_root);
     let current = fs::read_to_string(&resolved).map_err(|err| err.to_string())?;
+    let mut matches = current.match_indices(needle);
     let Some(index) = current.find(needle) else {
         return Err("needle not found".to_string());
     };
+    if matches.next().is_some() && matches.next().is_some() {
+        return Err("needle is not unique; provide more context".to_string());
+    }
 
     let mut next = String::with_capacity(current.len() + replacement.len());
     next.push_str(&current[..index]);
     next.push_str(replacement);
     next.push_str(&current[index + needle.len()..]);
-    fs::write(&resolved, &next).map_err(|err| err.to_string())?;
+    atomic_write(&resolved, &next)?;
     Ok(ToolOutput {
         summary: format!("edited {}", resolved.display()),
-        content: format!("replaced first occurrence of {:?}", needle),
+        content: format!("replaced unique occurrence of {:?}", needle),
     })
 }
 
@@ -143,12 +152,10 @@ pub fn exec_command(
     mode: PermissionMode,
 ) -> Result<ToolOutput, String> {
     can_exec(command, mode).into_result()?;
-    let output = Command::new("zsh")
-        .arg("-lc")
-        .arg(command)
-        .current_dir(workspace_root)
-        .output()
-        .map_err(|err| err.to_string())?;
+    let mut child = Command::new("zsh");
+    child.arg("-lc").arg(command).current_dir(workspace_root);
+    configure_exec_environment(&mut child);
+    let output = child.output().map_err(|err| err.to_string())?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -204,6 +211,39 @@ fn resolve_path(path: &Path, workspace_root: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         workspace_root.join(path)
+    }
+}
+
+fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path has no parent: {}", path.display()))?;
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_path = parent.join(format!(
+        ".harness-tmp-{}-{unique}",
+        std::process::id()
+    ));
+
+    let mut file = File::create(&temp_path).map_err(|err| err.to_string())?;
+    file.write_all(contents.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|err| err.to_string())?;
+    drop(file);
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        err.to_string()
+    })
+}
+
+fn configure_exec_environment(command: &mut Command) {
+    command.env_clear();
+    for key in ["PATH", "HOME", "SHELL", "TERM", "USER"] {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
     }
 }
 
@@ -314,13 +354,16 @@ fn wildcard_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
     use crate::PermissionMode;
 
-    use super::parallel_read_only;
+    use super::{edit_file, exec_command, parallel_read_only, read_file, write_file};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_workspace(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -355,6 +398,81 @@ mod tests {
         assert!(output.content.contains("hello world"));
         assert!(output.content.contains("src/main.rs"));
 
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn edit_file_rejects_non_unique_needle() {
+        let workspace = temp_workspace("tools-edit-duplicate");
+        fs::write(workspace.join("README.md"), "hello\nhello\n").unwrap();
+
+        let error = edit_file(
+            Path::new("README.md"),
+            "hello",
+            "world",
+            &workspace,
+            PermissionMode::WorkspaceWrite,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "needle is not unique; provide more context");
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn write_and_edit_use_atomic_write_path() {
+        let workspace = temp_workspace("tools-atomic-write");
+
+        write_file(
+            Path::new("README.md"),
+            "hello world",
+            &workspace,
+            PermissionMode::WorkspaceWrite,
+        )
+        .unwrap();
+        edit_file(
+            Path::new("README.md"),
+            "hello world",
+            "updated",
+            &workspace,
+            PermissionMode::WorkspaceWrite,
+        )
+        .unwrap();
+
+        let output = read_file(
+            Path::new("README.md"),
+            &workspace,
+            PermissionMode::WorkspaceWrite,
+        )
+        .unwrap();
+        assert_eq!(output.content, "updated");
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn exec_command_does_not_inherit_secret_env_vars() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let workspace = temp_workspace("tools-exec-env");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key = format!("HARNESS_SECRET_{unique}");
+
+        unsafe {
+            std::env::set_var(&key, "super-secret");
+        }
+        let output = exec_command(
+            &format!("printenv {key}"),
+            &workspace,
+            PermissionMode::WorkspaceWrite,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var(&key);
+        }
+
+        assert!(output.content.contains("stdout:\n\n\nstderr:\n"));
         cleanup(&workspace);
     }
 }

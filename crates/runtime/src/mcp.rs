@@ -196,12 +196,17 @@ fn read_message(reader: &mut dyn BufRead) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::process::Command;
 
     use serde_json::json;
 
     use crate::McpServerEntry;
 
     use super::{call_tool, list_tools};
+
+    fn has_node() -> bool {
+        Command::new("node").arg("--version").output().is_ok()
+    }
 
     fn mock_server() -> McpServerEntry {
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -222,6 +227,10 @@ mod tests {
 
     #[test]
     fn lists_tools_from_mock_server() {
+        if !has_node() {
+            eprintln!("node not found; skipping MCP mock test");
+            return;
+        }
         let tools = list_tools(&[mock_server()], "mock-echo").unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
@@ -233,6 +242,10 @@ mod tests {
 
     #[test]
     fn calls_tool_on_mock_server() {
+        if !has_node() {
+            eprintln!("node not found; skipping MCP mock test");
+            return;
+        }
         let result = call_tool(
             &[mock_server()],
             "mock-echo",

@@ -220,6 +220,18 @@ fn matches_dangerous_exec_command(command: &str) -> bool {
 }
 
 fn matches_read_only_exec_command(command: &str) -> bool {
+    if command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        == "git"
+    {
+        return matches_safe_git_exec_command(command);
+    }
+
     [
         "cargo test",
         "cargo check",
@@ -235,9 +247,6 @@ fn matches_read_only_exec_command(command: &str) -> bool {
         "ruff check",
         "go test",
         "cargo fmt --check",
-        "git status",
-        "git diff",
-        "git show",
         "ls",
         "pwd",
         "cat ",
@@ -247,6 +256,7 @@ fn matches_read_only_exec_command(command: &str) -> bool {
     ]
     .iter()
     .any(|needle| command.contains(needle))
+        && !contains_write_flags(command)
 }
 
 fn matches_build_exec_command(command: &str) -> bool {
@@ -272,6 +282,43 @@ fn truncate_command(command: &str) -> String {
     }
     let truncated = trimmed.chars().take(80).collect::<String>();
     format!("{truncated}...")
+}
+
+fn contains_write_flags(command: &str) -> bool {
+    let lowered = command.to_ascii_lowercase();
+    lowered.contains(" -i")
+        || lowered.contains(" >")
+        || lowered.contains(" >>")
+        || lowered.contains(" rm ")
+        || lowered.starts_with("rm ")
+}
+
+fn matches_safe_git_exec_command(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if first.rsplit('/').next().unwrap_or_default() != "git" {
+        return false;
+    }
+
+    while let Some(token) = tokens.next() {
+        match token {
+            "-C" | "-c" | "--git-dir" | "--work-tree" => {
+                let _ = tokens.next();
+            }
+            "--no-pager" | "--paginate" => {}
+            value if value.starts_with('-') => {}
+            subcommand => {
+                return matches!(
+                    subcommand,
+                    "status" | "diff" | "show" | "log" | "rev-parse" | "branch"
+                );
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -331,6 +378,24 @@ mod tests {
         assert_eq!(safe_risk, ApprovalRisk::Low);
         assert_eq!(danger_risk, ApprovalRisk::Critical);
         assert!(reason.contains("dangerous"));
+    }
+
+    #[test]
+    fn classifies_git_status_as_low_and_git_reset_as_critical() {
+        let (safe_risk, _) =
+            classify_approval_request("exec", &json!({ "command": "git -C repo status" }));
+        let (danger_risk, _) =
+            classify_approval_request("exec", &json!({ "command": "git reset --hard" }));
+
+        assert_eq!(safe_risk, ApprovalRisk::Low);
+        assert_eq!(danger_risk, ApprovalRisk::Critical);
+    }
+
+    #[test]
+    fn classifies_sed_in_place_as_high_risk() {
+        let (risk, _) =
+            classify_approval_request("exec", &json!({ "command": "sed -i 's/a/b/' README.md" }));
+        assert_eq!(risk, ApprovalRisk::High);
     }
 
     #[test]
