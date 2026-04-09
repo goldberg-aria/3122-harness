@@ -1288,7 +1288,7 @@ mod tests {
             return;
         }
 
-        let model = env::var("HARNESS_TEST_CODEX_MODEL").unwrap_or_else(|_| "o3".to_string());
+        let model = env::var("HARNESS_TEST_CODEX_MODEL").unwrap_or_else(|_| "gpt-5".to_string());
         let reply = send_prompt(
             &parse_model_target(&format!("codex/{model}")).unwrap(),
             "Reply with exactly: live-codex-ok",
