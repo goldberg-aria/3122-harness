@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use runtime::{
     backend_catalog, blueprint_summary, build_handoff_text, build_model_handoff_snapshot,
     build_memory_recall_text, build_resume_text, call_mcp_tool, detect_provider_key,
-    discover_mcp_servers, discover_skills, discover_slash_commands, doctor_report, edit_file,
-    exec_command, expand_slash_command, gather_workspace_context, glob_search, grep_search,
-    latest_model_handoff, list_mcp_tools, list_memory_records, load_config,
-    load_provider_registry, parallel_read_only, pending_model_handoff, provider_preset,
-    provider_presets, read_file, remove_provider_profile, render_prompt_context,
-    resolve_skill, resolve_slash_command, run_agent_loop, save_config, save_session_memory_bundle,
-    search_memory_records, upsert_provider_profile, write_file, SlashCommandKind,
+    create_slash_command_template, discover_mcp_servers, discover_skills, discover_slash_commands,
+    doctor_report, edit_file, exec_command, expand_slash_command, gather_workspace_context,
+    glob_search, grep_search, init_slash_command_dir, latest_model_handoff, list_mcp_tools,
+    list_memory_records, load_config, load_provider_registry, parallel_read_only,
+    pending_model_handoff, provider_preset, provider_presets, read_file, remove_provider_profile,
+    render_prompt_context, resolve_skill, resolve_slash_command, run_agent_loop, save_config,
+    save_session_memory_bundle, search_memory_records, slash_command_dir, upsert_provider_profile,
+    write_file, SlashCommandKind, SlashCommandScope,
     ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ConnectionMode, LoadedConfig,
     MemoryRecord, ModelHandoffSnapshot, PermissionMode, SavedProviderProfile, SessionStore,
     ToolOutput, VerificationPolicy,
@@ -375,6 +376,17 @@ fn handle_repl_line(
         print_slash_command_show(workspace, name);
         return ReplDirective::Continue;
     }
+    if let Some(rest) = trimmed.strip_prefix("/commands init").map(str::trim) {
+        run_commands_init(workspace, parse_scope_flag(rest));
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/commands new ").map(str::trim) {
+        match parse_new_command_args(rest) {
+            Ok((name, kind, scope)) => run_commands_new(workspace, name, kind, scope),
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
     if trimmed == "/handoff debug" {
         print_handoff_debug(workspace);
         return ReplDirective::Continue;
@@ -561,6 +573,8 @@ fn print_repl_help() {
     println!("/memory recall print rendered recall text");
     println!("/commands   list custom slash commands");
     println!("/commands show inspect one custom slash command");
+    println!("/commands init create a commands directory");
+    println!("/commands new create a command template");
     println!("/login      show provider setup hints");
     println!("/mode       show or set permission mode");
     println!("/approval   show or set approval policy");
@@ -591,6 +605,12 @@ fn print_slash_commands(workspace: &Path) {
         println!("no custom slash commands");
         return;
     }
+    if let Ok(global_dir) = slash_command_dir(workspace, SlashCommandScope::Global) {
+        println!("global_dir: {}", global_dir.display());
+    }
+    if let Ok(workspace_dir) = slash_command_dir(workspace, SlashCommandScope::Workspace) {
+        println!("workspace_dir: {}", workspace_dir.display());
+    }
     println!("custom_commands: {}", commands.len());
     for command in commands {
         let summary = if command.description.trim().is_empty() {
@@ -605,6 +625,33 @@ fn print_slash_commands(workspace: &Path) {
             command.source,
             summary
         );
+    }
+}
+
+fn run_commands_init(workspace: &Path, scope: SlashCommandScope) {
+    match init_slash_command_dir(workspace, scope) {
+        Ok(path) => {
+            println!("initialized {} commands dir", scope.as_str());
+            println!("path: {}", path.display());
+        }
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn run_commands_new(
+    workspace: &Path,
+    name: &str,
+    kind: SlashCommandKind,
+    scope: SlashCommandScope,
+) {
+    let kind_label = kind.as_str().to_string();
+    match create_slash_command_template(workspace, scope, name, kind) {
+        Ok(path) => {
+            println!("created /{} ({})", name.trim().trim_start_matches('/'), kind_label);
+            println!("scope: {}", scope.as_str());
+            println!("path: {}", path.display());
+        }
+        Err(err) => eprintln!("{err}"),
     }
 }
 
@@ -1070,6 +1117,22 @@ fn handle_memory_command(workspace: &Path, _config: &LoadedConfig, args: &[Strin
 fn handle_commands_command(workspace: &Path, args: &[String]) {
     match args.first().map(String::as_str) {
         None | Some("list") => print_slash_commands(workspace),
+        Some("init") => {
+            let scope = parse_commands_scope(args);
+            run_commands_init(workspace, scope);
+        }
+        Some("new") => {
+            let Some(name) = args.get(1) else {
+                eprintln!("usage: harness commands new <name> [alias|macro|prompt-template] [--global]");
+                std::process::exit(2);
+            };
+            let kind = args
+                .get(2)
+                .and_then(|value| parse_command_kind(value))
+                .unwrap_or(SlashCommandKind::Macro);
+            let scope = parse_commands_scope(args);
+            run_commands_new(workspace, name, kind, scope);
+        }
         Some("show") => {
             let Some(name) = args.get(1) else {
                 eprintln!("usage: harness commands show <name>");
@@ -1081,6 +1144,14 @@ fn handle_commands_command(workspace: &Path, args: &[String]) {
             eprintln!("unknown commands command: {other}");
             std::process::exit(2);
         }
+    }
+}
+
+fn parse_commands_scope(args: &[String]) -> SlashCommandScope {
+    if args.iter().any(|arg| arg == "--global") {
+        SlashCommandScope::Global
+    } else {
+        SlashCommandScope::Workspace
     }
 }
 
@@ -1196,6 +1267,39 @@ fn parse_slash_invocation(input: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((name, rest))
+}
+
+fn parse_scope_flag(input: &str) -> SlashCommandScope {
+    if input.split_whitespace().any(|part| part == "--global") {
+        SlashCommandScope::Global
+    } else {
+        SlashCommandScope::Workspace
+    }
+}
+
+fn parse_new_command_args(input: &str) -> Result<(&str, SlashCommandKind, SlashCommandScope), String> {
+    let tokens = input.split_whitespace().collect::<Vec<_>>();
+    let Some(name) = tokens.first().copied() else {
+        return Err("usage: /commands new <name> [alias|macro|prompt-template] [--global]".to_string());
+    };
+    let mut kind = SlashCommandKind::Macro;
+    for token in tokens.iter().skip(1) {
+        if *token == "--global" {
+            continue;
+        }
+        kind = parse_command_kind(token)
+            .ok_or_else(|| format!("unknown command kind: {token}"))?;
+    }
+    Ok((name, kind, parse_scope_flag(input)))
+}
+
+fn parse_command_kind(raw: &str) -> Option<SlashCommandKind> {
+    match raw.trim() {
+        "alias" => Some(SlashCommandKind::Alias),
+        "macro" => Some(SlashCommandKind::Macro),
+        "prompt-template" | "prompt_template" => Some(SlashCommandKind::PromptTemplate),
+        _ => None,
+    }
 }
 
 fn parse_optional_limit(input: &str, default: usize) -> Result<usize, String> {

@@ -82,6 +82,9 @@ cargo run -p cli -- handoff debug
 cargo run -p cli -- why-context
 cargo run -p cli -- commands
 cargo run -p cli -- commands show recap
+cargo run -p cli -- commands init
+cargo run -p cli -- commands new checkpoint macro
+cargo run -p cli -- commands new ctx alias --global
 cargo run -p cli -- tool parallel-read '[{"tool":"read","path":"README.md"},{"tool":"glob","pattern":"src/*.rs"}]'
 cargo run -p cli -- prompt "say hello"
 cargo run -p cli -- providers
@@ -173,6 +176,8 @@ REPL shape:
 - `/status` shows the current connection mode and behavior
 - `/commands` lists discovered custom slash commands
 - `/commands show <name>` prints the resolved command definition
+- `commands init [--global]` creates the command directory if needed
+- `commands new <name> [alias|macro|prompt-template] [--global]` writes a starter template
 
 Custom slash command format:
 

@@ -42,6 +42,21 @@ pub struct SlashCommand {
     pub prompt: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCommandScope {
+    Global,
+    Workspace,
+}
+
+impl SlashCommandScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SlashCommandConfig {
     name: Option<String>,
@@ -75,6 +90,42 @@ pub fn discover_slash_commands(workspace_root: &Path) -> Vec<SlashCommand> {
     }
 
     merged.into_values().collect()
+}
+
+pub fn slash_command_dir(workspace_root: &Path, scope: SlashCommandScope) -> Result<PathBuf, String> {
+    match scope {
+        SlashCommandScope::Global => {
+            let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+            Ok(PathBuf::from(home).join(".harness").join("commands"))
+        }
+        SlashCommandScope::Workspace => Ok(workspace_root.join(".harness").join("commands")),
+    }
+}
+
+pub fn init_slash_command_dir(
+    workspace_root: &Path,
+    scope: SlashCommandScope,
+) -> Result<PathBuf, String> {
+    let dir = slash_command_dir(workspace_root, scope)?;
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    Ok(dir)
+}
+
+pub fn create_slash_command_template(
+    workspace_root: &Path,
+    scope: SlashCommandScope,
+    name: &str,
+    kind: SlashCommandKind,
+) -> Result<PathBuf, String> {
+    let normalized = normalize_slash_command_name(name)?;
+    let dir = init_slash_command_dir(workspace_root, scope)?;
+    let path = dir.join(format!("{normalized}.toml"));
+    if path.exists() {
+        return Err(format!("command already exists: {}", path.display()));
+    }
+    let contents = render_slash_command_template(&normalized, kind);
+    fs::write(&path, contents).map_err(|err| err.to_string())?;
+    Ok(path)
 }
 
 pub fn resolve_slash_command<'a>(
@@ -117,15 +168,13 @@ pub fn expand_slash_command(command: &SlashCommand, args_raw: &str) -> Vec<Strin
 
 fn command_sources(workspace_root: &Path) -> Vec<(String, PathBuf)> {
     let mut sources = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        sources.push((
-            "global".to_string(),
-            PathBuf::from(home).join(".harness").join("commands"),
-        ));
+    if let Ok(dir) = slash_command_dir(workspace_root, SlashCommandScope::Global) {
+        sources.push(("global".to_string(), dir));
     }
     sources.push((
         "workspace".to_string(),
-        workspace_root.join(".harness").join("commands"),
+        slash_command_dir(workspace_root, SlashCommandScope::Workspace)
+            .unwrap_or_else(|_| workspace_root.join(".harness").join("commands")),
     ));
     sources
 }
@@ -180,13 +229,46 @@ fn apply_template(template: &str, args_raw: &str, args: &[&str]) -> String {
     output
 }
 
+fn normalize_slash_command_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim().trim_start_matches('/').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Err("command name is empty".to_string());
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
+    {
+        return Err(format!(
+            "invalid command name: {name} (use lowercase letters, digits, '-' or '_')"
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn render_slash_command_template(name: &str, kind: SlashCommandKind) -> String {
+    match kind {
+        SlashCommandKind::Alias => format!(
+            "name = \"{name}\"\ndescription = \"Describe this shortcut\"\nkind = \"alias\"\ntarget = \"/why-context\"\n"
+        ),
+        SlashCommandKind::Macro => format!(
+            "name = \"{name}\"\ndescription = \"Describe this workflow\"\nkind = \"macro\"\nsteps = [\"/memory save\", \"/resume\"]\n"
+        ),
+        SlashCommandKind::PromptTemplate => format!(
+            "name = \"{name}\"\ndescription = \"Describe this prompt template\"\nkind = \"prompt-template\"\nprompt = \"Review {{arg1}} in 3 concise bullets. Extra: {{args}}\"\n"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{discover_slash_commands, expand_slash_command, resolve_slash_command};
+    use super::{
+        create_slash_command_template, discover_slash_commands, expand_slash_command,
+        resolve_slash_command, SlashCommandKind, SlashCommandScope,
+    };
 
     fn temp_workspace(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -253,6 +335,22 @@ prompt = "Review the risk of {arg1} in 3 bullets. Extra: {args}"
             vec!["Review the risk of src/main.rs in 3 bullets. Extra: src/main.rs urgent"]
         );
 
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn creates_new_workspace_command_template() {
+        let workspace = temp_workspace("slash-commands-new");
+        let path = create_slash_command_template(
+            &workspace,
+            SlashCommandScope::Workspace,
+            "ctx",
+            SlashCommandKind::Alias,
+        )
+        .unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("kind = \"alias\""));
+        assert!(contents.contains("target = \"/why-context\""));
         cleanup(&workspace);
     }
 }
