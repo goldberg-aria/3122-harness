@@ -1,0 +1,3 @@
+description = "Save memory, show resume, and print the current handoff"
+kind = "macro"
+steps = ["/memory save", "/resume", "/handoff"]

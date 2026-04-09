@@ -80,6 +80,8 @@ cargo run -p cli -- resume
 cargo run -p cli -- handoff
 cargo run -p cli -- handoff debug
 cargo run -p cli -- why-context
+cargo run -p cli -- commands
+cargo run -p cli -- commands show recap
 cargo run -p cli -- tool parallel-read '[{"tool":"read","path":"README.md"},{"tool":"glob","pattern":"src/*.rs"}]'
 cargo run -p cli -- prompt "say hello"
 cargo run -p cli -- providers
@@ -164,9 +166,32 @@ REPL shape:
 
 - the base flow is closer to Codex/Claude-style slash commands
 - primary session commands are `/status`, `/model`, `/login`, `/memory`, `/resume`, `/handoff`, `/why-context`, `/approval`, `/doctor`
+- custom slash commands are loaded from `~/.harness/commands/*.toml` and `.harness/commands/*.toml`
+- workspace commands override global commands with the same name
 - `/model <spec>` switches the active model, stores a handoff snapshot, and prints a short active/previous/next summary
 - `/parallel-read <json-array>` batches read-only discovery work in one turn
 - `/status` shows the current connection mode and behavior
+- `/commands` lists discovered custom slash commands
+- `/commands show <name>` prints the resolved command definition
+
+Custom slash command format:
+
+```toml
+description = "Save memory, show resume, and print the current handoff"
+kind = "macro"
+steps = ["/memory save", "/resume", "/handoff"]
+```
+
+Supported kinds:
+
+- `alias`
+- `macro`
+- `prompt-template`
+
+Template placeholders:
+
+- `{args}` for the full raw argument string
+- `{arg1}`, `{arg2}`, ... for positional arguments
 
 Local-Lite memory:
 

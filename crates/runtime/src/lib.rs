@@ -1,5 +1,6 @@
 mod agent;
 mod approvals;
+mod commands;
 mod config;
 mod context;
 mod discovery;
@@ -23,6 +24,10 @@ pub use agent::{
 pub use approvals::{
     approval_action_for_policy, classify_approval_request, ApprovalAction, ApprovalPolicy,
     ApprovalRisk, VerificationPolicy,
+};
+pub use commands::{
+    discover_slash_commands, expand_slash_command, resolve_slash_command, SlashCommand,
+    SlashCommandKind,
 };
 pub use config::{load_config, save_config, ConnectionMode, HarnessConfig, LoadedConfig};
 pub use context::{
