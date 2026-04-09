@@ -1,3 +1,4 @@
+use std::fs;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -99,13 +100,16 @@ pub fn can_exec(command: &str, mode: PermissionMode) -> PermissionDecision {
 }
 
 fn is_within_workspace(path: &Path, workspace_root: &Path) -> bool {
-    let root = normalize_path(workspace_root);
+    let root = canonicalize_with_existing_ancestor(workspace_root)
+        .unwrap_or_else(|| normalize_path(workspace_root));
     let joined = if path.is_absolute() {
         normalize_path(path)
     } else {
         normalize_path(&workspace_root.join(path))
     };
-    joined.starts_with(&root)
+    canonicalize_with_existing_ancestor(&joined)
+        .unwrap_or(joined)
+        .starts_with(&root)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -120,6 +124,27 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+fn canonicalize_with_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let normalized = normalize_path(path);
+    if normalized.exists() {
+        return fs::canonicalize(&normalized).ok();
+    }
+
+    let mut suffix = Vec::new();
+    let mut cursor = normalized.as_path();
+    while !cursor.exists() {
+        let name = cursor.file_name()?.to_os_string();
+        suffix.push(name);
+        cursor = cursor.parent()?;
+    }
+
+    let mut canonical = fs::canonicalize(cursor).ok()?;
+    for component in suffix.iter().rev() {
+        canonical.push(component);
+    }
+    Some(canonical)
 }
 
 fn is_read_only_command(command: &str) -> bool {
@@ -224,6 +249,8 @@ fn is_dangerous_command(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::symlink};
 
     use super::{can_exec, can_write, PermissionDecision, PermissionMode};
 
@@ -306,5 +333,34 @@ mod tests {
                 reason: "command may mutate state; blocked in read-only mode".to_string(),
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_write_blocks_symlink_escape() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!("perm-workspace-{unique}"));
+        let outside = std::env::temp_dir().join(format!("perm-outside-{unique}"));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, workspace.join("linked")).unwrap();
+
+        let decision = can_write(
+            Path::new("linked/file.txt"),
+            &workspace,
+            PermissionMode::WorkspaceWrite,
+        );
+        assert_eq!(
+            decision,
+            PermissionDecision::Deny {
+                reason: "write path is outside the workspace".to_string(),
+            }
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&outside);
     }
 }

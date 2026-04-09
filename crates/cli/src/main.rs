@@ -1964,12 +1964,15 @@ fn approval_for_request_tui(
     let _ = io::stdout().flush();
 
     let mut line = String::new();
-    io::stdin()
+    let read_result = io::stdin()
         .read_line(&mut line)
-        .map_err(|err| err.to_string())?;
-
-    let _ = enable_raw_mode();
-    let _ = execute!(stdout, EnterAlternateScreen, Hide);
+        .map_err(|err| err.to_string());
+    let restore_result = restore_tui_terminal(&mut stdout);
+    if let Err(err) = read_result {
+        let _ = restore_result;
+        return Err(err);
+    }
+    restore_result?;
 
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => {
@@ -2019,6 +2022,12 @@ fn approval_for_request_tui(
             })
         }
     }
+}
+
+fn restore_tui_terminal(stdout: &mut Stdout) -> Result<(), String> {
+    enable_raw_mode().map_err(|err| err.to_string())?;
+    execute!(stdout, EnterAlternateScreen, Hide).map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 #[allow(dead_code)]

@@ -334,20 +334,44 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 }
 
 fn wildcard_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
-    if pattern.is_empty() {
-        return text.is_empty();
+    let mut pattern_index = 0usize;
+    let mut text_index = 0usize;
+    let mut star_index = None;
+    let mut match_index = 0usize;
+
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+            continue;
+        }
+
+        if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+                pattern_index += 1;
+            }
+            star_index = Some(pattern_index);
+            match_index = text_index;
+            continue;
+        }
+
+        if let Some(next_pattern_index) = star_index {
+            match_index += 1;
+            text_index = match_index;
+            pattern_index = next_pattern_index;
+            continue;
+        }
+
+        return false;
     }
 
-    match pattern[0] {
-        b'*' => {
-            wildcard_match_bytes(&pattern[1..], text)
-                || (!text.is_empty() && wildcard_match_bytes(pattern, &text[1..]))
-        }
-        b'?' => !text.is_empty() && wildcard_match_bytes(&pattern[1..], &text[1..]),
-        value => {
-            !text.is_empty() && value == text[0] && wildcard_match_bytes(&pattern[1..], &text[1..])
-        }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
     }
+
+    pattern_index == pattern.len()
 }
 
 #[cfg(test)]
@@ -361,7 +385,7 @@ mod tests {
 
     use crate::PermissionMode;
 
-    use super::{edit_file, exec_command, parallel_read_only, read_file, write_file};
+    use super::{edit_file, exec_command, parallel_read_only, read_file, wildcard_match, write_file};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -474,5 +498,12 @@ mod tests {
 
         assert!(output.content.contains("stdout:\n\n\nstderr:\n"));
         cleanup(&workspace);
+    }
+
+    #[test]
+    fn wildcard_match_handles_many_stars_without_backtracking_explosion() {
+        assert!(wildcard_match("**/src/**/main.rs", "crates/runtime/src/bin/main.rs"));
+        assert!(wildcard_match("*****main.rs", "main.rs"));
+        assert!(!wildcard_match("**/src/**/lib.rs", "crates/runtime/src/bin/main.rs"));
     }
 }
