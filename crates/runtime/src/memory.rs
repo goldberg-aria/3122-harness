@@ -269,6 +269,11 @@ pub fn save_session_memory_bundle(
 
 pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
     let latest_session = SessionStore::latest(workspace_root)?;
+    let latest_digest = latest_session
+        .as_deref()
+        .map(SessionStore::read_events)
+        .transpose()?
+        .map(|events| summarize_session_events(&events));
     let latest_handoff = latest_session
         .as_deref()
         .map(latest_model_handoff)
@@ -278,17 +283,6 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
     let latest_summary = memories
         .iter()
         .find(|record| record.kind == MemoryKind::Summary.as_str());
-    let latest_tasks = memories
-        .iter()
-        .filter(|record| record.kind == MemoryKind::Task.as_str())
-        .take(3)
-        .collect::<Vec<_>>();
-    let latest_errors = memories
-        .iter()
-        .filter(|record| record.kind == MemoryKind::Error.as_str())
-        .take(3)
-        .collect::<Vec<_>>();
-
     let mut out = String::new();
     out.push_str("Resume\n");
     out.push_str(&format!(
@@ -312,26 +306,40 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
             handoff.snapshot.suggested_next_step
         ));
     }
-    if let Some(summary) = latest_summary {
+    if let Some(digest) = latest_digest.as_ref() {
+        out.push_str(&format!("latest_summary: {}\n", digest.title));
+        out.push_str(&digest.summary);
+        if !digest.summary.ends_with('\n') {
+            out.push('\n');
+        }
+    } else if let Some(summary) = latest_summary {
         out.push_str(&format!("latest_summary: {}\n", summary.title));
         out.push_str(&summary.body);
         out.push('\n');
     } else {
         out.push_str("latest_summary: none\n");
     }
+    let latest_tasks = latest_digest
+        .as_ref()
+        .map(|digest| digest.goals.iter().take(3).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     if !latest_tasks.is_empty() {
         out.push_str("recent_tasks:\n");
-        for record in latest_tasks {
+        for task in latest_tasks {
             out.push_str("- ");
-            out.push_str(&record.title);
+            out.push_str(&task);
             out.push('\n');
         }
     }
+    let latest_errors = latest_digest
+        .as_ref()
+        .map(|digest| digest.errors.iter().take(3).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     if !latest_errors.is_empty() {
         out.push_str("recent_errors:\n");
-        for record in latest_errors {
+        for error in latest_errors {
             out.push_str("- ");
-            out.push_str(&record.title);
+            out.push_str(&error);
             out.push('\n');
         }
     }
@@ -340,6 +348,11 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
 
 pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
     let latest_session = SessionStore::latest(workspace_root)?;
+    let latest_digest = latest_session
+        .as_deref()
+        .map(SessionStore::read_events)
+        .transpose()?
+        .map(|events| summarize_session_events(&events));
     let summary_record = list_memory_records(workspace_root)?
         .into_iter()
         .find(|record| record.kind == MemoryKind::Summary.as_str());
@@ -355,7 +368,8 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
         out.push_str(&format!("Latest session: {}\n\n", path.display()));
     }
     if let Some(handoff) = latest_handoff {
-        out.push_str(&render_model_handoff_text(&handoff.snapshot));
+        let merged = merge_handoff_with_digest(&handoff.snapshot, latest_digest.as_ref());
+        out.push_str(&render_model_handoff_text(&merged));
         out.push_str("\n\n");
     } else if let Some(summary) = summary_record {
         out.push_str("Session summary:\n");
@@ -364,16 +378,15 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
     } else {
         out.push_str("Session summary: none\n\n");
     }
-    let recent_tasks = list_memory_records(workspace_root)?
-        .into_iter()
-        .filter(|record| record.kind == MemoryKind::Task.as_str())
-        .take(3)
-        .collect::<Vec<_>>();
+    let recent_tasks = latest_digest
+        .as_ref()
+        .map(|digest| digest.goals.iter().take(3).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
     if !recent_tasks.is_empty() {
         out.push_str("Recent tasks:\n");
-        for record in recent_tasks {
+        for task in recent_tasks {
             out.push_str("- ");
-            out.push_str(&record.title);
+            out.push_str(&task);
             out.push('\n');
         }
         out.push('\n');
@@ -532,6 +545,26 @@ pub fn render_model_handoff_text(snapshot: &ModelHandoffSnapshot) -> String {
     out
 }
 
+fn merge_handoff_with_digest(
+    snapshot: &ModelHandoffSnapshot,
+    digest: Option<&SessionDigest>,
+) -> ModelHandoffSnapshot {
+    let Some(digest) = digest else {
+        return snapshot.clone();
+    };
+
+    let mut merged = snapshot.clone();
+    if !digest.summary.trim().is_empty() {
+        merged.recent_work_summary = truncate_text(&digest.summary, 600);
+    }
+    merged.open_tasks = digest.goals.iter().take(3).cloned().collect();
+    merged.recent_errors = digest.errors.iter().take(2).cloned().collect();
+    if let Some(task) = merged.open_tasks.first() {
+        merged.suggested_next_step = format!("Continue with: {task}");
+    }
+    merged
+}
+
 pub fn summarize_session_events(events: &[SessionEvent]) -> SessionDigest {
     let mut goals = Vec::new();
     let mut tools = Vec::new();
@@ -543,7 +576,10 @@ pub fn summarize_session_events(events: &[SessionEvent]) -> SessionDigest {
             "user_input" | "prompt_start" => {
                 if let Some(text) = event.payload.get("text").and_then(|value| value.as_str()) {
                     let trimmed = text.trim();
-                    if !trimmed.is_empty() && !trimmed.starts_with('/') {
+                    if !trimmed.is_empty()
+                        && !trimmed.starts_with('/')
+                        && !is_low_signal_user_text(trimmed)
+                    {
                         push_unique(&mut goals, trimmed.to_string(), 3);
                     }
                 }
@@ -624,6 +660,35 @@ pub fn summarize_session_events(events: &[SessionEvent]) -> SessionDigest {
         errors,
         last_assistant_text,
     }
+}
+
+fn is_low_signal_user_text(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+    if normalized.chars().count() <= 2 {
+        return true;
+    }
+    let low_signal = [
+        "hi",
+        "hello",
+        "hey",
+        "안녕",
+        "안녕하세요",
+        "ㅎㅇ",
+        "ㅂㅇ",
+        "test",
+        "ping",
+        "pong",
+    ];
+    if low_signal.iter().any(|item| normalized == *item) {
+        return true;
+    }
+    normalized.contains("모델명")
+        || normalized.contains("네 모델")
+        || normalized.contains("what model")
+        || normalized.contains("your model")
 }
 
 fn push_unique(items: &mut Vec<String>, value: String, max_len: usize) {
@@ -808,6 +873,29 @@ mod tests {
         assert!(handoff.contains("Next step:"));
 
         cleanup(&workspace);
+    }
+
+    #[test]
+    fn ignores_low_signal_greetings_and_model_questions_in_digest() {
+        let digest = summarize_session_events(&[
+            SessionEvent {
+                ts_ms: 1,
+                kind: "user_input".to_string(),
+                payload: json!({ "text": "hi" }),
+            },
+            SessionEvent {
+                ts_ms: 2,
+                kind: "user_input".to_string(),
+                payload: json!({ "text": "네 모델명이 뭐야?" }),
+            },
+            SessionEvent {
+                ts_ms: 3,
+                kind: "user_input".to_string(),
+                payload: json!({ "text": "현재 프로젝트 구조를 설명해" }),
+            },
+        ]);
+
+        assert_eq!(digest.goals, vec!["현재 프로젝트 구조를 설명해".to_string()]);
     }
 
     #[test]

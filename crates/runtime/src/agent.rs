@@ -448,6 +448,10 @@ Critical rules:\n\
             ));
             header.push_str(
                 "- Treat this session as isolated to the current workspace and prompt context only.\n\
+- If the user asked a question, summary, explanation, or analysis, answer directly.\n\
+- Do not create or edit files unless the user explicitly asked for implementation or file changes.\n\
+- The current User request overrides older memory, recall, and prior session tasks.\n\
+- Do not continue an older file-writing request unless the current User request repeats it.\n\
 \n\
 Do:\n\
 - use read, grep, and glob before write, edit, or exec when more context is needed\n\
@@ -502,7 +506,10 @@ Compact rules for this model:\n\
                 profile.answer_line_limit
             ));
             header.push_str(
-                "- Do not emit chain-of-thought or `<thinking>`.\n\
+                "- If the user asked for explanation, summary, or analysis, answer directly.\n\
+- Do not create or edit files unless the user clearly asked for file changes.\n\
+- The current User request overrides older recall and prior file-writing tasks.\n\
+- Do not emit chain-of-thought or `<thinking>`.\n\
 \n\
 Tool request format:\n\
 <tool_call>\n\

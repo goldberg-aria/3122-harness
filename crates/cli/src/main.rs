@@ -907,7 +907,7 @@ fn handle_repl_line(
             return ReplDirective::Continue;
         }
         "/skills" => {
-            print_skills(workspace, config);
+            print_skills(workspace, config, false);
             return ReplDirective::Continue;
         }
         "/mcp" => {
@@ -1679,19 +1679,7 @@ fn render_skills_text(workspace: &Path, config: &LoadedConfig) -> String {
     if skills.is_empty() {
         return "no skills found".to_string();
     }
-    skills
-        .into_iter()
-        .map(|skill| {
-            format!(
-                "{} | {} | {} | {}",
-                skill.name,
-                skill.source,
-                skill.path.display(),
-                skill.summary
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    render_skill_list(&skills, false)
 }
 
 fn render_skill_text(
@@ -3146,7 +3134,8 @@ fn sync_provider_profiles_from_env(workspace: &Path) {
 
 fn handle_skills_command(workspace: &Path, config: &LoadedConfig, args: &[String]) {
     match args.first().map(String::as_str) {
-        None | Some("list") => print_skills(workspace, config),
+        None | Some("list") => print_skills(workspace, config, false),
+        Some("all") => print_skills(workspace, config, true),
         Some("show") => {
             let Some(name) = args.get(1) else {
                 eprintln!("usage: {} skills show <name>", APP_NAME);
@@ -3324,21 +3313,43 @@ fn print_tool_output(output: &ToolOutput) {
     }
 }
 
-fn print_skills(workspace: &Path, config: &LoadedConfig) {
+fn print_skills(workspace: &Path, config: &LoadedConfig, show_all: bool) {
     let skills = discover_skills(&config.skill_sources(workspace));
     if skills.is_empty() {
         println!("no skills found");
         return;
     }
-    for skill in skills {
-        println!(
-            "{} | {} | {} | {}",
+    println!("{}", render_skill_list(&skills, show_all));
+}
+
+fn render_skill_list(skills: &[runtime::SkillEntry], show_all: bool) -> String {
+    let mut lines = Vec::new();
+    let workspace_count = skills.iter().filter(|skill| skill.source == "workspace").count();
+    let user_count = skills.iter().filter(|skill| skill.source == "user").count();
+    lines.push(format!("skills: {}", skills.len()));
+    lines.push(format!(
+        "sources: workspace={} user={}",
+        workspace_count, user_count
+    ));
+    lines.push("list:".to_string());
+    let max_items = if show_all { usize::MAX } else { 20 };
+    for skill in skills.iter().take(max_items) {
+        lines.push(format!(
+            "- {} | {} | {}",
             skill.name,
             skill.source,
-            skill.path.display(),
-            skill.summary
-        );
+            compact_line(&skill.summary, 96)
+        ));
     }
+    if !show_all && skills.len() > max_items {
+        lines.push(format!(
+            "… {} more | use `skills list all` or `skills show <name>`",
+            skills.len() - max_items
+        ));
+    } else {
+        lines.push("hint: use `skills show <name>`".to_string());
+    }
+    lines.join("\n")
 }
 
 fn show_skill(workspace: &Path, config: &LoadedConfig, name: &str) {
