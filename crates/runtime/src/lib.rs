@@ -27,8 +27,8 @@ pub use approvals::{
 };
 pub use commands::{
     create_slash_command_template, discover_slash_commands, expand_slash_command,
-    init_slash_command_dir, resolve_slash_command, slash_command_dir, SlashCommand,
-    SlashCommandKind, SlashCommandScope,
+    init_slash_command_dir, resolve_slash_command, slash_command_dir, validate_slash_command_args,
+    SlashCommand, SlashCommandKind, SlashCommandScope,
 };
 pub use config::{load_config, save_config, ConnectionMode, HarnessConfig, LoadedConfig};
 pub use context::{

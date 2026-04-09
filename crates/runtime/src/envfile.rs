@@ -70,7 +70,10 @@ pub fn load_workspace_env(workspace_root: &Path) -> Result<Vec<String>, String> 
 }
 
 fn env_candidates(workspace_root: &Path) -> Vec<PathBuf> {
-    vec![workspace_root.join(".env"), workspace_root.join(".env.local")]
+    vec![
+        workspace_root.join(".env"),
+        workspace_root.join(".env.local"),
+    ]
 }
 
 fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, String> {
@@ -108,7 +111,9 @@ fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, String> {
                     values.entry("GROQ_BASE_URL".to_string()).or_insert(url);
                 }
                 Some(FreeformSection::DeepInfra) => {
-                    values.entry("DEEPINFRA_BASE_URL".to_string()).or_insert(url);
+                    values
+                        .entry("DEEPINFRA_BASE_URL".to_string())
+                        .or_insert(url);
                 }
                 _ => {}
             }
@@ -131,10 +136,16 @@ fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, String> {
         .or_insert_with(|| "https://api.deepinfra.com/v1/openai".to_string());
 
     if let Some(base_url) = values.get("QWEN_BASE_URL").cloned() {
-        values.insert("QWEN_BASE_URL".to_string(), strip_chat_completions(&base_url));
+        values.insert(
+            "QWEN_BASE_URL".to_string(),
+            strip_chat_completions(&base_url),
+        );
     }
     if let Some(base_url) = values.get("OPENAI_BASE_URL").cloned() {
-        values.insert("OPENAI_BASE_URL".to_string(), strip_chat_completions(&base_url));
+        values.insert(
+            "OPENAI_BASE_URL".to_string(),
+            strip_chat_completions(&base_url),
+        );
     }
 
     Ok(values)
@@ -192,7 +203,10 @@ fn strip_chat_completions(url: &str) -> String {
         .to_string()
 }
 
-fn infer_freeform_value(section: Option<FreeformSection>, line: &str) -> Option<(&'static str, &str)> {
+fn infer_freeform_value(
+    section: Option<FreeformSection>,
+    line: &str,
+) -> Option<(&'static str, &str)> {
     let trimmed = line.trim();
     if trimmed.contains(' ') {
         return None;

@@ -1,3 +1,5 @@
 description = "Ask the active model for a short risk review of a target path"
 kind = "prompt-template"
+usage = "/review-risk <path> [extra context]"
+min_args = 1
 prompt = "Review the implementation risk of {arg1} in 3 concise bullets. Extra context: {args}"

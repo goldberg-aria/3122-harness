@@ -37,6 +37,9 @@ pub struct SlashCommand {
     pub kind: SlashCommandKind,
     pub source: String,
     pub path: PathBuf,
+    pub usage: Option<String>,
+    pub min_args: Option<usize>,
+    pub max_args: Option<usize>,
     pub target: Option<String>,
     pub steps: Vec<String>,
     pub prompt: Option<String>,
@@ -62,6 +65,9 @@ struct SlashCommandConfig {
     name: Option<String>,
     description: Option<String>,
     kind: String,
+    usage: Option<String>,
+    min_args: Option<usize>,
+    max_args: Option<usize>,
     target: Option<String>,
     steps: Option<Vec<String>>,
     prompt: Option<String>,
@@ -95,7 +101,10 @@ pub fn discover_slash_commands(workspace_root: &Path) -> Vec<SlashCommand> {
     merged.into_values().collect()
 }
 
-pub fn slash_command_dir(workspace_root: &Path, scope: SlashCommandScope) -> Result<PathBuf, String> {
+pub fn slash_command_dir(
+    workspace_root: &Path,
+    scope: SlashCommandScope,
+) -> Result<PathBuf, String> {
     match scope {
         SlashCommandScope::Global => {
             let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
@@ -169,6 +178,27 @@ pub fn expand_slash_command(command: &SlashCommand, args_raw: &str) -> Vec<Strin
     }
 }
 
+pub fn validate_slash_command_args(command: &SlashCommand, args_raw: &str) -> Result<(), String> {
+    let count = args_raw.split_whitespace().count();
+    if let Some(min_args) = command.min_args {
+        if count < min_args {
+            return Err(render_usage_error(
+                command,
+                format!("expected at least {min_args} arg(s)"),
+            ));
+        }
+    }
+    if let Some(max_args) = command.max_args {
+        if count > max_args {
+            return Err(render_usage_error(
+                command,
+                format!("expected at most {max_args} arg(s)"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn command_sources(workspace_root: &Path) -> Vec<(String, PathBuf)> {
     let mut sources = Vec::new();
     if let Ok(dir) = slash_command_dir(workspace_root, SlashCommandScope::Global) {
@@ -185,12 +215,27 @@ fn command_sources(workspace_root: &Path) -> Vec<(String, PathBuf)> {
 fn built_in_commands() -> Vec<SlashCommand> {
     vec![
         built_in_alias("ctx", "Show the current prompt context", "/why-context"),
-        built_in_alias("mem", "List local memory records", "/memory"),
+        built_in_alias_with_args(
+            "mem",
+            "Open local memory commands",
+            "/mem [memory-subcommand...]",
+            "/memory",
+        ),
         built_in_alias("sum", "Show the latest resume summary", "/resume"),
         built_in_alias("hf", "Show the latest handoff block", "/handoff"),
-        built_in_alias("models", "Show the active and saved model state", "/model"),
+        built_in_alias_with_args(
+            "models",
+            "Open model commands",
+            "/models [model-subcommand...]",
+            "/model",
+        ),
         built_in_alias("check", "Run doctor checks", "/doctor"),
-        built_in_alias("notes", "List saved local memory", "/memory"),
+        built_in_alias_with_args(
+            "notes",
+            "Open saved local memory commands",
+            "/notes [memory-subcommand...]",
+            "/memory",
+        ),
         built_in_macro(
             "checkpoint",
             "Save memory, show resume, and print the current handoff",
@@ -206,6 +251,30 @@ fn built_in_alias(name: &str, description: &str, target: &str) -> SlashCommand {
         kind: SlashCommandKind::Alias,
         source: "builtin".to_string(),
         path: PathBuf::from(format!("<builtin:{name}>")),
+        usage: Some(format!("/{name}")),
+        min_args: Some(0),
+        max_args: Some(0),
+        target: Some(target.to_string()),
+        steps: Vec::new(),
+        prompt: None,
+    }
+}
+
+fn built_in_alias_with_args(
+    name: &str,
+    description: &str,
+    usage: &str,
+    target: &str,
+) -> SlashCommand {
+    SlashCommand {
+        name: name.to_string(),
+        description: description.to_string(),
+        kind: SlashCommandKind::Alias,
+        source: "builtin".to_string(),
+        path: PathBuf::from(format!("<builtin:{name}>")),
+        usage: Some(usage.to_string()),
+        min_args: Some(0),
+        max_args: None,
         target: Some(target.to_string()),
         steps: Vec::new(),
         prompt: None,
@@ -219,6 +288,9 @@ fn built_in_macro(name: &str, description: &str, steps: &[&str]) -> SlashCommand
         kind: SlashCommandKind::Macro,
         source: "builtin".to_string(),
         path: PathBuf::from(format!("<builtin:{name}>")),
+        usage: Some(format!("/{name}")),
+        min_args: Some(0),
+        max_args: Some(0),
         target: None,
         steps: steps.iter().map(|step| (*step).to_string()).collect(),
         prompt: None,
@@ -261,6 +333,9 @@ fn parse_slash_command(path: &Path, scope: &str) -> Result<SlashCommand, String>
         kind,
         source: scope.to_string(),
         path: path.to_path_buf(),
+        usage: config.usage,
+        min_args: config.min_args,
+        max_args: config.max_args,
         target: config.target,
         steps: config.steps.unwrap_or_default(),
         prompt: config.prompt,
@@ -294,15 +369,23 @@ fn normalize_slash_command_name(name: &str) -> Result<String, String> {
 fn render_slash_command_template(name: &str, kind: SlashCommandKind) -> String {
     match kind {
         SlashCommandKind::Alias => format!(
-            "name = \"{name}\"\ndescription = \"Describe this shortcut\"\nkind = \"alias\"\ntarget = \"/why-context\"\n"
+            "name = \"{name}\"\ndescription = \"Describe this shortcut\"\nkind = \"alias\"\nusage = \"/{name}\"\ntarget = \"/why-context\"\n"
         ),
         SlashCommandKind::Macro => format!(
-            "name = \"{name}\"\ndescription = \"Describe this workflow\"\nkind = \"macro\"\nsteps = [\"/memory save\", \"/resume\"]\n"
+            "name = \"{name}\"\ndescription = \"Describe this workflow\"\nkind = \"macro\"\nusage = \"/{name}\"\nsteps = [\"/memory save\", \"/resume\"]\n"
         ),
         SlashCommandKind::PromptTemplate => format!(
-            "name = \"{name}\"\ndescription = \"Describe this prompt template\"\nkind = \"prompt-template\"\nprompt = \"Review {{arg1}} in 3 concise bullets. Extra: {{args}}\"\n"
+            "name = \"{name}\"\ndescription = \"Describe this prompt template\"\nkind = \"prompt-template\"\nusage = \"/{name} <target> [extra context]\"\nmin_args = 1\nprompt = \"Review {{arg1}} in 3 concise bullets. Extra: {{args}}\"\n"
         ),
     }
+}
+
+fn render_usage_error(command: &SlashCommand, reason: String) -> String {
+    let usage = command
+        .usage
+        .clone()
+        .unwrap_or_else(|| format!("/{}", command.name));
+    format!("{reason} for /{}.\nusage: {usage}", command.name)
 }
 
 #[cfg(test)]
@@ -313,7 +396,7 @@ mod tests {
 
     use super::{
         create_slash_command_template, discover_slash_commands, expand_slash_command,
-        resolve_slash_command, SlashCommandKind, SlashCommandScope,
+        resolve_slash_command, validate_slash_command_args, SlashCommandKind, SlashCommandScope,
     };
 
     fn temp_workspace(prefix: &str) -> PathBuf {
@@ -397,6 +480,7 @@ prompt = "Review the risk of {arg1} in 3 bullets. Extra: {args}"
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("kind = \"alias\""));
         assert!(contents.contains("target = \"/why-context\""));
+        assert!(contents.contains("usage = \"/ctx\""));
         cleanup(&workspace);
     }
 
@@ -423,7 +507,36 @@ target = "/memory recall 3"
         let commands = discover_slash_commands(&workspace);
         let overridden = resolve_slash_command(&commands, "ctx").unwrap();
         assert_eq!(overridden.source, "workspace");
-        assert_eq!(expand_slash_command(overridden, ""), vec!["/memory recall 3"]);
+        assert_eq!(
+            expand_slash_command(overridden, ""),
+            vec!["/memory recall 3"]
+        );
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn validates_slash_command_arg_ranges() {
+        let workspace = temp_workspace("slash-commands-args");
+        let dir = workspace.join(".harness").join("commands");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("review-risk.toml"),
+            r#"
+description = "Ask the model for a focused risk review"
+kind = "prompt-template"
+usage = "/review-risk <path> [extra context]"
+min_args = 1
+max_args = 3
+prompt = "Review the risk of {arg1} in 3 bullets. Extra: {args}"
+"#,
+        )
+        .unwrap();
+
+        let commands = discover_slash_commands(&workspace);
+        let review = resolve_slash_command(&commands, "review-risk").unwrap();
+        assert!(validate_slash_command_args(review, "src/main.rs urgent").is_ok());
+        assert!(validate_slash_command_args(review, "").is_err());
+        assert!(validate_slash_command_args(review, "a b c d").is_err());
         cleanup(&workspace);
     }
 }

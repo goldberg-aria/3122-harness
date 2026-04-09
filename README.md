@@ -185,6 +185,7 @@ Custom slash command format:
 ```toml
 description = "Save memory, show resume, and print the current handoff"
 kind = "macro"
+usage = "/recap"
 steps = ["/memory save", "/resume", "/handoff"]
 ```
 
@@ -208,6 +209,8 @@ Template placeholders:
 
 - `{args}` for the full raw argument string
 - `{arg1}`, `{arg2}`, ... for positional arguments
+- optional `usage = "/name <required> [optional]"` is shown in `commands show` and validation errors
+- optional `min_args` and `max_args` let a command fail early with a clear usage message
 
 Local-Lite memory:
 

@@ -3,18 +3,18 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use runtime::{
-    backend_catalog, blueprint_summary, build_handoff_text, build_model_handoff_snapshot,
-    build_memory_recall_text, build_resume_text, call_mcp_tool, detect_provider_key,
-    create_slash_command_template, discover_mcp_servers, discover_skills, discover_slash_commands,
+    backend_catalog, blueprint_summary, build_handoff_text, build_memory_recall_text,
+    build_model_handoff_snapshot, build_resume_text, call_mcp_tool, create_slash_command_template,
+    detect_provider_key, discover_mcp_servers, discover_skills, discover_slash_commands,
     doctor_report, edit_file, exec_command, expand_slash_command, gather_workspace_context,
     glob_search, grep_search, init_slash_command_dir, latest_model_handoff, list_mcp_tools,
     list_memory_records, load_config, load_provider_registry, parallel_read_only,
     pending_model_handoff, provider_preset, provider_presets, read_file, remove_provider_profile,
     render_prompt_context, resolve_skill, resolve_slash_command, run_agent_loop, save_config,
     save_session_memory_bundle, search_memory_records, slash_command_dir, upsert_provider_profile,
-    write_file, SlashCommandKind, SlashCommandScope,
-    ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ConnectionMode, LoadedConfig,
-    MemoryRecord, ModelHandoffSnapshot, PermissionMode, SavedProviderProfile, SessionStore,
+    validate_slash_command_args, write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy,
+    ApprovalRequest, ConnectionMode, LoadedConfig, MemoryRecord, ModelHandoffSnapshot,
+    PermissionMode, SavedProviderProfile, SessionStore, SlashCommandKind, SlashCommandScope,
     ToolOutput, VerificationPolicy,
 };
 use serde_json::json;
@@ -310,7 +310,10 @@ fn handle_repl_line(
         _ => {}
     }
 
-    if let Some(next_mode) = trimmed.strip_prefix("/mode ").and_then(PermissionMode::parse) {
+    if let Some(next_mode) = trimmed
+        .strip_prefix("/mode ")
+        .and_then(PermissionMode::parse)
+    {
         *mode = next_mode;
         let _ = session.append("mode_change", json!({ "mode": mode.as_str() }));
         println!("mode set to {mode}");
@@ -647,7 +650,11 @@ fn run_commands_new(
     let kind_label = kind.as_str().to_string();
     match create_slash_command_template(workspace, scope, name, kind) {
         Ok(path) => {
-            println!("created /{} ({})", name.trim().trim_start_matches('/'), kind_label);
+            println!(
+                "created /{} ({})",
+                name.trim().trim_start_matches('/'),
+                kind_label
+            );
             println!("scope: {}", scope.as_str());
             println!("path: {}", path.display());
         }
@@ -673,12 +680,25 @@ fn print_slash_command_show(workspace: &Path, name: &str) {
             command.description.trim()
         }
     );
+    let usage = command
+        .usage
+        .clone()
+        .unwrap_or_else(|| format!("/{}", command.name));
+    println!("usage: {usage}");
+    println!(
+        "args: min={} max={}",
+        command
+            .min_args
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        command
+            .max_args
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
     match command.kind {
         SlashCommandKind::Alias => {
-            println!(
-                "target: {}",
-                command.target.as_deref().unwrap_or("-")
-            );
+            println!("target: {}", command.target.as_deref().unwrap_or("-"));
         }
         SlashCommandKind::Macro => {
             println!("steps:");
@@ -687,10 +707,7 @@ fn print_slash_command_show(workspace: &Path, name: &str) {
             }
         }
         SlashCommandKind::PromptTemplate => {
-            println!(
-                "prompt: {}",
-                command.prompt.as_deref().unwrap_or("-")
-            );
+            println!("prompt: {}", command.prompt.as_deref().unwrap_or("-"));
         }
     }
 }
@@ -726,10 +743,20 @@ fn maybe_run_custom_slash_command(
     let Some(command) = resolve_slash_command(&commands, name) else {
         return Ok(false);
     };
+    validate_slash_command_args(command, args_raw)?;
     let expanded = expand_slash_command(command, args_raw);
     if expanded.is_empty() {
-        return Err(format!("custom command /{} expanded to no steps", command.name));
+        return Err(format!(
+            "custom command /{} expanded to no steps",
+            command.name
+        ));
     }
+    println!(
+        "custom: /{} ({}, {})",
+        command.name,
+        command.kind.as_str(),
+        command.source
+    );
     let _ = session.append(
         "custom_command",
         json!({
@@ -740,7 +767,8 @@ fn maybe_run_custom_slash_command(
             "expanded_steps": expanded,
         }),
     );
-    for step in expand_slash_command(command, args_raw) {
+    for step in expanded {
+        println!("step: {step}");
         let _ = session.append("custom_command_step", json!({ "command": step }));
         match handle_repl_line(
             workspace,
@@ -803,10 +831,7 @@ fn print_memory_show(workspace: &Path, index: usize) {
             println!("kind: {}", record.kind);
             println!("title: {}", record.title);
             println!("ts_ms: {}", record.ts_ms);
-            println!(
-                "session: {}",
-                record.session_path.as_deref().unwrap_or("-")
-            );
+            println!("session: {}", record.session_path.as_deref().unwrap_or("-"));
             if record.tags.is_empty() {
                 println!("tags: -");
             } else {
@@ -851,7 +876,10 @@ fn print_handoff_debug(workspace: &Path) {
             );
             println!("to_model: {}", handoff.snapshot.to_model);
             println!("current_goal: {}", handoff.snapshot.current_goal);
-            println!("recent_work_summary: {}", handoff.snapshot.recent_work_summary);
+            println!(
+                "recent_work_summary: {}",
+                handoff.snapshot.recent_work_summary
+            );
             if handoff.snapshot.open_tasks.is_empty() {
                 println!("open_tasks: -");
             } else {
@@ -868,7 +896,10 @@ fn print_handoff_debug(workspace: &Path) {
                     println!("- {error}");
                 }
             }
-            println!("suggested_next_step: {}", handoff.snapshot.suggested_next_step);
+            println!(
+                "suggested_next_step: {}",
+                handoff.snapshot.suggested_next_step
+            );
         }
         Ok(None) => println!("latest_handoff: -"),
         Err(err) => {
@@ -1058,7 +1089,8 @@ fn handle_memory_command(workspace: &Path, _config: &LoadedConfig, args: &[Strin
             }
         }
         Some("recall") => {
-            let limit = match parse_optional_limit(args.get(1).map(String::as_str).unwrap_or(""), 6) {
+            let limit = match parse_optional_limit(args.get(1).map(String::as_str).unwrap_or(""), 6)
+            {
                 Ok(limit) => limit,
                 Err(err) => {
                     eprintln!("{err}");
@@ -1123,7 +1155,9 @@ fn handle_commands_command(workspace: &Path, args: &[String]) {
         }
         Some("new") => {
             let Some(name) = args.get(1) else {
-                eprintln!("usage: harness commands new <name> [alias|macro|prompt-template] [--global]");
+                eprintln!(
+                    "usage: harness commands new <name> [alias|macro|prompt-template] [--global]"
+                );
                 std::process::exit(2);
             };
             let kind = args
@@ -1277,18 +1311,21 @@ fn parse_scope_flag(input: &str) -> SlashCommandScope {
     }
 }
 
-fn parse_new_command_args(input: &str) -> Result<(&str, SlashCommandKind, SlashCommandScope), String> {
+fn parse_new_command_args(
+    input: &str,
+) -> Result<(&str, SlashCommandKind, SlashCommandScope), String> {
     let tokens = input.split_whitespace().collect::<Vec<_>>();
     let Some(name) = tokens.first().copied() else {
-        return Err("usage: /commands new <name> [alias|macro|prompt-template] [--global]".to_string());
+        return Err(
+            "usage: /commands new <name> [alias|macro|prompt-template] [--global]".to_string(),
+        );
     };
     let mut kind = SlashCommandKind::Macro;
     for token in tokens.iter().skip(1) {
         if *token == "--global" {
             continue;
         }
-        kind = parse_command_kind(token)
-            .ok_or_else(|| format!("unknown command kind: {token}"))?;
+        kind = parse_command_kind(token).ok_or_else(|| format!("unknown command kind: {token}"))?;
     }
     Ok((name, kind, parse_scope_flag(input)))
 }
@@ -1495,14 +1532,21 @@ fn sync_provider_profiles_from_env(workspace: &Path) {
 
     let mut saved = Vec::new();
     for (alias, route, api_key_env, base_url_env, preset_name, source) in specs {
-        let Some(api_key) = env::var(api_key_env).ok().filter(|value| !value.trim().is_empty()) else {
+        let Some(api_key) = env::var(api_key_env)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
             continue;
         };
 
         let base_url = base_url_env
             .and_then(|name| env::var(name).ok())
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| preset_name.and_then(provider_preset).map(|preset| preset.base_url.to_string()));
+            .or_else(|| {
+                preset_name
+                    .and_then(provider_preset)
+                    .map(|preset| preset.base_url.to_string())
+            });
 
         let Some(base_url) = base_url else {
             eprintln!("skipping {alias}: no base URL configured");

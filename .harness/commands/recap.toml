@@ -1,3 +1,4 @@
 description = "Save memory, show resume, and print the current handoff"
 kind = "macro"
+usage = "/recap"
 steps = ["/memory save", "/resume", "/handoff"]
