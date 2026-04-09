@@ -202,12 +202,31 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 code: KeyCode::Esc, ..
             } => {
                 ui.input.clear();
+                ui.sync_slash_navigation(0);
             }
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
             } => {
                 ui.input.pop();
+                let total = build_slash_suggestions(workspace, &ui.input).len();
+                ui.sync_slash_navigation(total);
+            }
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                let total = build_slash_suggestions(workspace, &ui.input).len();
+                if ui.input.starts_with('/') && total > 0 {
+                    ui.move_slash_selection(total, -1);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Down, ..
+            } => {
+                let total = build_slash_suggestions(workspace, &ui.input).len();
+                if ui.input.starts_with('/') && total > 0 {
+                    ui.move_slash_selection(total, 1);
+                }
             }
             KeyEvent {
                 code: KeyCode::Enter,
@@ -220,8 +239,12 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                     ui.input.push('\n');
                     continue;
                 }
+                if maybe_accept_selected_slash_suggestion(workspace, &mut ui) {
+                    continue;
+                }
                 let line = ui.input.trim().to_string();
                 ui.input.clear();
+                ui.sync_slash_navigation(0);
                 if line.is_empty() {
                     continue;
                 }
@@ -266,12 +289,18 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 && !modifiers.contains(KeyModifiers::ALT) =>
             {
                 ui.input.push(ch);
+                let total = build_slash_suggestions(workspace, &ui.input).len();
+                ui.sync_slash_navigation(total);
             }
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
-                if let Some(suggestion) = build_slash_suggestions(workspace, &ui.input).first() {
-                    ui.input = format!("/{}", suggestion.name);
+                let suggestions = build_slash_suggestions(workspace, &ui.input);
+                if !suggestions.is_empty() {
+                    ui.sync_slash_navigation(suggestions.len());
+                    let selected = suggestions[ui.slash_selection].clone();
+                    apply_slash_suggestion(&mut ui, &selected);
+                    ui.sync_slash_navigation(suggestions.len());
                 }
             }
             _ => {}
@@ -287,6 +316,8 @@ struct TuiState {
     transcript: Vec<String>,
     input: String,
     model_choices: Vec<String>,
+    slash_selection: usize,
+    slash_scroll: usize,
 }
 
 impl TuiState {
@@ -295,6 +326,8 @@ impl TuiState {
             transcript: Vec::new(),
             input: String::new(),
             model_choices: Vec::new(),
+            slash_selection: 0,
+            slash_scroll: 0,
         }
     }
 
@@ -325,6 +358,39 @@ impl TuiState {
             Err(err) => self.push_error(err),
         }
     }
+
+    fn sync_slash_navigation(&mut self, total: usize) {
+        if !self.input.starts_with('/') || total == 0 {
+            self.slash_selection = 0;
+            self.slash_scroll = 0;
+            return;
+        }
+        if self.slash_selection >= total {
+            self.slash_selection = total.saturating_sub(1);
+        }
+        if self.slash_selection < self.slash_scroll {
+            self.slash_scroll = self.slash_selection;
+        }
+        let window = MAX_SLASH_SUGGESTIONS.max(1);
+        if self.slash_selection >= self.slash_scroll + window {
+            self.slash_scroll = self.slash_selection + 1 - window;
+        }
+    }
+
+    fn move_slash_selection(&mut self, total: usize, direction: isize) {
+        if total == 0 {
+            self.sync_slash_navigation(0);
+            return;
+        }
+        self.sync_slash_navigation(total);
+        let last = total.saturating_sub(1);
+        self.slash_selection = if direction < 0 {
+            self.slash_selection.saturating_sub(1)
+        } else {
+            (self.slash_selection + 1).min(last)
+        };
+        self.sync_slash_navigation(total);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -347,7 +413,12 @@ fn redraw_tui(
     let width = width.max(20);
     let height = height.max(8);
     let suggestions = build_slash_suggestions(workspace, &ui.input);
-    let suggestion_lines = render_suggestion_lines(&suggestions, width as usize);
+    let suggestion_lines = render_suggestion_lines(
+        &suggestions,
+        width as usize,
+        ui.slash_selection,
+        ui.slash_scroll,
+    );
     let footer_rows = 2usize + suggestion_lines.len();
     let workspace_name = workspace
         .file_name()
@@ -413,7 +484,7 @@ fn redraw_tui(
         stdout,
         MoveTo(0, input_row.saturating_sub(1)),
         SetAttribute(Attribute::Dim),
-        Print("Enter send | Shift/Alt-Enter or Ctrl-J newline | Tab complete | Ctrl-C exit"),
+        Print("Enter send/select | Up/Down browse | Shift/Alt-Enter or Ctrl-J newline | Tab complete | Ctrl-C exit"),
         SetAttribute(Attribute::Reset),
         MoveTo(0, input_row),
         Print(truncate_for_terminal(&format!("> {}", ui.input), width as usize)),
@@ -448,14 +519,12 @@ fn build_slash_suggestions(workspace: &Path, input: &str) -> Vec<SlashSuggestion
     suggestions.sort_by(|left, right| left.name.cmp(&right.name));
     suggestions.dedup_by(|left, right| left.name == right.name);
     if prefix.is_empty() {
-        suggestions.truncate(MAX_SLASH_SUGGESTIONS);
         return suggestions;
     }
-    let mut filtered = suggestions
+    let filtered = suggestions
         .into_iter()
         .filter(|item| item.name.starts_with(&prefix))
         .collect::<Vec<_>>();
-    filtered.truncate(MAX_SLASH_SUGGESTIONS);
     filtered
 }
 
@@ -490,18 +559,66 @@ fn core_slash_suggestions() -> Vec<SlashSuggestion> {
     .collect()
 }
 
-fn render_suggestion_lines(suggestions: &[SlashSuggestion], width: usize) -> Vec<String> {
+fn render_suggestion_lines(
+    suggestions: &[SlashSuggestion],
+    width: usize,
+    selected: usize,
+    scroll: usize,
+) -> Vec<String> {
     if suggestions.is_empty() {
         return Vec::new();
     }
-    let mut lines = vec!["commands".to_string()];
-    for suggestion in suggestions {
+    let window = MAX_SLASH_SUGGESTIONS.max(1);
+    let start = scroll.min(suggestions.len().saturating_sub(1));
+    let end = (start + window).min(suggestions.len());
+    let mut lines = vec![format!(
+        "commands {}/{}",
+        selected.saturating_add(1).min(suggestions.len()),
+        suggestions.len()
+    )];
+    for (offset, suggestion) in suggestions[start..end].iter().enumerate() {
+        let absolute_index = start + offset;
+        let marker = if absolute_index == selected { ">" } else { " " };
         lines.push(truncate_for_terminal(
-            &format!("/{:<14} {}", suggestion.name, suggestion.description),
+            &format!("{marker} /{:<14} {}", suggestion.name, suggestion.description),
             width,
         ));
     }
     lines
+}
+
+fn apply_slash_suggestion(ui: &mut TuiState, suggestion: &SlashSuggestion) {
+    let suffix = ui
+        .input
+        .strip_prefix('/')
+        .and_then(|rest| rest.find(char::is_whitespace).map(|index| &rest[index..]))
+        .unwrap_or("");
+    ui.input = format!("/{}{}", suggestion.name, suffix);
+}
+
+fn maybe_accept_selected_slash_suggestion(workspace: &Path, ui: &mut TuiState) -> bool {
+    if !ui.input.starts_with('/') {
+        return false;
+    }
+    let suggestions = build_slash_suggestions(workspace, &ui.input);
+    if suggestions.is_empty() {
+        ui.sync_slash_navigation(0);
+        return false;
+    }
+    ui.sync_slash_navigation(suggestions.len());
+    let selected = &suggestions[ui.slash_selection];
+    let current = ui
+        .input
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if current != selected.name {
+        apply_slash_suggestion(ui, selected);
+        ui.sync_slash_navigation(suggestions.len());
+        return true;
+    }
+    false
 }
 
 fn truncate_for_terminal(line: &str, width: usize) -> String {
@@ -3828,4 +3945,71 @@ fn print_prompt_help() {
     println!("  {APP_NAME} prompt \"say hello\"");
     println!("  {APP_NAME} prompt --model openai/gpt-4.1-mini \"summarize this project\"");
     println!("  {APP_NAME} prompt --model profile/groq/openai/gpt-oss-20b \"read README.md and summarize\"");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_slash_suggestion, build_slash_suggestions, maybe_accept_selected_slash_suggestion,
+        render_suggestion_lines, SlashSuggestion, TuiState,
+    };
+
+    #[test]
+    fn slash_suggestions_show_full_catalog_for_bare_slash() {
+        let workspace = std::env::temp_dir();
+        let suggestions = build_slash_suggestions(&workspace, "/");
+        assert!(suggestions.len() > 10);
+        assert!(suggestions.iter().any(|item| item.name == "model"));
+        assert!(suggestions.iter().any(|item| item.name == "help"));
+    }
+
+    #[test]
+    fn apply_slash_suggestion_replaces_command_but_keeps_args() {
+        let mut ui = TuiState::new();
+        ui.input = "/mo extra context".to_string();
+        apply_slash_suggestion(
+            &mut ui,
+            &SlashSuggestion {
+                name: "model".to_string(),
+                description: "Show model".to_string(),
+            },
+        );
+        assert_eq!(ui.input, "/model extra context");
+    }
+
+    #[test]
+    fn enter_on_partial_slash_accepts_selected_suggestion_first() {
+        let workspace = std::env::temp_dir();
+        let mut ui = TuiState::new();
+        ui.input = "/mo".to_string();
+        let suggestions = build_slash_suggestions(&workspace, &ui.input);
+        ui.slash_selection = suggestions
+            .iter()
+            .position(|item| item.name == "model")
+            .unwrap_or(0);
+        ui.sync_slash_navigation(suggestions.len());
+        assert!(maybe_accept_selected_slash_suggestion(&workspace, &mut ui));
+        assert_eq!(ui.input, "/model");
+    }
+
+    #[test]
+    fn render_suggestion_lines_marks_selected_row() {
+        let lines = render_suggestion_lines(
+            &[
+                SlashSuggestion {
+                    name: "help".to_string(),
+                    description: "Show commands".to_string(),
+                },
+                SlashSuggestion {
+                    name: "model".to_string(),
+                    description: "Show model".to_string(),
+                },
+            ],
+            80,
+            1,
+            0,
+        );
+        assert!(lines[1].starts_with("  /help"));
+        assert!(lines[2].starts_with("> /model"));
+    }
 }
