@@ -80,6 +80,7 @@ Included:
 - Anthropic, OpenAI-compatible, Ollama, Claude, and Codex lanes
 - skill and MCP bridges
 - prompt and auto approval policies
+- `api/auth/auto` provider connection policy with API-first defaults
 - Local-Lite memory stored under `.harness/`
 - session replay and recall
 

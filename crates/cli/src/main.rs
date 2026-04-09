@@ -10,9 +10,9 @@ use runtime::{
     parallel_read_only, pending_model_handoff, provider_preset, provider_presets, read_file,
     remove_provider_profile, render_prompt_context, resolve_skill, run_agent_loop, save_config,
     save_session_memory_bundle, search_memory_records, upsert_provider_profile, write_file,
-    ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, LoadedConfig, MemoryRecord,
-    ModelHandoffSnapshot, PermissionMode, SavedProviderProfile, SessionStore, ToolOutput,
-    VerificationPolicy,
+    ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ConnectionMode, LoadedConfig,
+    MemoryRecord, ModelHandoffSnapshot, PermissionMode, SavedProviderProfile, SessionStore,
+    ToolOutput, VerificationPolicy,
 };
 use serde_json::json;
 
@@ -148,6 +148,11 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
         approval_policy_hint(approval_policy)
     );
     println!(
+        "connection: {} ({})",
+        config.interactive_connection_mode(),
+        connection_mode_hint(config.interactive_connection_mode())
+    );
+    println!(
         "verification: {} ({})",
         config.default_verification_policy(),
         verification_policy_hint(config.default_verification_policy())
@@ -218,6 +223,7 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 current_model.as_deref(),
                 mode,
                 approval_policy,
+                config.interactive_connection_mode(),
                 config.default_verification_policy(),
             ),
             "/model" => print_model_status(workspace, config, current_model.as_deref()),
@@ -368,6 +374,7 @@ fn print_repl_status(
     current_model: Option<&str>,
     mode: PermissionMode,
     approval_policy: ApprovalPolicy,
+    connection_mode: ConnectionMode,
     verification_policy: VerificationPolicy,
 ) {
     let provider_count = load_provider_registry(workspace)
@@ -387,6 +394,11 @@ fn print_repl_status(
         println!("handoff_boost: pending for {}", handoff.snapshot.to_model);
     }
     println!("mode: {mode}");
+    println!("connection: {connection_mode}");
+    println!(
+        "connection_behavior: {}",
+        connection_mode_hint(connection_mode)
+    );
     println!("approval: {}", approval_policy);
     println!(
         "approval_behavior: {}",
@@ -1454,6 +1466,14 @@ fn verification_policy_hint(policy: VerificationPolicy) -> &'static str {
         VerificationPolicy::Off => "no completion checks",
         VerificationPolicy::Annotate => "warn when completion is unverified",
         VerificationPolicy::Require => "reject unverified completion after code changes",
+    }
+}
+
+fn connection_mode_hint(mode: ConnectionMode) -> &'static str {
+    match mode {
+        ConnectionMode::Api => "prefer BYOK/API routes",
+        ConnectionMode::Auth => "prefer authenticated adapters when available",
+        ConnectionMode::Auto => "prefer API, then fall back to supported auth adapters",
     }
 }
 

@@ -159,6 +159,7 @@ Provider policy for v1:
 - MiniMax: `api` first
 - Groq / Qwen API / other OpenAI-compatible routes: `api` first
 - Ollama: local API only
+- runtime target resolution now follows this policy
 
 Saved provider profiles:
 

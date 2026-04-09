@@ -60,6 +60,7 @@ This repository currently contains:
 - more readable CLI status, memory, approval, and verification feedback
 - compact prompt shaping for weaker local and open-weight model families such as Ollama, Qwen, Llama, Gemma, Mistral, Phi, and DeepSeek
 - model-aware context budget profiles with compact recall limits for smaller model families
+- runtime `api/auth/auto` target resolution for interactive and one-shot modes
 
 Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/ROADMAP.md).
 
@@ -135,6 +136,7 @@ Provider connection policy:
 - `api` means use BYOK/API lanes first
 - `auth` means prefer authenticated adapters such as `claude-code/...` and `codex/...`
 - `auto` means prefer API when a configured key/profile exists, otherwise use an auth adapter when the route supports it
+- runtime resolution now honors this policy
 - current route policy:
   - Claude: `api` and `auth`
   - OpenAI/Codex: `api` and `auth`
@@ -159,6 +161,7 @@ REPL shape:
 - primary session commands are `/status`, `/model`, `/login`, `/memory`, `/resume`, `/handoff`, `/why-context`, `/approval`, `/doctor`
 - `/model <spec>` switches the active model, stores a handoff snapshot, and prints a short active/previous/next summary
 - `/parallel-read <json-array>` batches read-only discovery work in one turn
+- `/status` shows the current connection mode and behavior
 
 Local-Lite memory:
 
@@ -203,15 +206,22 @@ Live provider tests:
 - `OPENAI_API_KEY` enables the OpenAI-compatible live test
 - `ANTHROPIC_API_KEY` enables the Anthropic live test
 - `HARNESS_TEST_OLLAMA_MODEL` or `OLLAMA_HOST` enables the Ollama live test
+- `HARNESS_TEST_SAVED_PROFILE_BASE_URL` and `HARNESS_TEST_SAVED_PROFILE_API_KEY` enable saved-profile live tests
+- `HARNESS_RUN_AUTH_ADAPTER_TESTS=1` enables `claude-code` and `codex` auth-adapter smoke tests
 - optional model overrides:
   - `HARNESS_TEST_OPENAI_MODEL`
   - `HARNESS_TEST_ANTHROPIC_MODEL`
   - `HARNESS_TEST_OLLAMA_MODEL`
+  - `HARNESS_TEST_SAVED_PROFILE_ROUTE`
+  - `HARNESS_TEST_SAVED_PROFILE_MODEL`
+  - `HARNESS_TEST_SAVED_PROFILE_ALIAS`
+  - `HARNESS_TEST_CLAUDE_CODE_MODEL`
+  - `HARNESS_TEST_CODEX_MODEL`
 
 ## Immediate next steps
 
-1. Add env-backed smoke coverage for saved provider profiles and external adapters.
-2. Add stronger REPL-level tests for status and handoff presentation.
-3. Add provider-specific output shaping for external CLI adapters.
-4. Add more explicit memory and handoff debugging commands.
-5. Teach runtime resolution to honor `api/auth/auto` preferences per route.
+1. Add stronger REPL-level tests for status and handoff presentation.
+2. Add provider-specific output shaping for external CLI adapters.
+3. Add more explicit memory and handoff debugging commands.
+4. Expand saved-profile presets for Z.AI, MiniMax, and Groq.
+5. Add matrix scripts for the representative model suite.

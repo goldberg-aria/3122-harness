@@ -6,10 +6,10 @@ use serde_json::{json, Value};
 use crate::{
     assess_verification, call_mcp_tool, classify_approval_request, discover_mcp_servers,
     discover_skills, gather_workspace_context, list_mcp_tools, load_provider_registry,
-    parallel_read_only, render_prompt_context, resolve_model_target, resolve_skill, send_prompt,
-    write_file, ApprovalRisk, LoadedConfig, PermissionMode, ProviderReply, ProviderRoute,
-    ProviderTarget, ProviderToolCall, SessionStore, ToolOutput, VerificationEvent,
-    VerificationPolicy,
+    parallel_read_only, render_prompt_context, resolve_model_target_with_mode, resolve_skill,
+    send_prompt, write_file, ApprovalRisk, ConnectionMode, LoadedConfig, PermissionMode,
+    ProviderReply, ProviderRoute, ProviderTarget, ProviderToolCall, SessionStore, ToolOutput,
+    VerificationEvent, VerificationPolicy,
 };
 use crate::{build_skill_packet, edit_file, exec_command, glob_search, grep_search, read_file};
 
@@ -108,6 +108,11 @@ pub fn run_agent_loop(
         verification_policy: config.default_verification_policy(),
         ..AgentOptions::default()
     };
+    let connection_mode = if session.is_some() {
+        config.interactive_connection_mode()
+    } else {
+        config.default_connection_mode()
+    };
     let skill_sources = config.skill_sources(workspace_root);
     let mcp_sources = config.mcp_sources(workspace_root);
     let registry = match load_provider_registry(workspace_root) {
@@ -116,7 +121,7 @@ pub fn run_agent_loop(
     };
     let mut errors = Vec::new();
     for model in chain {
-        let target = match resolve_model_target(&model, &registry) {
+        let target = match resolve_model_target_with_mode(&model, &registry, connection_mode) {
             Ok(target) => target,
             Err(err) => {
                 errors.push(format!("{model}: {err}"));
@@ -127,7 +132,7 @@ pub fn run_agent_loop(
             workspace_root,
             config,
             permission_mode,
-            Some(&model),
+            Some(&display_model(&model, &target, connection_mode)),
             Some(prompt),
         ));
 
@@ -149,6 +154,13 @@ pub fn run_agent_loop(
     }
 
     Err(errors)
+}
+
+fn display_model(requested_model: &str, target: &ProviderTarget, mode: ConnectionMode) -> String {
+    if matches!(mode, ConnectionMode::Api) || requested_model.starts_with(target.route.as_str()) {
+        return requested_model.to_string();
+    }
+    format!("{}/{}", target.route.as_str(), target.model)
 }
 
 pub fn run_agent_loop_with_runner<F, G>(

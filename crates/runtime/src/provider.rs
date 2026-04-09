@@ -3,7 +3,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{find_provider_profile, ProviderRegistry};
+use crate::{find_provider_profile, ConnectionMode, ProviderRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderRoute {
@@ -144,6 +144,75 @@ pub fn resolve_model_target(
         });
     }
     parse_model_target(trimmed)
+}
+
+pub fn resolve_model_target_with_mode(
+    input: &str,
+    registry: &ProviderRegistry,
+    mode: ConnectionMode,
+) -> Result<ProviderTarget, String> {
+    let trimmed = input.trim();
+    let target = resolve_model_target(trimmed, registry)?;
+
+    if matches!(
+        target.route,
+        ProviderRoute::ClaudeCode | ProviderRoute::Codex
+    ) {
+        return Ok(target);
+    }
+    if trimmed.starts_with("profile/") || target.route == ProviderRoute::Ollama {
+        return Ok(target);
+    }
+
+    match mode {
+        ConnectionMode::Api => Ok(target),
+        ConnectionMode::Auth => auth_adapter_target(&target).ok_or_else(|| {
+            format!(
+                "auth mode is not supported for route `{}`; use an API/profile target instead",
+                target.route.as_str()
+            )
+        }),
+        ConnectionMode::Auto => {
+            if api_lane_available(&target) {
+                return Ok(target);
+            }
+            auth_adapter_target(&target).ok_or_else(|| {
+                format!(
+                    "no API credentials found and no auth adapter is available for route `{}`",
+                    target.route.as_str()
+                )
+            })
+        }
+    }
+}
+
+fn auth_adapter_target(target: &ProviderTarget) -> Option<ProviderTarget> {
+    let route = match target.route {
+        ProviderRoute::Anthropic => ProviderRoute::ClaudeCode,
+        ProviderRoute::OpenAiCompat => ProviderRoute::Codex,
+        _ => return None,
+    };
+
+    Some(ProviderTarget {
+        route,
+        model: target.model.clone(),
+        base_url_override: None,
+        api_key_override: None,
+        profile_alias: target.profile_alias.clone(),
+    })
+}
+
+fn api_lane_available(target: &ProviderTarget) -> bool {
+    if target.api_key_override.is_some() || target.base_url_override.is_some() {
+        return true;
+    }
+
+    match target.route {
+        ProviderRoute::Anthropic => std::env::var("ANTHROPIC_API_KEY").is_ok(),
+        ProviderRoute::OpenAiCompat => std::env::var("OPENAI_API_KEY").is_ok(),
+        ProviderRoute::Ollama => true,
+        ProviderRoute::ClaudeCode | ProviderRoute::Codex => false,
+    }
 }
 
 pub fn send_prompt(target: &ProviderTarget, prompt: &str) -> Result<ProviderReply, String> {
@@ -909,12 +978,13 @@ struct OllamaFunctionCall {
 mod tests {
     use std::env;
 
-    use crate::{send_prompt, ProviderRegistry, SavedProviderProfile};
+    use crate::{send_prompt, ConnectionMode, ProviderRegistry, SavedProviderProfile};
 
     use super::{
         join_url, parse_anthropic_tool_calls, parse_model_target, parse_ollama_tool_calls,
-        parse_openai_tool_calls, resolve_model_target, AnthropicContentBlock, OllamaFunctionCall,
-        OllamaToolCall, OpenAiFunctionCall, OpenAiToolCall, ProviderRoute,
+        parse_openai_tool_calls, resolve_model_target, resolve_model_target_with_mode,
+        AnthropicContentBlock, OllamaFunctionCall, OllamaToolCall, OpenAiFunctionCall,
+        OpenAiToolCall, ProviderRoute,
     };
     use serde_json::json;
 
@@ -996,6 +1066,61 @@ mod tests {
             Some("https://openrouter.ai/api/v1")
         );
         assert_eq!(target.profile_alias.as_deref(), Some("router"));
+    }
+
+    #[test]
+    fn resolves_auth_mode_to_claude_code_for_anthropic() {
+        let registry = ProviderRegistry::default();
+        let target = resolve_model_target_with_mode(
+            "anthropic/claude-sonnet-4-6",
+            &registry,
+            ConnectionMode::Auth,
+        )
+        .unwrap();
+
+        assert_eq!(target.route, ProviderRoute::ClaudeCode);
+        assert_eq!(target.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn resolves_auth_mode_to_codex_for_openai() {
+        let registry = ProviderRegistry::default();
+        let target =
+            resolve_model_target_with_mode("openai/gpt-4.1-mini", &registry, ConnectionMode::Auth)
+                .unwrap();
+
+        assert_eq!(target.route, ProviderRoute::Codex);
+        assert_eq!(target.model, "gpt-4.1-mini");
+    }
+
+    #[test]
+    fn keeps_profile_targets_on_api_lane_even_in_auth_mode() {
+        let registry = ProviderRegistry {
+            profiles: vec![SavedProviderProfile {
+                alias: "zai".to_string(),
+                route: "openai-compat".to_string(),
+                base_url: "https://api.z.ai/api/paas/v4".to_string(),
+                api_key: "demo".to_string(),
+                source: "manual".to_string(),
+            }],
+        };
+
+        let target =
+            resolve_model_target_with_mode("profile/zai/glm-4.5", &registry, ConnectionMode::Auth)
+                .unwrap();
+
+        assert_eq!(target.route, ProviderRoute::OpenAiCompat);
+        assert_eq!(target.profile_alias.as_deref(), Some("zai"));
+    }
+
+    #[test]
+    fn keeps_explicit_adapter_targets_unchanged() {
+        let registry = ProviderRegistry::default();
+        let target =
+            resolve_model_target_with_mode("codex/o3", &registry, ConnectionMode::Api).unwrap();
+
+        assert_eq!(target.route, ProviderRoute::Codex);
+        assert_eq!(target.model, "o3");
     }
 
     #[test]
@@ -1105,6 +1230,75 @@ mod tests {
         assert!(!reply.text.trim().is_empty());
     }
 
+    #[test]
+    fn live_saved_profile_prompt_when_enabled() {
+        if !saved_profile_live_test_enabled() {
+            return;
+        }
+
+        let route = env::var("HARNESS_TEST_SAVED_PROFILE_ROUTE")
+            .unwrap_or_else(|_| "openai-compat".to_string());
+        let model = env::var("HARNESS_TEST_SAVED_PROFILE_MODEL")
+            .unwrap_or_else(|_| "gpt-4.1-mini".to_string());
+        let alias = env::var("HARNESS_TEST_SAVED_PROFILE_ALIAS")
+            .unwrap_or_else(|_| "live-profile".to_string());
+        let registry = ProviderRegistry {
+            profiles: vec![SavedProviderProfile {
+                alias: alias.clone(),
+                route: route.clone(),
+                base_url: env::var("HARNESS_TEST_SAVED_PROFILE_BASE_URL").unwrap(),
+                api_key: env::var("HARNESS_TEST_SAVED_PROFILE_API_KEY").unwrap(),
+                source: "env-test".to_string(),
+            }],
+        };
+
+        let target = resolve_model_target_with_mode(
+            &format!("profile/{alias}/{model}"),
+            &registry,
+            ConnectionMode::Api,
+        )
+        .unwrap();
+        let reply = send_prompt(&target, "Reply with exactly: live-profile-ok").unwrap();
+
+        assert_eq!(reply.route.as_str(), route);
+        assert!(!reply.text.trim().is_empty());
+    }
+
+    #[test]
+    fn live_claude_code_adapter_when_enabled() {
+        if !auth_adapter_live_test_enabled("claude") {
+            return;
+        }
+
+        let model =
+            env::var("HARNESS_TEST_CLAUDE_CODE_MODEL").unwrap_or_else(|_| "sonnet".to_string());
+        let reply = send_prompt(
+            &parse_model_target(&format!("claude-code/{model}")).unwrap(),
+            "Reply with exactly: live-claude-code-ok",
+        )
+        .unwrap();
+
+        assert_eq!(reply.route, ProviderRoute::ClaudeCode);
+        assert!(!reply.text.trim().is_empty());
+    }
+
+    #[test]
+    fn live_codex_adapter_when_enabled() {
+        if !auth_adapter_live_test_enabled("codex") {
+            return;
+        }
+
+        let model = env::var("HARNESS_TEST_CODEX_MODEL").unwrap_or_else(|_| "o3".to_string());
+        let reply = send_prompt(
+            &parse_model_target(&format!("codex/{model}")).unwrap(),
+            "Reply with exactly: live-codex-ok",
+        )
+        .unwrap();
+
+        assert_eq!(reply.route, ProviderRoute::Codex);
+        assert!(!reply.text.trim().is_empty());
+    }
+
     fn live_test_enabled(provider: &str) -> bool {
         matches!(
             env::var("HARNESS_RUN_LIVE_PROVIDER_TESTS").ok().as_deref(),
@@ -1115,6 +1309,25 @@ mod tests {
             "ollama" => {
                 env::var("HARNESS_TEST_OLLAMA_MODEL").is_ok() || env::var("OLLAMA_HOST").is_ok()
             }
+            _ => false,
+        }
+    }
+
+    fn saved_profile_live_test_enabled() -> bool {
+        matches!(
+            env::var("HARNESS_RUN_LIVE_PROVIDER_TESTS").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES")
+        ) && env::var("HARNESS_TEST_SAVED_PROFILE_BASE_URL").is_ok()
+            && env::var("HARNESS_TEST_SAVED_PROFILE_API_KEY").is_ok()
+    }
+
+    fn auth_adapter_live_test_enabled(adapter: &str) -> bool {
+        matches!(
+            env::var("HARNESS_RUN_AUTH_ADAPTER_TESTS").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES")
+        ) && match adapter {
+            "claude" => true,
+            "codex" => true,
             _ => false,
         }
     }
