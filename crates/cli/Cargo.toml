@@ -6,9 +6,10 @@ license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "harness"
+name = "3122"
 path = "src/main.rs"
 
 [dependencies]
+crossterm = "0.28"
 runtime = { path = "../runtime" }
 serde_json.workspace = true

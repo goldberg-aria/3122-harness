@@ -1,7 +1,15 @@
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::terminal::{
+    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
+};
+use crossterm::{execute, queue};
 use runtime::{
     backend_catalog, blueprint_summary, build_handoff_text, build_memory_recall_text,
     build_model_handoff_snapshot, build_resume_text, call_mcp_tool, create_slash_command_template,
@@ -18,6 +26,9 @@ use runtime::{
     ToolOutput, VerificationPolicy,
 };
 use serde_json::json;
+
+const APP_NAME: &str = "3122";
+const MAX_SLASH_SUGGESTIONS: usize = 7;
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -68,7 +79,7 @@ fn main() {
         Some("prompt") => {
             let (override_model, prompt) = parse_prompt_args(&args[1..]);
             if prompt.trim().is_empty() {
-                eprintln!("usage: harness prompt [--model <spec>] <text...>");
+                eprintln!("usage: {} prompt [--model <spec>] <text...>", APP_NAME);
                 std::process::exit(2);
             }
             let mut approval_policy = config.default_approval_policy();
@@ -131,73 +142,347 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
         }),
     );
 
-    println!("Harness");
-    println!("workspace: {}", workspace.display());
-    println!(
-        "config: {}",
-        config
-            .source
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "default (no config file found)".to_string())
-    );
-    println!("session: {}", session.path().display());
-    println!("mode: {mode}");
-    println!(
-        "approval: {} ({})",
-        approval_policy,
-        approval_policy_hint(approval_policy)
-    );
-    println!(
-        "connection: {} ({})",
-        config.interactive_connection_mode(),
-        connection_mode_hint(config.interactive_connection_mode())
-    );
-    println!(
-        "verification: {} ({})",
-        config.default_verification_policy(),
-        verification_policy_hint(config.default_verification_policy())
-    );
-    if let Some(model) = current_model.as_deref() {
-        println!("model: {model}");
+    let mut ui = TuiState::new();
+    ui.push_system("Type /help for commands".to_string());
+
+    if enable_raw_mode().is_err() {
+        eprintln!("failed to enable raw mode");
+        autosave_session_memory(workspace, &session);
+        return;
     }
-    println!("type /help for commands");
 
-    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    if execute!(stdout, EnterAlternateScreen, Hide).is_err() {
+        let _ = disable_raw_mode();
+        eprintln!("failed to enter alternate screen");
+        autosave_session_memory(workspace, &session);
+        return;
+    }
+
     loop {
-        print!("harness> ");
-        let _ = io::stdout().flush();
-
-        let mut line = String::new();
-        if stdin.read_line(&mut line).is_err() {
-            eprintln!("failed to read input");
-            autosave_session_memory(workspace, &session);
-            return;
-        }
-        if line.is_empty() {
-            autosave_session_memory(workspace, &session);
-            return;
-        }
-
-        let trimmed = line.trim();
-        let _ = session.append("user_input", json!({ "text": trimmed }));
-        match handle_repl_line(
+        if redraw_tui(
+            &mut stdout,
             workspace,
             config,
             &session,
-            trimmed,
-            &mut current_model,
-            &mut mode,
-            &mut approval_policy,
-            0,
-        ) {
-            ReplDirective::Continue => continue,
-            ReplDirective::Exit => {
-                autosave_session_memory(workspace, &session);
-                return;
+            &current_model,
+            mode,
+            approval_policy,
+            &ui,
+        )
+        .is_err()
+        {
+            break;
+        }
+
+        let Ok(event) = event::read() else {
+            ui.push_error("failed to read terminal input".to_string());
+            continue;
+        };
+
+        let Event::Key(key) = event else {
+            continue;
+        };
+
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => break,
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                ui.input.clear();
             }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                ui.input.pop();
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                let line = ui.input.trim().to_string();
+                ui.input.clear();
+                if line.is_empty() {
+                    continue;
+                }
+                let _ = session.append("user_input", json!({ "text": line }));
+                ui.push_user(line.clone());
+                match process_repl_input_tui(
+                    workspace,
+                    config,
+                    &session,
+                    &line,
+                    &mut current_model,
+                    &mut mode,
+                    &mut approval_policy,
+                    &mut ui,
+                    0,
+                ) {
+                    ReplDirective::Continue => {}
+                    ReplDirective::Exit => break,
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                ui.input.push(ch);
+            }
+            _ => {}
         }
     }
+
+    let _ = execute!(stdout, Show, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+    autosave_session_memory(workspace, &session);
+}
+
+struct TuiState {
+    transcript: Vec<String>,
+    input: String,
+}
+
+impl TuiState {
+    fn new() -> Self {
+        Self {
+            transcript: Vec::new(),
+            input: String::new(),
+        }
+    }
+
+    fn push_user(&mut self, line: String) {
+        self.transcript.push(format!("> {line}"));
+    }
+
+    fn push_system(&mut self, line: String) {
+        self.push_block(&line);
+    }
+
+    fn push_error(&mut self, line: String) {
+        self.push_block(&format!("error: {line}"));
+    }
+
+    fn push_block(&mut self, block: &str) {
+        for line in block.lines() {
+            self.transcript.push(line.to_string());
+        }
+        if block.trim().is_empty() {
+            self.transcript.push(String::new());
+        }
+    }
+
+    fn push_result(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(text) => self.push_block(&text),
+            Err(err) => self.push_error(err),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SlashSuggestion {
+    name: String,
+    description: String,
+}
+
+fn redraw_tui(
+    stdout: &mut Stdout,
+    workspace: &Path,
+    config: &LoadedConfig,
+    session: &SessionStore,
+    current_model: &Option<String>,
+    mode: PermissionMode,
+    approval_policy: ApprovalPolicy,
+    ui: &TuiState,
+) -> Result<(), String> {
+    let (width, height) = terminal::size().map_err(|err| err.to_string())?;
+    let width = width.max(20);
+    let height = height.max(8);
+    let suggestions = build_slash_suggestions(workspace, &ui.input);
+    let suggestion_lines = render_suggestion_lines(&suggestions, width as usize);
+    let footer_rows = 2usize + suggestion_lines.len();
+    let workspace_name = workspace
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_else(|| workspace.to_str().unwrap_or("-"));
+    let header = vec![
+        format!(
+            "{APP_NAME} | {} | {} | {}",
+            current_model.as_deref().or_else(|| config.primary_model()).unwrap_or("-"),
+            mode,
+            approval_policy,
+        ),
+        format!(
+            "{} | conn={} | session={}",
+            workspace_name,
+            config.interactive_connection_mode(),
+            runtime::SessionStore::session_id_from_path(session.path())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+    ];
+
+    let transcript_height = (height as usize)
+        .saturating_sub(header.len())
+        .saturating_sub(footer_rows);
+    let mut wrapped = Vec::new();
+    for line in &ui.transcript {
+        wrapped.extend(wrap_for_terminal(line, width as usize));
+    }
+    let start = wrapped.len().saturating_sub(transcript_height);
+    let visible = &wrapped[start..];
+
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All)).map_err(|err| err.to_string())?;
+    for (index, line) in header.iter().enumerate() {
+        queue!(
+            stdout,
+            MoveTo(0, index as u16),
+            SetAttribute(Attribute::Bold),
+            Print(truncate_for_terminal(line, width as usize)),
+            SetAttribute(Attribute::Reset)
+        )
+        .map_err(|err| err.to_string())?;
+    }
+
+    let mut row = header.len() as u16;
+    for line in visible {
+        queue!(stdout, MoveTo(0, row), Print(truncate_for_terminal(line, width as usize)))
+            .map_err(|err| err.to_string())?;
+        row += 1;
+    }
+
+    let suggestion_start = height as usize - footer_rows;
+    for (offset, line) in suggestion_lines.iter().enumerate() {
+        queue!(
+            stdout,
+            MoveTo(0, (suggestion_start + offset) as u16),
+            Print(truncate_for_terminal(line, width as usize))
+        )
+        .map_err(|err| err.to_string())?;
+    }
+
+    let input_row = height.saturating_sub(1);
+    queue!(
+        stdout,
+        MoveTo(0, input_row.saturating_sub(1)),
+        SetAttribute(Attribute::Dim),
+        Print("Enter to send. Ctrl-C to exit. Esc clears input."),
+        SetAttribute(Attribute::Reset),
+        MoveTo(0, input_row),
+        Print(truncate_for_terminal(&format!("> {}", ui.input), width as usize)),
+        MoveTo((2 + ui.input.chars().count()) as u16, input_row)
+    )
+    .map_err(|err| err.to_string())?;
+    stdout.flush().map_err(|err| err.to_string())
+}
+
+fn build_slash_suggestions(workspace: &Path, input: &str) -> Vec<SlashSuggestion> {
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+    let prefix = input
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let mut suggestions = core_slash_suggestions();
+    for command in discover_slash_commands(workspace) {
+        suggestions.push(SlashSuggestion {
+            name: command.name,
+            description: if command.description.trim().is_empty() {
+                command.kind.as_str().to_string()
+            } else {
+                command.description
+            },
+        });
+    }
+    suggestions.sort_by(|left, right| left.name.cmp(&right.name));
+    suggestions.dedup_by(|left, right| left.name == right.name);
+    if prefix.is_empty() {
+        suggestions.truncate(MAX_SLASH_SUGGESTIONS);
+        return suggestions;
+    }
+    let mut filtered = suggestions
+        .into_iter()
+        .filter(|item| item.name.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    filtered.truncate(MAX_SLASH_SUGGESTIONS);
+    filtered
+}
+
+fn core_slash_suggestions() -> Vec<SlashSuggestion> {
+    [
+        ("help", "Show commands"),
+        ("status", "Show current session state"),
+        ("model", "Show or set the active model"),
+        ("resume", "Show latest session resume summary"),
+        ("handoff", "Print the latest handoff block"),
+        ("why-context", "Show the current prompt context"),
+        ("memory", "List, recall, search, or save local memory"),
+        ("commands", "List custom slash commands"),
+        ("login", "Show provider setup hints"),
+        ("mode", "Show or set permission mode"),
+        ("approval", "Show or set approval policy"),
+        ("doctor", "Inspect local environment"),
+        ("providers", "List saved providers"),
+        ("skills", "List discovered skills"),
+        ("mcp", "List discovered MCP servers"),
+        ("session", "Show latest session path"),
+        ("parallel-read", "Run read/grep/glob in one batch"),
+        ("exit", "Leave the session"),
+    ]
+    .into_iter()
+    .map(|(name, description)| SlashSuggestion {
+        name: name.to_string(),
+        description: description.to_string(),
+    })
+    .collect()
+}
+
+fn render_suggestion_lines(suggestions: &[SlashSuggestion], width: usize) -> Vec<String> {
+    if suggestions.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["commands".to_string()];
+    for suggestion in suggestions {
+        lines.push(truncate_for_terminal(
+            &format!("/{:<14} {}", suggestion.name, suggestion.description),
+            width,
+        ));
+    }
+    lines
+}
+
+fn truncate_for_terminal(line: &str, width: usize) -> String {
+    line.chars().take(width).collect()
+}
+
+fn wrap_for_terminal(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for ch in line.chars() {
+        current.push(ch);
+        if current.chars().count() >= width {
+            out.push(current);
+            current = String::new();
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 enum ReplDirective {
@@ -205,6 +490,260 @@ enum ReplDirective {
     Exit,
 }
 
+fn process_repl_input_tui(
+    workspace: &Path,
+    config: &LoadedConfig,
+    session: &SessionStore,
+    trimmed: &str,
+    current_model: &mut Option<String>,
+    mode: &mut PermissionMode,
+    approval_policy: &mut ApprovalPolicy,
+    ui: &mut TuiState,
+    custom_depth: usize,
+) -> ReplDirective {
+    match trimmed {
+        "" => return ReplDirective::Continue,
+        "/exit" | "/quit" => return ReplDirective::Exit,
+        "/help" => {
+            ui.push_block(&render_repl_help_text());
+            return ReplDirective::Continue;
+        }
+        "/status" => {
+            ui.push_block(&render_repl_status_text(
+                workspace,
+                session,
+                current_model.as_deref(),
+                *mode,
+                *approval_policy,
+                config.interactive_connection_mode(),
+                config.default_verification_policy(),
+            ));
+            return ReplDirective::Continue;
+        }
+        "/model" => {
+            ui.push_block(&render_model_status_text(
+                workspace,
+                config,
+                current_model.as_deref(),
+            ));
+            return ReplDirective::Continue;
+        }
+        "/resume" => {
+            ui.push_result(build_resume_text(workspace));
+            return ReplDirective::Continue;
+        }
+        "/handoff" => {
+            ui.push_result(build_handoff_text(workspace));
+            return ReplDirective::Continue;
+        }
+        "/why-context" => {
+            ui.push_block(&build_context_dump(
+                workspace,
+                config,
+                current_model.as_deref(),
+                Some(*mode),
+            ));
+            return ReplDirective::Continue;
+        }
+        "/memory" => {
+            ui.push_result(render_memory_list_text(workspace));
+            return ReplDirective::Continue;
+        }
+        "/commands" => {
+            ui.push_block(&render_slash_commands_text(workspace));
+            return ReplDirective::Continue;
+        }
+        "/login" => {
+            ui.push_block(&render_login_status_text(workspace));
+            return ReplDirective::Continue;
+        }
+        "/mode" => {
+            ui.push_system(mode.to_string());
+            return ReplDirective::Continue;
+        }
+        "/approval" => {
+            ui.push_block(&format_approval_status(*approval_policy));
+            return ReplDirective::Continue;
+        }
+        "/doctor" => {
+            ui.push_block(&doctor_report(workspace, config).render());
+            return ReplDirective::Continue;
+        }
+        "/config" => {
+            ui.push_block(&config.render_summary(workspace));
+            return ReplDirective::Continue;
+        }
+        "/skills" => {
+            ui.push_block(&render_skills_text(workspace, config));
+            return ReplDirective::Continue;
+        }
+        "/mcp" => {
+            ui.push_block(&render_mcp_text(workspace, config));
+            return ReplDirective::Continue;
+        }
+        "/providers" => {
+            ui.push_block(&render_saved_providers_text(workspace));
+            return ReplDirective::Continue;
+        }
+        "/blueprint" => {
+            ui.push_block(&blueprint_summary());
+            return ReplDirective::Continue;
+        }
+        "/session" => {
+            ui.push_system(session.path().display().to_string());
+            return ReplDirective::Continue;
+        }
+        _ => {}
+    }
+
+    if let Some(next_mode) = trimmed.strip_prefix("/mode ").and_then(PermissionMode::parse) {
+        *mode = next_mode;
+        let _ = session.append("mode_change", json!({ "mode": mode.as_str() }));
+        ui.push_system(format!("mode set to {mode}"));
+        return ReplDirective::Continue;
+    }
+    if let Some(model) = trimmed.strip_prefix("/model ").map(str::trim) {
+        if model.is_empty() {
+            ui.push_error("usage: /model <provider/model | profile/alias/model>".to_string());
+            return ReplDirective::Continue;
+        }
+        let previous_model = current_model
+            .as_deref()
+            .or_else(|| config.primary_model())
+            .map(ToOwned::to_owned);
+        *current_model = Some(model.to_string());
+        let _ = session.append("model_change", json!({ "from": previous_model, "model": model }));
+        match build_model_handoff_snapshot(workspace, session.path(), previous_model.as_deref(), model)
+        {
+            Ok(snapshot) => {
+                let _ = session.append(
+                    "model_handoff",
+                    serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
+                );
+                ui.push_block(&render_model_switch_summary_text(&snapshot));
+            }
+            Err(err) => ui.push_error(format!("model set to {model}; failed to build handoff: {err}")),
+        }
+        return ReplDirective::Continue;
+    }
+    if trimmed == "/memory save" {
+        ui.push_result(render_save_latest_session_memory(workspace, session));
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/memory show ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => ui.push_result(render_memory_show_text(workspace, index)),
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(limit) = trimmed.strip_prefix("/memory recall").map(str::trim) {
+        match parse_optional_limit(limit, 6) {
+            Ok(limit) => ui.push_result(build_memory_recall_text(workspace, limit)),
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(query) = trimmed.strip_prefix("/memory search ").map(str::trim) {
+        ui.push_result(render_memory_search_text(workspace, query));
+        return ReplDirective::Continue;
+    }
+    if let Some(name) = trimmed.strip_prefix("/commands show ").map(str::trim) {
+        ui.push_result(render_slash_command_show_text(workspace, name));
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/commands init").map(str::trim) {
+        ui.push_result(run_commands_init_text(workspace, parse_scope_flag(rest)));
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/commands new ").map(str::trim) {
+        match parse_new_command_args(rest) {
+            Ok((name, kind, scope)) => ui.push_result(run_commands_new_text(workspace, name, kind, scope)),
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
+    if trimmed == "/handoff debug" {
+        ui.push_result(render_handoff_debug_text(workspace));
+        return ReplDirective::Continue;
+    }
+    if let Some(next_policy) = trimmed.strip_prefix("/approval ").and_then(ApprovalPolicy::parse) {
+        *approval_policy = next_policy;
+        let _ = session.append(
+            "approval_change",
+            json!({ "policy": approval_policy.as_str() }),
+        );
+        ui.push_system(format!("approval set to {approval_policy}"));
+        return ReplDirective::Continue;
+    }
+    if let Some(body) = trimmed.strip_prefix("/skill ") {
+        let Some((name, task)) = split_skill_command(body) else {
+            ui.push_error("usage: /skill <name> [task...]".to_string());
+            return ReplDirective::Continue;
+        };
+        ui.push_result(render_skill_text(workspace, config, name, task, session));
+        return ReplDirective::Continue;
+    }
+    if let Some(body) = trimmed.strip_prefix("/mcp-tools ") {
+        let name = body.trim();
+        if name.is_empty() {
+            ui.push_error("usage: /mcp-tools <server>".to_string());
+            return ReplDirective::Continue;
+        }
+        ui.push_result(render_mcp_tools_text(workspace, config, name));
+        return ReplDirective::Continue;
+    }
+    if let Some(body) = trimmed.strip_prefix("/mcp-call ") {
+        match split_mcp_call_command(body) {
+            Some((server, tool, arguments)) => {
+                ui.push_result(render_mcp_call_text(workspace, config, server, tool, arguments, session));
+            }
+            None => ui.push_error("usage: /mcp-call <server> <tool> [json-args]".to_string()),
+        }
+        return ReplDirective::Continue;
+    }
+
+    if trimmed.starts_with('/') && custom_depth < 4 {
+        match maybe_run_custom_slash_command_tui(
+            workspace,
+            config,
+            session,
+            trimmed,
+            current_model,
+            mode,
+            approval_policy,
+            ui,
+            custom_depth + 1,
+        ) {
+            Ok(true) => return ReplDirective::Continue,
+            Ok(false) => {}
+            Err(err) => {
+                ui.push_error(err);
+                return ReplDirective::Continue;
+            }
+        }
+    }
+
+    if trimmed.starts_with('/') {
+        ui.push_result(render_repl_tool_output(workspace, trimmed, *mode, session));
+    } else {
+        let _ = session.append("prompt_start", json!({ "text": trimmed }));
+        let result = run_prompt_capture(
+            workspace,
+            config,
+            trimmed,
+            current_model.as_deref(),
+            *mode,
+            approval_policy,
+            session,
+            ui,
+        );
+        ui.push_result(result);
+    }
+    ReplDirective::Continue
+}
+
+#[allow(dead_code)]
 fn handle_repl_line(
     workspace: &Path,
     config: &LoadedConfig,
@@ -470,6 +1009,825 @@ fn handle_repl_line(
     ReplDirective::Continue
 }
 
+fn render_repl_help_text() -> String {
+    [
+        "/help       show commands",
+        "/status     show current session state",
+        "/model      show or set the active model",
+        "/resume     show latest session resume summary",
+        "/handoff    print a handoff block",
+        "/handoff debug inspect the latest handoff state",
+        "/why-context show the current prompt context",
+        "/memory     list/search/save local memory",
+        "/memory show inspect one recent memory record",
+        "/memory recall print rendered recall text",
+        "/commands   list custom slash commands",
+        "/commands show inspect one custom slash command",
+        "/commands init create a commands directory",
+        "/commands new create a command template",
+        "/login      show provider setup hints",
+        "/mode       show or set permission mode",
+        "/approval   show or set approval policy",
+        "/doctor     inspect local environment",
+        "/config     show resolved config",
+        "/providers  list saved providers",
+        "/blueprint  print architecture summary",
+        "/skills     list discovered skills",
+        "/skill      show or run a specific skill",
+        "/mcp        list discovered MCP servers",
+        "/mcp-tools  list tools from one MCP server",
+        "/mcp-call   call a tool on one MCP server",
+        "/session    show latest session path",
+        "/read       read a file",
+        "/write      write a file",
+        "/edit       replace first occurrence",
+        "/grep       search text",
+        "/glob       find paths",
+        "/exec       run a shell command",
+        "/parallel-read run read/grep/glob in one batch",
+        "/exit       leave the repl",
+    ]
+    .join("\n")
+}
+
+fn render_repl_status_text(
+    workspace: &Path,
+    session: &SessionStore,
+    current_model: Option<&str>,
+    mode: PermissionMode,
+    approval_policy: ApprovalPolicy,
+    connection_mode: ConnectionMode,
+    verification_policy: VerificationPolicy,
+) -> String {
+    let provider_count = load_provider_registry(workspace)
+        .map(|registry| registry.profiles.len())
+        .unwrap_or(0);
+    let memory_records = list_memory_records(workspace).unwrap_or_default();
+    let mut lines = vec![
+        format!("workspace: {}", workspace.display()),
+        format!("session: {}", session.path().display()),
+        format!("model: {}", current_model.unwrap_or("-")),
+    ];
+    if let Ok(Some(handoff)) = latest_model_handoff(session.path()) {
+        if let Some(previous) = handoff.snapshot.from_model.as_deref() {
+            lines.push(format!("previous_model: {previous}"));
+        }
+        lines.push(format!("next_step: {}", handoff.snapshot.suggested_next_step));
+    }
+    if let Ok(Some(handoff)) = pending_model_handoff(session.path()) {
+        lines.push(format!("handoff_boost: pending for {}", handoff.snapshot.to_model));
+    }
+    lines.push(format!("mode: {mode}"));
+    lines.push(format!("connection: {connection_mode}"));
+    lines.push(format!(
+        "connection_behavior: {}",
+        connection_mode_hint(connection_mode)
+    ));
+    lines.push(format!("approval: {approval_policy}"));
+    lines.push(format!(
+        "approval_behavior: {}",
+        approval_policy_hint(approval_policy)
+    ));
+    lines.push(format!("verification: {verification_policy}"));
+    lines.push(format!(
+        "verification_behavior: {}",
+        verification_policy_hint(verification_policy)
+    ));
+    lines.push(format!("saved_providers: {provider_count}"));
+    lines.push(format!("memory_records: {}", memory_records.len()));
+    lines.join("\n")
+}
+
+fn render_model_status_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    current_model: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        format!("active: {}", current_model.unwrap_or("-")),
+        format!("default: {}", config.primary_model().unwrap_or("-")),
+    ];
+    if let Ok(Some(session_path)) = SessionStore::latest(workspace) {
+        if let Ok(Some(handoff)) = latest_model_handoff(&session_path) {
+            if let Some(previous) = handoff.snapshot.from_model.as_deref() {
+                lines.push(format!("previous: {previous}"));
+            }
+            lines.push(format!("current_goal: {}", handoff.snapshot.current_goal));
+            lines.push(format!("next: {}", handoff.snapshot.suggested_next_step));
+        }
+    }
+    if !config.data.model.fallback.is_empty() {
+        lines.push(format!("fallback: {}", config.data.model.fallback.join(", ")));
+    }
+    let registry = load_provider_registry(workspace).unwrap_or_default();
+    if registry.profiles.is_empty() {
+        lines.push("saved_profiles: none".to_string());
+    } else {
+        lines.push("saved_profiles:".to_string());
+        for profile in registry.profiles {
+            lines.push(format!(
+                "- {} | {} | use: profile/{}/<model>",
+                profile.alias, profile.base_url, profile.alias
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_login_status_text(workspace: &Path) -> String {
+    let registry = load_provider_registry(workspace).unwrap_or_default();
+    let mut lines = vec!["BYOK:".to_string()];
+    if registry.profiles.is_empty() {
+        lines.push("- no saved provider profiles".to_string());
+    } else {
+        lines.push(format!(
+            "- saved provider profiles: {}",
+            registry.profiles.len()
+        ));
+        for profile in registry.profiles {
+            lines.push(format!("- {} | {}", profile.alias, profile.base_url));
+        }
+    }
+    lines.push("Next steps:".to_string());
+    lines.push(format!("- `{APP_NAME} providers presets`"));
+    lines.push(format!("- `{APP_NAME} providers add <alias> --api-key <key>`"));
+    lines.push("- use `profile/<alias>/<model>` in `/model`".to_string());
+    lines.push("External CLIs:".to_string());
+    lines.push(format!("- run `{APP_NAME} doctor` to inspect `claude` and `codex`"));
+    lines.join("\n")
+}
+
+fn render_slash_commands_text(workspace: &Path) -> String {
+    let commands = discover_slash_commands(workspace);
+    if commands.is_empty() {
+        return "no custom slash commands".to_string();
+    }
+    let mut lines = Vec::new();
+    if let Ok(global_dir) = slash_command_dir(workspace, SlashCommandScope::Global) {
+        lines.push(format!("global_dir: {}", global_dir.display()));
+    }
+    if let Ok(workspace_dir) = slash_command_dir(workspace, SlashCommandScope::Workspace) {
+        lines.push(format!("workspace_dir: {}", workspace_dir.display()));
+    }
+    lines.push(format!("custom_commands: {}", commands.len()));
+    for command in commands {
+        let summary = if command.description.trim().is_empty() {
+            "-".to_string()
+        } else {
+            compact_line(command.description.trim(), 96)
+        };
+        lines.push(format!(
+            "/{} | {} | {} | {}",
+            command.name,
+            command.kind.as_str(),
+            command.source,
+            summary
+        ));
+    }
+    lines.join("\n")
+}
+
+fn run_commands_init_text(workspace: &Path, scope: SlashCommandScope) -> Result<String, String> {
+    init_slash_command_dir(workspace, scope).map(|path| {
+        format!(
+            "initialized {} commands dir\npath: {}",
+            scope.as_str(),
+            path.display()
+        )
+    })
+}
+
+fn run_commands_new_text(
+    workspace: &Path,
+    name: &str,
+    kind: SlashCommandKind,
+    scope: SlashCommandScope,
+) -> Result<String, String> {
+    let kind_label = kind.as_str().to_string();
+    create_slash_command_template(workspace, scope, name, kind).map(|path| {
+        format!(
+            "created /{} ({})\nscope: {}\npath: {}",
+            name.trim().trim_start_matches('/'),
+            kind_label,
+            scope.as_str(),
+            path.display()
+        )
+    })
+}
+
+fn render_slash_command_show_text(workspace: &Path, name: &str) -> Result<String, String> {
+    let commands = discover_slash_commands(workspace);
+    let command = resolve_slash_command(&commands, name)
+        .ok_or_else(|| format!("unknown custom command: {name}"))?;
+    let usage = command
+        .usage
+        .clone()
+        .unwrap_or_else(|| format!("/{}", command.name));
+    let mut lines = vec![
+        format!("name: /{}", command.name),
+        format!("kind: {}", command.kind.as_str()),
+        format!("source: {}", command.source),
+        format!("path: {}", command.path.display()),
+        format!(
+            "description: {}",
+            if command.description.trim().is_empty() {
+                "-"
+            } else {
+                command.description.trim()
+            }
+        ),
+        format!("usage: {usage}"),
+        format!(
+            "args: min={} max={}",
+            command
+                .min_args
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            command
+                .max_args
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ),
+    ];
+    match command.kind {
+        SlashCommandKind::Alias => {
+            lines.push(format!("target: {}", command.target.as_deref().unwrap_or("-")));
+        }
+        SlashCommandKind::Macro => {
+            lines.push("steps:".to_string());
+            for step in &command.steps {
+                lines.push(format!("- {step}"));
+            }
+        }
+        SlashCommandKind::PromptTemplate => {
+            lines.push(format!("prompt: {}", command.prompt.as_deref().unwrap_or("-")));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_saved_providers_text(workspace: &Path) -> String {
+    let registry = load_provider_registry(workspace).unwrap_or_default();
+    if registry.profiles.is_empty() {
+        return "no saved provider profiles".to_string();
+    }
+    registry
+        .profiles
+        .into_iter()
+        .map(|profile| {
+            format!(
+                "{} | {} | {} | use: profile/{}/<model>",
+                profile.alias, profile.route, profile.base_url, profile.alias
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_memory_list_text(workspace: &Path) -> Result<String, String> {
+    let records = list_memory_records(workspace)?;
+    if records.is_empty() {
+        return Ok("no memory records".to_string());
+    }
+    let mut lines = vec![format!("memory_records: {}", records.len())];
+    let (summaries, decisions, tasks, errors, notes) = memory_kind_counts(&records);
+    lines.push(format!(
+        "kinds: summary={} decision={} task={} error={} note={}",
+        summaries, decisions, tasks, errors, notes
+    ));
+    lines.push("recent:".to_string());
+    for (index, record) in records.into_iter().take(5).enumerate() {
+        lines.push(format!(
+            "- #{} | {} | {} | {}",
+            index + 1,
+            record.kind,
+            record.title,
+            record.ts_ms
+        ));
+    }
+    lines.push("hint: use `memory show <index>` or `memory recall [limit]`".to_string());
+    Ok(lines.join("\n"))
+}
+
+fn render_memory_show_text(workspace: &Path, index: usize) -> Result<String, String> {
+    let records = list_memory_records(workspace)?;
+    if records.is_empty() {
+        return Ok("no memory records".to_string());
+    }
+    let Some(record) = records.get(index - 1) else {
+        return Err(format!("memory index out of range: {index}"));
+    };
+    let mut lines = vec![
+        format!("index: {index}"),
+        format!("kind: {}", record.kind),
+        format!("title: {}", record.title),
+        format!("ts_ms: {}", record.ts_ms),
+        format!("session: {}", record.session_path.as_deref().unwrap_or("-")),
+        format!(
+            "tags: {}",
+            if record.tags.is_empty() {
+                "-".to_string()
+            } else {
+                record.tags.join(", ")
+            }
+        ),
+        "body:".to_string(),
+        record.body.trim().to_string(),
+    ];
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_memory_search_text(workspace: &Path, query: &str) -> Result<String, String> {
+    let records = search_memory_records(workspace, query)?;
+    if records.is_empty() {
+        return Ok("no memory matches".to_string());
+    }
+    let mut lines = vec![format!("matches: {}", records.len())];
+    for record in records {
+        lines.push(format!("{} | {}", record.kind, record.title));
+        lines.push(record.body.trim().to_string());
+        lines.push(String::new());
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_save_latest_session_memory(
+    workspace: &Path,
+    session: &SessionStore,
+) -> Result<String, String> {
+    let bundle = save_session_memory_bundle(workspace, session.path())?;
+    if bundle.saved_records.is_empty() {
+        return Ok("memory unchanged".to_string());
+    }
+    let mut lines = vec![format!("saved {} memory record(s)", bundle.saved_records.len())];
+    for record in bundle.saved_records {
+        lines.push(format!("{} | {}", record.kind, record.title));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_model_switch_summary_text(snapshot: &ModelHandoffSnapshot) -> String {
+    let mut lines = vec![
+        format!("active: {}", snapshot.to_model),
+        format!("previous: {}", snapshot.from_model.as_deref().unwrap_or("-")),
+        format!("handoff: {}", compact_line(&snapshot.current_goal, 96)),
+        format!("next: {}", compact_line(&snapshot.suggested_next_step, 96)),
+    ];
+    if !snapshot.open_tasks.is_empty() {
+        lines.push(format!(
+            "warning: {} open task(s) carried forward",
+            snapshot.open_tasks.len()
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_handoff_debug_text(workspace: &Path) -> Result<String, String> {
+    let latest_session = SessionStore::latest(workspace)?;
+    let Some(session_path) = latest_session else {
+        return Ok("no sessions found".to_string());
+    };
+
+    let mut lines = vec![format!("session: {}", session_path.display())];
+    match latest_model_handoff(&session_path)? {
+        Some(handoff) => {
+            lines.push(format!("latest_handoff_ts_ms: {}", handoff.ts_ms));
+            lines.push(format!(
+                "from_model: {}",
+                handoff.snapshot.from_model.as_deref().unwrap_or("-")
+            ));
+            lines.push(format!("to_model: {}", handoff.snapshot.to_model));
+            lines.push(format!("current_goal: {}", handoff.snapshot.current_goal));
+            lines.push(format!(
+                "recent_work_summary: {}",
+                handoff.snapshot.recent_work_summary
+            ));
+            if handoff.snapshot.open_tasks.is_empty() {
+                lines.push("open_tasks: -".to_string());
+            } else {
+                lines.push("open_tasks:".to_string());
+                for task in &handoff.snapshot.open_tasks {
+                    lines.push(format!("- {task}"));
+                }
+            }
+            if handoff.snapshot.recent_errors.is_empty() {
+                lines.push("recent_errors: -".to_string());
+            } else {
+                lines.push("recent_errors:".to_string());
+                for error in &handoff.snapshot.recent_errors {
+                    lines.push(format!("- {error}"));
+                }
+            }
+            lines.push(format!(
+                "suggested_next_step: {}",
+                handoff.snapshot.suggested_next_step
+            ));
+        }
+        None => lines.push("latest_handoff: -".to_string()),
+    }
+    match pending_model_handoff(&session_path)? {
+        Some(handoff) => {
+            lines.push("pending_handoff: yes".to_string());
+            lines.push(format!("pending_to_model: {}", handoff.snapshot.to_model));
+        }
+        None => lines.push("pending_handoff: no".to_string()),
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_repl_tool_output(
+    workspace: &Path,
+    line: &str,
+    mode: PermissionMode,
+    session: &SessionStore,
+) -> Result<String, String> {
+    let tokens: Vec<String> = line.split_whitespace().map(ToOwned::to_owned).collect();
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let command = tokens[0].trim_start_matches('/');
+    let args = &tokens[1..];
+    match run_tool_command(workspace, command, args, line, mode) {
+        Ok(output) => {
+            let _ = session.append(
+                "tool_result",
+                json!({ "command": command, "summary": output.summary, "content": output.content }),
+            );
+            Ok(format_tool_output(&output))
+        }
+        Err(err) => {
+            let _ = session.append("tool_error", json!({ "command": command, "error": err }));
+            Err(err)
+        }
+    }
+}
+
+fn format_tool_output(output: &ToolOutput) -> String {
+    if output.content.is_empty() {
+        output.summary.clone()
+    } else {
+        format!("{}\n{}", output.summary, output.content)
+    }
+}
+
+fn format_approval_status(policy: ApprovalPolicy) -> String {
+    format!("approval: {policy}\nbehavior: {}", approval_policy_hint(policy))
+}
+
+fn render_skills_text(workspace: &Path, config: &LoadedConfig) -> String {
+    let skills = discover_skills(&config.skill_sources(workspace));
+    if skills.is_empty() {
+        return "no skills found".to_string();
+    }
+    skills
+        .into_iter()
+        .map(|skill| {
+            format!(
+                "{} | {} | {} | {}",
+                skill.name,
+                skill.source,
+                skill.path.display(),
+                skill.summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_skill_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    name: &str,
+    task: Option<&str>,
+    session: &SessionStore,
+) -> Result<String, String> {
+    let skills = discover_skills(&config.skill_sources(workspace));
+    let skill = resolve_skill(&skills, name)?;
+    let packet = runtime::build_skill_packet(skill, task);
+    let _ = session.append(
+        "skill_invocation",
+        json!({
+            "name": packet.skill.name,
+            "source": packet.skill.source,
+            "path": packet.skill.path.display().to_string(),
+            "task": packet.task,
+        }),
+    );
+    Ok(format!(
+        "skill: {}\nsource: {}\npath: {}\nsummary: {}\ntask: {}\n\n{}",
+        packet.skill.name,
+        packet.skill.source,
+        packet.skill.path.display(),
+        packet.skill.summary,
+        packet.task.as_deref().unwrap_or("-"),
+        packet.prompt
+    ))
+}
+
+fn render_mcp_text(workspace: &Path, config: &LoadedConfig) -> String {
+    let servers = discover_mcp_servers(&config.mcp_sources(workspace));
+    if servers.is_empty() {
+        return "no mcp servers configured\nexpected config file shape: .harness/mcp.json"
+            .to_string();
+    }
+    servers
+        .into_iter()
+        .map(|server| {
+            let location = server
+                .command
+                .as_ref()
+                .map(ToOwned::to_owned)
+                .or(server.url.as_ref().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "{} | {} | enabled={} | {} | {}",
+                server.name, server.transport, server.enabled, location, server.source
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_mcp_tools_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    server_name: &str,
+) -> Result<String, String> {
+    let servers = discover_mcp_servers(&config.mcp_sources(workspace));
+    let tools = list_mcp_tools(&servers, server_name)?;
+    if tools.is_empty() {
+        return Ok("no tools reported".to_string());
+    }
+    Ok(tools
+        .into_iter()
+        .map(|tool| format!("{} | {}", tool.name, tool.description.unwrap_or_else(|| "-".to_string())))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn render_mcp_call_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    server_name: &str,
+    tool_name: &str,
+    arguments: Option<&str>,
+    session: &SessionStore,
+) -> Result<String, String> {
+    let servers = discover_mcp_servers(&config.mcp_sources(workspace));
+    let parsed_arguments = match arguments {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|err| format!("invalid JSON arguments: {err}"))?,
+        None => json!({}),
+    };
+    let result = call_mcp_tool(&servers, server_name, tool_name, parsed_arguments.clone())?;
+    let _ = session.append(
+        "mcp_call",
+        json!({
+            "server": server_name,
+            "tool": tool_name,
+            "arguments": parsed_arguments,
+            "result": result,
+        }),
+    );
+    Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()))
+}
+
+fn maybe_run_custom_slash_command_tui(
+    workspace: &Path,
+    config: &LoadedConfig,
+    session: &SessionStore,
+    trimmed: &str,
+    current_model: &mut Option<String>,
+    mode: &mut PermissionMode,
+    approval_policy: &mut ApprovalPolicy,
+    ui: &mut TuiState,
+    custom_depth: usize,
+) -> Result<bool, String> {
+    let Some((name, args_raw)) = parse_slash_invocation(trimmed) else {
+        return Ok(false);
+    };
+    let commands = discover_slash_commands(workspace);
+    let Some(command) = resolve_slash_command(&commands, name) else {
+        return Ok(false);
+    };
+    validate_slash_command_args(command, args_raw)?;
+    let expanded = expand_slash_command(command, args_raw);
+    if expanded.is_empty() {
+        return Err(format!("custom command /{} expanded to no steps", command.name));
+    }
+    ui.push_system(format!(
+        "custom: /{} ({}, {})",
+        command.name,
+        command.kind.as_str(),
+        command.source
+    ));
+    let _ = session.append(
+        "custom_command",
+        json!({
+            "name": command.name,
+            "kind": command.kind.as_str(),
+            "source": command.source,
+            "args": args_raw,
+            "expanded_steps": expanded,
+        }),
+    );
+    for step in expanded {
+        ui.push_system(format!("step: {step}"));
+        let _ = session.append("custom_command_step", json!({ "command": step }));
+        match process_repl_input_tui(
+            workspace,
+            config,
+            session,
+            &step,
+            current_model,
+            mode,
+            approval_policy,
+            ui,
+            custom_depth,
+        ) {
+            ReplDirective::Continue => {}
+            ReplDirective::Exit => return Ok(true),
+        }
+    }
+    Ok(true)
+}
+
+fn run_prompt_capture(
+    workspace: &Path,
+    config: &LoadedConfig,
+    prompt: &str,
+    override_model: Option<&str>,
+    permission_mode: PermissionMode,
+    approval_policy: &mut ApprovalPolicy,
+    session: &SessionStore,
+    ui: &mut TuiState,
+) -> Result<String, String> {
+    match run_agent_loop(
+        config,
+        workspace,
+        prompt,
+        override_model,
+        permission_mode,
+        Some(session),
+        |request| approval_for_request_tui(request, approval_policy, session, ui),
+    ) {
+        Ok(reply) => {
+            let mut lines = vec![
+                format!("provider: {}", reply.provider.route.as_str()),
+                format!("model: {}", reply.provider.model),
+            ];
+            if reply.provider.text.starts_with("Not verified:") {
+                lines.push("verification: not verified".to_string());
+            }
+            if !reply.tool_events.is_empty() {
+                lines.push(String::new());
+                for (index, event) in reply.tool_events.iter().enumerate() {
+                    lines.push(format!(
+                        "tool[{index}] {} {}",
+                        event.name,
+                        serde_json::to_string(&event.arguments)
+                            .unwrap_or_else(|_| "{}".to_string())
+                    ));
+                    lines.push(event.summary.clone());
+                }
+            }
+            lines.push(String::new());
+            lines.push(reply.provider.text);
+            Ok(lines.join("\n"))
+        }
+        Err(errors) => {
+            let rendered = errors.join("\n");
+            let _ = session.append("prompt_error", json!({ "errors": errors }));
+            if let Ok(Some(handoff)) = pending_model_handoff(session.path()) {
+                let _ = session.append(
+                    "model_probe_failed",
+                    json!({
+                        "model": handoff.snapshot.to_model,
+                        "error": rendered,
+                    }),
+                );
+            }
+            Err(rendered)
+        }
+    }
+}
+
+fn approval_for_request_tui(
+    request: &ApprovalRequest,
+    approval_policy: &mut ApprovalPolicy,
+    session: &SessionStore,
+    _ui: &mut TuiState,
+) -> Result<ApprovalOutcome, String> {
+    let action = runtime::approval_action_for_policy(*approval_policy, request.risk);
+    match action {
+        ApprovalAction::AutoApprove => {
+            let _ = session.append(
+                "approval_result",
+                json!({
+                    "tool": request.tool,
+                    "risk": request.risk.as_str(),
+                    "decision": "auto-approve",
+                    "reason": request.reason,
+                }),
+            );
+            return Ok(ApprovalOutcome::Approve);
+        }
+        ApprovalAction::Deny => {
+            let reason = format!(
+                "blocked {}-risk tool `{}`: {}",
+                request.risk, request.tool, request.reason
+            );
+            let _ = session.append(
+                "approval_result",
+                json!({
+                    "tool": request.tool,
+                    "risk": request.risk.as_str(),
+                    "decision": "deny",
+                    "reason": reason,
+                }),
+            );
+            return Ok(ApprovalOutcome::Reject { reason });
+        }
+        ApprovalAction::Prompt => {}
+    }
+
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen, Show);
+    println!();
+    println!("approval required");
+    println!("tool: {}", request.tool);
+    println!("risk: {}", request.risk);
+    println!("why: {}", request.reason);
+    println!(
+        "arguments: {}",
+        serde_json::to_string_pretty(&request.arguments).unwrap_or_else(|_| "{}".to_string())
+    );
+    print!("approve? [y]es / [n]o / [a]uto: ");
+    let _ = io::stdout().flush();
+
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|err| err.to_string())?;
+
+    let _ = enable_raw_mode();
+    let _ = execute!(stdout, EnterAlternateScreen, Hide);
+
+    match line.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => {
+            let _ = session.append(
+                "approval_result",
+                json!({
+                    "tool": request.tool,
+                    "risk": request.risk.as_str(),
+                    "decision": "approve",
+                    "reason": request.reason,
+                }),
+            );
+            Ok(ApprovalOutcome::Approve)
+        }
+        "a" | "auto" => {
+            *approval_policy = ApprovalPolicy::Auto;
+            let _ = session.append(
+                "approval_change",
+                json!({ "policy": approval_policy.as_str(), "via": "interactive" }),
+            );
+            let _ = session.append(
+                "approval_result",
+                json!({
+                    "tool": request.tool,
+                    "risk": request.risk.as_str(),
+                    "decision": "approve",
+                    "reason": request.reason,
+                }),
+            );
+            Ok(ApprovalOutcome::Approve)
+        }
+        _ => {
+            let _ = session.append(
+                "approval_result",
+                json!({
+                    "tool": request.tool,
+                    "risk": request.risk.as_str(),
+                    "decision": "reject",
+                    "reason": request.reason,
+                }),
+            );
+            Ok(ApprovalOutcome::Reject {
+                reason: format!(
+                    "rejected by user for {}-risk tool `{}`",
+                    request.risk, request.tool
+                ),
+            })
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn print_repl_status(
     workspace: &Path,
     session: &SessionStore,
@@ -544,6 +1902,7 @@ fn print_model_status(workspace: &Path, config: &LoadedConfig, current_model: Op
     }
 }
 
+#[allow(dead_code)]
 fn print_login_status(workspace: &Path) {
     let registry = load_provider_registry(workspace).unwrap_or_default();
     println!("BYOK:");
@@ -556,13 +1915,14 @@ fn print_login_status(workspace: &Path) {
         }
     }
     println!("Next steps:");
-    println!("- `harness providers presets`");
-    println!("- `harness providers add <alias> --api-key <key>`");
+    println!("- `{} providers presets`", APP_NAME);
+    println!("- `{} providers add <alias> --api-key <key>`", APP_NAME);
     println!("- use `profile/<alias>/<model>` in `/model` or `prompt --model`");
     println!("External CLIs:");
-    println!("- run `harness doctor` to inspect `claude` and `codex` availability");
+    println!("- run `{} doctor` to inspect `claude` and `codex` availability", APP_NAME);
 }
 
+#[allow(dead_code)]
 fn print_repl_help() {
     println!("/help       show commands");
     println!("/status     show current session state");
@@ -712,6 +2072,7 @@ fn print_slash_command_show(workspace: &Path, name: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn print_saved_providers(workspace: &Path) {
     let registry = load_provider_registry(workspace).unwrap_or_default();
     if registry.profiles.is_empty() {
@@ -726,6 +2087,7 @@ fn print_saved_providers(workspace: &Path) {
     }
 }
 
+#[allow(dead_code)]
 fn maybe_run_custom_slash_command(
     workspace: &Path,
     config: &LoadedConfig,
@@ -936,6 +2298,7 @@ fn print_memory_search(workspace: &Path, query: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn save_latest_session_memory(workspace: &Path, session: &SessionStore) {
     match save_session_memory_bundle(workspace, session.path()) {
         Ok(bundle) => {
@@ -952,6 +2315,7 @@ fn save_latest_session_memory(workspace: &Path, session: &SessionStore) {
     }
 }
 
+#[allow(dead_code)]
 fn print_model_switch_summary(snapshot: &ModelHandoffSnapshot) {
     println!("active: {}", snapshot.to_model);
     println!(
@@ -1002,6 +2366,7 @@ fn build_context_dump(
     render_prompt_context(&context)
 }
 
+#[allow(dead_code)]
 fn handle_repl_tool_command(
     workspace: &Path,
     line: &str,
@@ -1049,7 +2414,7 @@ fn handle_model_command(workspace: &Path, config: &LoadedConfig, args: &[String]
         None | Some("show") => print_model_status(workspace, config, config.primary_model()),
         Some("set-primary") => {
             let Some(model) = args.get(1) else {
-                eprintln!("usage: harness model set-primary <spec>");
+                eprintln!("usage: {} model set-primary <spec>", APP_NAME);
                 std::process::exit(2);
             };
             let mut next = config.data.clone();
@@ -1077,7 +2442,7 @@ fn handle_memory_command(workspace: &Path, _config: &LoadedConfig, args: &[Strin
         None | Some("list") => print_memory_list(workspace),
         Some("show") => {
             let Some(index) = args.get(1) else {
-                eprintln!("usage: harness memory show <index>");
+                eprintln!("usage: {} memory show <index>", APP_NAME);
                 std::process::exit(2);
             };
             match parse_positive_index(index) {
@@ -1101,7 +2466,7 @@ fn handle_memory_command(workspace: &Path, _config: &LoadedConfig, args: &[Strin
         }
         Some("search") => {
             let Some(query) = args.get(1) else {
-                eprintln!("usage: harness memory search <query>");
+                eprintln!("usage: {} memory search <query>", APP_NAME);
                 std::process::exit(2);
             };
             print_memory_search(workspace, query);
@@ -1156,7 +2521,8 @@ fn handle_commands_command(workspace: &Path, args: &[String]) {
         Some("new") => {
             let Some(name) = args.get(1) else {
                 eprintln!(
-                    "usage: harness commands new <name> [alias|macro|prompt-template] [--global]"
+                    "usage: {} commands new <name> [alias|macro|prompt-template] [--global]",
+                    APP_NAME
                 );
                 std::process::exit(2);
             };
@@ -1169,7 +2535,7 @@ fn handle_commands_command(workspace: &Path, args: &[String]) {
         }
         Some("show") => {
             let Some(name) = args.get(1) else {
-                eprintln!("usage: harness commands show <name>");
+                eprintln!("usage: {} commands show <name>", APP_NAME);
                 std::process::exit(2);
             };
             print_slash_command_show(workspace, name);
@@ -1238,7 +2604,7 @@ fn handle_providers_command(workspace: &Path, args: &[String]) {
         Some("sync-env") => sync_provider_profiles_from_env(workspace),
         Some("detect-key") => {
             let Some(api_key) = args.get(1) else {
-                eprintln!("usage: harness providers detect-key <api-key>");
+                eprintln!("usage: {} providers detect-key <api-key>", APP_NAME);
                 std::process::exit(2);
             };
             match detect_provider_key(api_key) {
@@ -1257,7 +2623,7 @@ fn handle_providers_command(workspace: &Path, args: &[String]) {
         Some("add") => add_provider_profile_command(workspace, &args[1..]),
         Some("remove") => {
             let Some(alias) = args.get(1) else {
-                eprintln!("usage: harness providers remove <alias>");
+                eprintln!("usage: {} providers remove <alias>", APP_NAME);
                 std::process::exit(2);
             };
             match remove_provider_profile(workspace, alias) {
@@ -1373,7 +2739,8 @@ fn handle_handoff_command(workspace: &Path, args: &[String]) {
 fn add_provider_profile_command(workspace: &Path, args: &[String]) {
     let Some(alias) = args.first() else {
         eprintln!(
-            "usage: harness providers add <alias> --api-key <key> [--preset <name>] [--base-url <url>] [--route <openai-compat|anthropic|ollama>]"
+            "usage: {} providers add <alias> --api-key <key> [--preset <name>] [--base-url <url>] [--route <openai-compat|anthropic|ollama>]",
+            APP_NAME
         );
         std::process::exit(2);
     };
@@ -1585,14 +2952,14 @@ fn handle_skills_command(workspace: &Path, config: &LoadedConfig, args: &[String
         None | Some("list") => print_skills(workspace, config),
         Some("show") => {
             let Some(name) = args.get(1) else {
-                eprintln!("usage: harness skills show <name>");
+                eprintln!("usage: {} skills show <name>", APP_NAME);
                 std::process::exit(2);
             };
             show_skill(workspace, config, name);
         }
         Some("run") => {
             let Some(name) = args.get(1) else {
-                eprintln!("usage: harness skills run <name> [task...]");
+                eprintln!("usage: {} skills run <name> [task...]", APP_NAME);
                 std::process::exit(2);
             };
             let task = if args.len() > 2 {
@@ -1614,18 +2981,18 @@ fn handle_mcp_command(workspace: &Path, config: &LoadedConfig, args: &[String]) 
         None | Some("list") => print_mcp(workspace, config),
         Some("tools") => {
             let Some(name) = args.get(1) else {
-                eprintln!("usage: harness mcp tools <server>");
+                eprintln!("usage: {} mcp tools <server>", APP_NAME);
                 std::process::exit(2);
             };
             print_mcp_tools(workspace, config, name);
         }
         Some("call") => {
             let Some(server) = args.get(1) else {
-                eprintln!("usage: harness mcp call <server> <tool> [json-args]");
+                eprintln!("usage: {} mcp call <server> <tool> [json-args]", APP_NAME);
                 std::process::exit(2);
             };
             let Some(tool) = args.get(2) else {
-                eprintln!("usage: harness mcp call <server> <tool> [json-args]");
+                eprintln!("usage: {} mcp call <server> <tool> [json-args]", APP_NAME);
                 std::process::exit(2);
             };
             let arguments = if args.len() > 3 {
@@ -2167,6 +3534,7 @@ fn connection_mode_hint(mode: ConnectionMode) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn print_approval_status(policy: ApprovalPolicy) {
     println!("approval: {policy}");
     println!("behavior: {}", approval_policy_hint(policy));
@@ -2201,7 +3569,7 @@ fn parse_prompt_args(args: &[String]) -> (Option<String>, String) {
 }
 
 fn print_help() {
-    println!("harness");
+    println!("{APP_NAME}");
     println!();
     println!("commands:");
     println!("  repl        start interactive shell");

@@ -61,12 +61,15 @@ This repository currently contains:
 - compact prompt shaping for weaker local and open-weight model families such as Ollama, Qwen, Llama, Gemma, Mistral, Phi, and DeepSeek
 - model-aware context budget profiles with compact recall limits for smaller model families
 - runtime `api/auth/auto` target resolution for interactive and one-shot modes
+- a full-screen terminal REPL with a fixed bottom input bar and live slash-command suggestions
 
 Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/ROADMAP.md).
 
 ## Commands
 
 ```bash
+cargo run -p cli --bin 3122 -- repl
+./target/debug/3122 repl
 cargo run -p cli -- doctor
 cargo run -p cli -- config
 cargo run -p cli -- model show
@@ -168,6 +171,9 @@ Verification behavior:
 REPL shape:
 
 - the base flow is closer to Codex/Claude-style slash commands
+- the default interactive shell now opens in a cleared alternate screen
+- the input line stays pinned to the bottom of the terminal
+- typing `/` shows matching slash commands above the input line
 - primary session commands are `/status`, `/model`, `/login`, `/memory`, `/resume`, `/handoff`, `/why-context`, `/approval`, `/doctor`
 - custom slash commands are loaded from `~/.harness/commands/*.toml` and `.harness/commands/*.toml`
 - built-in shortcut commands are always available first, then `global`, then `workspace`
