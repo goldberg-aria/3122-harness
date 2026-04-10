@@ -604,6 +604,7 @@ impl NexusCloudBackend {
             .request(method, url)
             .bearer_auth(self.api_key()?)
             .header(header::ACCEPT, "application/json")
+            .header("X-AMCP-Agent-Name", "3122-harness")
             .header("X-Nexus-Agent-Name", "3122-harness");
         if let Some(namespace) = self.namespace.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
             request = request.header("X-Workspace-Id", namespace);
@@ -1133,6 +1134,7 @@ mod tests {
         assert_eq!(captured[0].0, "POST");
         assert_eq!(captured[0].1, "/v1/amcp/remember");
         assert!(first_headers.contains("authorization: bearer nxs_test_key"));
+        assert!(first_headers.contains("x-amcp-agent-name: 3122-harness"));
         assert!(first_headers.contains("x-nexus-agent-name: 3122-harness"));
         assert!(first_headers.contains("x-workspace-id: workspace-a"));
         assert!(captured[0].3.contains("\"created_at\":\"1970-01-01T00:00:00"));
