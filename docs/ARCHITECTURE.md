@@ -53,21 +53,22 @@ The harness should encode operational rules that keep weaker models useful and s
 
 - parity with every Claude Code feature
 - full TUI polish
-- cloud bridge mode
 - multi-agent orchestration
 - hooks and plugins
 - full MCP lifecycle management
-- Nexus account login or cloud sync
+- Norfolk or MaaS direct hosted backend support
 
 ## Memory spine
 
-Local memory now has two layers:
+Local memory now has three layers:
 
 - JSONL transcripts under `.harness/sessions/`
 - SQLite trajectory memory under `.harness/memory.db`
+- AMCP-native portable memory backends behind one runtime interface
 
 The transcript is the raw event log.
-The trajectory store is the compressed operational memory used for recall.
+The trajectory store is the compressed operational memory used for continuity.
+The AMCP backend is the portable memory layer used for durable recall, export/import, and backend migration.
 
 Trajectory rows capture:
 
@@ -86,6 +87,32 @@ This is the main continuity layer for `/resume`, `/handoff`, `/why-context`, and
 
 The same store also tracks repeated tool sequences as `skill_candidates`.
 Candidates are suggested first and only become reusable slash commands when promoted.
+
+Portable memory records are serialized in one AMCP core shape across all backends:
+
+- `id`
+- `content`
+- `type`
+- `scope`
+- `origin`
+- `visibility`
+- `retention`
+- `tags`
+- `metadata`
+- `source_refs`
+- `energy`
+- `created_at`
+- `updated_at`
+
+The local backend is the default.
+`nexus-cloud` and `third-party-amcp` share the same external item schema and can be swapped in through config without rewriting prompt assembly.
+
+Current hosted implementation:
+
+- `nexus-cloud` is wired to the Nexus `/v1/amcp` contract
+- the harness sends one AMCP item shape in local and hosted modes
+- hosted sessions come from `GET /v1/amcp/sessions` and `GET /v1/amcp/sessions/:id`
+- hosted chain items may include continuity fields, but the harness only requires AMCP core plus optional profile fields
 
 ## Core loop
 

@@ -107,10 +107,10 @@ Deliverables:
 
 - `.harness/memory/` layout
 - `.harness/memory.db` trajectory store
-- memory record schema
+- AMCP-native portable memory schema
+- backend abstraction for local and hosted AMCP storage
 - save/search/list/prune operations
-- `rg`-based recall
-- session summary promotion into memory
+- session summary promotion into AMCP items
 - trajectory compression and FTS search
 - skill candidate detection and promotion
 

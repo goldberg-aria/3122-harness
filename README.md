@@ -1,4 +1,6 @@
-# Coding Agent Harness
+# 3122
+
+AMCP-native, model-neutral coding harness.
 
 Terminal-first coding agent harness scaffold.
 
@@ -41,6 +43,7 @@ This repository currently contains:
 - external adapter clients for `claude` and `codex`
 - JSONL session files under `.harness/sessions/`
 - SQLite-backed trajectory memory under `.harness/memory.db`
+- AMCP-native portable memory records stored alongside trajectory state in `.harness/memory.db`
 - built-in tool surfaces for `read`, `write`, `edit`, `grep`, `glob`, and `exec`
 - skill discovery across project and user skill folders
 - skill resolution and prompt-packet generation through `skills show/run` and `/skill`
@@ -58,6 +61,7 @@ This repository currently contains:
 - automatic model-switch handoff snapshots with first-turn context boost
 - trajectory indexing that compresses work into goal, attempt, failure, verification, and next-step state
 - repeated workflow detection with promotable skill candidates
+- `nexus-cloud` hosted memory transport over the Nexus `/v1/amcp` surface
 - runtime unit tests covering config, permissions, providers, skills, MCP, the harness loop, and verifier behavior
 - env-gated live provider tests for Anthropic, OpenAI-compatible, and Ollama
 - more readable CLI status, memory, approval, and verification feedback
@@ -82,6 +86,9 @@ cargo run -p cli -- memory show 1
 cargo run -p cli -- memory recall 6
 cargo run -p cli -- memory save
 cargo run -p cli -- memory search provider
+cargo run -p cli -- memory export --format amcp-jsonl --output memory-export.jsonl
+cargo run -p cli -- memory import --format amcp-jsonl --input memory-export.jsonl
+cargo run -p cli -- memory migrate --from local-amcp --to nexus-cloud
 cargo run -p cli -- trajectory
 cargo run -p cli -- trajectory active
 cargo run -p cli -- trajectory search provider
@@ -115,6 +122,31 @@ cargo run -p cli -- session latest
 cargo run -p cli -- tool read README.md
 cargo run -p cli -- repl
 ```
+
+## Hosted memory
+
+`nexus-cloud` is the first hosted portable memory backend.
+It uses the same AMCP item shape as `local-amcp` and talks to Nexus over `/v1/amcp`.
+
+Example config:
+
+```toml
+[memory]
+backend = "nexus-cloud"
+dual_write_legacy_jsonl = true
+
+[memory.nexus_cloud]
+endpoint = "https://nexus-api.example.com"
+api_key_env = "NEXUS_API_KEY"
+namespace = "workspace-default"
+```
+
+Runtime rules:
+
+- the endpoint is the API host, not the web host
+- the raw key stays in the environment variable named by `api_key_env`
+- `memory migrate --from local-amcp --to nexus-cloud` moves portable AMCP items only
+- transcripts and trajectory continuity remain local runtime state
 
 ## Tool-call protocol
 
@@ -229,8 +261,11 @@ Template placeholders:
 
 Local-Lite memory:
 
-- `memory save` promotes the latest session into local memory
+- `memory save` promotes the latest session into AMCP-native portable memory
 - trajectory state is stored in `.harness/memory.db`
+- portable memory uses one AMCP item shape across local and hosted backends
+- `[memory].backend` selects `local-amcp`, `nexus-cloud`, or `third-party-amcp`
+- `[memory].dual_write_legacy_jsonl = true` keeps `.harness/memory/*.jsonl` compatibility files during migration
 - `trajectory` lists recent compressed work trajectories
 - `trajectory active` shows the current active trajectory with files, failure, and verification hints
 - `trajectory search <query>` runs local FTS search across stored trajectories
@@ -239,6 +274,9 @@ Local-Lite memory:
 - `memory show <index>` prints one saved memory record with tags and source session
 - `memory recall [limit]` prints the exact recall block the harness would inject
 - `memory search <query>` searches saved memory locally
+- `memory export --format amcp-jsonl` exports portable memory in AMCP JSONL
+- `memory import --format amcp-jsonl` imports portable memory into the selected backend
+- `memory migrate --from <backend> --to <backend>` moves AMCP items between backends
 - `resume` and `handoff` render session and handoff state back into operator-friendly text
 - `handoff debug` shows the latest structured handoff snapshot plus pending boost state
 - `why-context` prints the exact runtime context injected before a model turn

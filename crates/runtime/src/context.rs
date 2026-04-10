@@ -128,7 +128,7 @@ pub fn gather_workspace_context(
             .unwrap_or_else(|_| "none".to_string()),
         conversation_recall: build_conversation_recall(config, workspace_root, user_query)
             .unwrap_or_else(|_| "none".to_string()),
-        recall_reason: build_recall_reason(workspace_root, user_query),
+        recall_reason: build_recall_reason(workspace_root, user_query, config),
     }
 }
 
@@ -401,8 +401,16 @@ fn context_budget_profile(model: Option<&str>) -> ContextBudgetProfile {
     }
 }
 
-fn build_recall_reason(workspace_root: &Path, user_query: Option<&str>) -> String {
+fn build_recall_reason(
+    workspace_root: &Path,
+    user_query: Option<&str>,
+    config: &LoadedConfig,
+) -> String {
     let mut reasons = vec!["active trajectory is always prioritized".to_string()];
+    reasons.push(format!(
+        "portable recall is routed through {}",
+        config.memory_backend()
+    ));
     if let Some(query) = user_query.map(str::trim).filter(|value| !value.is_empty()) {
         if query.contains('/') || query.contains('.') {
             reasons.push("query mentions file-like tokens, so file memory was preferred".to_string());

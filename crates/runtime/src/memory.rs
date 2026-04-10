@@ -4,10 +4,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-
 use crate::session::SessionEvent;
 use crate::SessionStore;
-use crate::{active_trajectory, build_trajectory_recall_text, record_session_trajectory};
+use crate::{
+    active_trajectory, build_trajectory_recall_text, current_timestamp_iso, default_local_origin,
+    default_local_scope, default_private_retention, load_config, metadata_legacy_kind,
+    metadata_title, record_session_trajectory, resolve_selected_memory_backend,
+    session_key_for_item, source_ref_uri, timestamp_millis, AmcpMemoryItem, AmcpSourceRef,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryKind {
@@ -118,28 +122,239 @@ pub fn append_memory_record(
     tags: &[String],
     session_path: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    let dir = memory_dir(workspace_root);
-    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join(kind.file_name());
-    let record = MemoryRecord {
-        ts_ms: now_ms(),
-        kind: kind.as_str().to_string(),
-        title: title.to_string(),
-        body: body.to_string(),
-        tags: tags.to_vec(),
-        session_path: session_path.map(|path| path.display().to_string()),
-    };
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|err| err.to_string())?;
-    let line = serde_json::to_string(&record).map_err(|err| err.to_string())?;
-    writeln!(file, "{line}").map_err(|err| err.to_string())?;
-    Ok(path)
+    let config = load_config(workspace_root).unwrap_or_default();
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    let item = build_amcp_item(
+        kind,
+        title,
+        body,
+        tags,
+        session_path,
+        &[],
+        session_path.and_then(|path| SessionStore::session_id_from_path(path)),
+    );
+    let _ = backend.remember(&item)?;
+    let record = memory_record_from_item(&item);
+    if config.dual_write_legacy_jsonl() {
+        append_legacy_memory_record(workspace_root, &record)?;
+        return Ok(memory_dir(workspace_root).join(kind.file_name()));
+    }
+    Ok(crate::memory_db_path(workspace_root))
 }
 
 pub fn list_memory_records(workspace_root: &Path) -> Result<Vec<MemoryRecord>, String> {
+    let config = load_config(workspace_root).unwrap_or_default();
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    let mut records = backend
+        .export_items()?
+        .into_iter()
+        .map(|item| memory_record_from_item(&item))
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| right.ts_ms.cmp(&left.ts_ms));
+    Ok(records)
+}
+
+pub fn search_memory_records(
+    workspace_root: &Path,
+    query: &str,
+) -> Result<Vec<MemoryRecord>, String> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let config = load_config(workspace_root).unwrap_or_default();
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    Ok(backend
+        .recall(Some(&query), 24)?
+        .into_iter()
+        .map(|item| memory_record_from_item(&item))
+        .collect())
+}
+
+pub fn save_session_summary(
+    workspace_root: &Path,
+    session_path: &Path,
+) -> Result<(PathBuf, MemoryRecord), String> {
+    let events = SessionStore::read_events(session_path)?;
+    let _ = record_session_trajectory(workspace_root, session_path);
+    let digest = summarize_session_events(&events);
+    let trajectory = active_trajectory(workspace_root).ok().flatten();
+    let item = build_amcp_item(
+        MemoryKind::Summary,
+        &digest.title,
+        &digest.summary,
+        &digest.tools,
+        Some(session_path),
+        &trajectory
+            .as_ref()
+            .map(|record| record.active_files.clone())
+            .unwrap_or_default(),
+        SessionStore::session_id_from_path(session_path),
+    );
+    let record = memory_record_from_item(&item);
+    let config = load_config(workspace_root).unwrap_or_default();
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    let _ = backend.remember(&item)?;
+    let path = if config.dual_write_legacy_jsonl() {
+        append_legacy_memory_if_missing(workspace_root, &record)?;
+        memory_dir(workspace_root).join(MemoryKind::Summary.file_name())
+    } else {
+        crate::memory_db_path(workspace_root)
+    };
+    Ok((path, record))
+}
+
+pub fn save_session_memory_bundle(
+    workspace_root: &Path,
+    session_path: &Path,
+) -> Result<SavedMemoryBundle, String> {
+    let events = SessionStore::read_events(session_path)?;
+    let trajectory = record_session_trajectory(workspace_root, session_path).ok();
+    let digest = summarize_session_events(&events);
+    let config = load_config(workspace_root).unwrap_or_default();
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    let mut saved_records = Vec::new();
+
+    let file_paths = trajectory
+        .as_ref()
+        .map(|record| record.active_files.clone())
+        .unwrap_or_default();
+    let session_id = SessionStore::session_id_from_path(session_path);
+
+    let summary_item = build_amcp_item(
+        MemoryKind::Summary,
+        &digest.title,
+        &digest.summary,
+        &digest.tools,
+        Some(session_path),
+        &file_paths,
+        session_id.clone(),
+    );
+    if backend.remember(&summary_item)? {
+        let record = memory_record_from_item(&summary_item);
+        saved_records.push(record);
+    }
+    if config.dual_write_legacy_jsonl() {
+        append_legacy_memory_if_missing(workspace_root, &memory_record_from_item(&summary_item))?;
+    }
+
+    for goal in &digest.goals {
+        let item = build_amcp_item(
+            MemoryKind::Task,
+            goal,
+            goal,
+            &digest.tools,
+            Some(session_path),
+            &file_paths,
+            session_id.clone(),
+        );
+        if backend.remember(&item)? {
+            saved_records.push(memory_record_from_item(&item));
+        }
+        if config.dual_write_legacy_jsonl() {
+            append_legacy_memory_if_missing(workspace_root, &memory_record_from_item(&item))?;
+        }
+    }
+
+    for error in &digest.errors {
+        let item = build_amcp_item(
+            MemoryKind::Error,
+            error,
+            error,
+            &digest.tools,
+            Some(session_path),
+            &file_paths,
+            session_id.clone(),
+        );
+        if backend.remember(&item)? {
+            saved_records.push(memory_record_from_item(&item));
+        }
+        if config.dual_write_legacy_jsonl() {
+            append_legacy_memory_if_missing(workspace_root, &memory_record_from_item(&item))?;
+        }
+    }
+
+    Ok(SavedMemoryBundle { saved_records })
+}
+
+fn build_amcp_item(
+    kind: MemoryKind,
+    title: &str,
+    body: &str,
+    tags: &[String],
+    session_path: Option<&Path>,
+    file_paths: &[String],
+    session_id: Option<String>,
+) -> AmcpMemoryItem {
+    let timestamp = now_ms();
+    let timestamp_iso = current_timestamp_iso();
+    let session_text = session_path.map(|path| path.display().to_string());
+    let stable_seed = format!(
+        "{}|{}|{}|{}",
+        kind.as_str(),
+        title,
+        body,
+        session_text.as_deref().unwrap_or("-")
+    );
+    let mut source_refs = Vec::new();
+    if let Some(path) = session_path {
+        source_refs.push(AmcpSourceRef {
+            kind: "session".to_string(),
+            uri: source_ref_uri(path),
+        });
+    }
+    for path in file_paths {
+        if path.trim().is_empty() {
+            continue;
+        }
+        source_refs.push(AmcpSourceRef {
+            kind: "file".to_string(),
+            uri: format!("file://{path}"),
+        });
+    }
+    AmcpMemoryItem {
+        id: format!("amcp-{}", stable_hex_hash(&stable_seed)),
+        content: body.to_string(),
+        item_type: portable_item_type(kind).to_string(),
+        scope: default_local_scope(),
+        origin: default_local_origin(session_id.as_deref(), timestamp),
+        visibility: "private".to_string(),
+        retention: default_private_retention(),
+        tags: tags.to_vec(),
+        metadata: crate::portable_memory::default_semantic_metadata(
+            title,
+            kind.as_str(),
+            session_text.as_deref(),
+        ),
+        source_refs,
+        energy: 1.0,
+        created_at: timestamp_iso.clone(),
+        updated_at: timestamp_iso,
+    }
+}
+
+fn portable_item_type(kind: MemoryKind) -> &'static str {
+    match kind {
+        MemoryKind::Summary | MemoryKind::Note => "context",
+        MemoryKind::Decision => "decision",
+        MemoryKind::Task => "task",
+        MemoryKind::Error => "error",
+    }
+}
+
+fn memory_record_from_item(item: &AmcpMemoryItem) -> MemoryRecord {
+    MemoryRecord {
+        ts_ms: timestamp_millis(&item.updated_at).unwrap_or_default(),
+        kind: metadata_legacy_kind(item),
+        title: metadata_title(item),
+        body: item.content.clone(),
+        tags: item.tags.clone(),
+        session_path: session_key_for_item(item).map(|value| value.replacen("file://", "", 1)),
+    }
+}
+
+fn legacy_list_memory_records(workspace_root: &Path) -> Result<Vec<MemoryRecord>, String> {
     let dir = memory_dir(workspace_root);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -162,119 +377,58 @@ pub fn list_memory_records(workspace_root: &Path) -> Result<Vec<MemoryRecord>, S
     Ok(records)
 }
 
-pub fn search_memory_records(
+fn append_legacy_memory_record(
     workspace_root: &Path,
-    query: &str,
-) -> Result<Vec<MemoryRecord>, String> {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    Ok(list_memory_records(workspace_root)?
-        .into_iter()
-        .filter(|record| {
-            record.title.to_ascii_lowercase().contains(&query)
-                || record.body.to_ascii_lowercase().contains(&query)
-                || record
-                    .tags
-                    .iter()
-                    .any(|tag| tag.to_ascii_lowercase().contains(&query))
-        })
-        .collect())
+    record: &MemoryRecord,
+) -> Result<PathBuf, String> {
+    let dir = memory_dir(workspace_root);
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join(legacy_file_name_for_kind(&record.kind));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| err.to_string())?;
+    let line = serde_json::to_string(record).map_err(|err| err.to_string())?;
+    writeln!(file, "{line}").map_err(|err| err.to_string())?;
+    Ok(path)
 }
 
-pub fn save_session_summary(
+fn append_legacy_memory_if_missing(
     workspace_root: &Path,
-    session_path: &Path,
-) -> Result<(PathBuf, MemoryRecord), String> {
-    let events = SessionStore::read_events(session_path)?;
-    let digest = summarize_session_events(&events);
-    let tags = digest.tools.clone();
-    let path = append_memory_record(
-        workspace_root,
-        MemoryKind::Summary,
-        &digest.title,
-        &digest.summary,
-        &tags,
-        Some(session_path),
-    )?;
-    let record = list_memory_records(workspace_root)?
-        .into_iter()
-        .find(|record| {
-            record.kind == MemoryKind::Summary.as_str()
-                && record.session_path.as_deref() == Some(&session_path.display().to_string())
-        })
-        .ok_or_else(|| "failed to reload saved session summary".to_string())?;
-    Ok((path, record))
+    record: &MemoryRecord,
+) -> Result<(), String> {
+    let existing = legacy_list_memory_records(workspace_root)?;
+    let session_path = record.session_path.as_deref().unwrap_or("-");
+    if existing.iter().any(|candidate| {
+        candidate.kind == record.kind
+            && candidate.title == record.title
+            && candidate.session_path.as_deref().unwrap_or("-") == session_path
+    }) {
+        return Ok(());
+    }
+    let _ = append_legacy_memory_record(workspace_root, record)?;
+    Ok(())
 }
 
-pub fn save_session_memory_bundle(
-    workspace_root: &Path,
-    session_path: &Path,
-) -> Result<SavedMemoryBundle, String> {
-    let events = SessionStore::read_events(session_path)?;
-    let _ = record_session_trajectory(workspace_root, session_path);
-    let digest = summarize_session_events(&events);
-    let existing = list_memory_records(workspace_root)?;
-    let session_path_rendered = session_path.display().to_string();
-    let mut saved_records = Vec::new();
-
-    if !record_exists(
-        &existing,
-        MemoryKind::Summary,
-        &digest.title,
-        &session_path_rendered,
-    ) {
-        let (_, record) = save_session_summary(workspace_root, session_path)?;
-        saved_records.push(record);
+fn legacy_file_name_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "summary" => "summaries.jsonl",
+        "decision" => "decisions.jsonl",
+        "task" => "tasks.jsonl",
+        "error" => "errors.jsonl",
+        "note" | "context" | "artifact" => "notes.jsonl",
+        _ => "notes.jsonl",
     }
+}
 
-    for goal in &digest.goals {
-        if record_exists(&existing, MemoryKind::Task, goal, &session_path_rendered) {
-            continue;
-        }
-        append_memory_record(
-            workspace_root,
-            MemoryKind::Task,
-            goal,
-            goal,
-            &digest.tools,
-            Some(session_path),
-        )?;
-        saved_records.push(MemoryRecord {
-            ts_ms: now_ms(),
-            kind: MemoryKind::Task.as_str().to_string(),
-            title: goal.clone(),
-            body: goal.clone(),
-            tags: digest.tools.clone(),
-            session_path: Some(session_path_rendered.clone()),
-        });
+fn stable_hex_hash(input: &str) -> String {
+    let mut hash = 1469598103934665603u64;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
     }
-
-    for error in &digest.errors {
-        if record_exists(&existing, MemoryKind::Error, error, &session_path_rendered) {
-            continue;
-        }
-        append_memory_record(
-            workspace_root,
-            MemoryKind::Error,
-            error,
-            error,
-            &digest.tools,
-            Some(session_path),
-        )?;
-        saved_records.push(MemoryRecord {
-            ts_ms: now_ms(),
-            kind: MemoryKind::Error.as_str().to_string(),
-            title: error.clone(),
-            body: error.clone(),
-            tags: digest.tools.clone(),
-            session_path: Some(session_path_rendered.clone()),
-        });
-    }
-
-    Ok(SavedMemoryBundle { saved_records })
+    format!("{hash:016x}")
 }
 
 pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
@@ -293,7 +447,7 @@ pub fn build_resume_text(workspace_root: &Path) -> Result<String, String> {
         .map(latest_model_handoff)
         .transpose()?
         .flatten();
-    let memories = list_memory_records(workspace_root)?;
+    let memories = list_memory_records(workspace_root).unwrap_or_default();
     let latest_summary = memories
         .iter()
         .find(|record| record.kind == MemoryKind::Summary.as_str());
@@ -410,7 +564,8 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
         .map(SessionStore::read_events)
         .transpose()?
         .map(|events| summarize_session_events(&events));
-    let summary_record = list_memory_records(workspace_root)?
+    let summary_record = list_memory_records(workspace_root)
+        .unwrap_or_default()
         .into_iter()
         .find(|record| record.kind == MemoryKind::Summary.as_str());
     let latest_handoff = latest_session
@@ -471,14 +626,17 @@ pub fn build_memory_recall_text(workspace_root: &Path, limit: usize) -> Result<S
             return Ok(text);
         }
     }
-    let records = list_memory_records(workspace_root)?;
-    if records.is_empty() {
+    let config = load_config(workspace_root).unwrap_or_default();
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    let items = backend.recall(None, limit.max(1))?;
+    if items.is_empty() {
         return Ok("none".to_string());
     }
 
     let mut deduped = Vec::new();
     let mut seen = HashSet::new();
-    for record in records {
+    for item in items {
+        let record = memory_record_from_item(&item);
         let key = format!("{}|{}|{}", record.kind, record.title, record.body);
         if seen.insert(key) {
             deduped.push(record);
@@ -505,7 +663,7 @@ pub fn build_model_handoff_snapshot(
 ) -> Result<ModelHandoffSnapshot, String> {
     let events = SessionStore::read_events(session_path)?;
     let digest = summarize_session_events(&events);
-    let records = list_memory_records(workspace_root)?;
+    let records = list_memory_records(workspace_root).unwrap_or_default();
     let active_trajectory = active_trajectory(workspace_root)?;
 
     let latest_summary = records
@@ -844,19 +1002,6 @@ fn truncate_text(input: &str, max_chars: usize) -> String {
     }
     let shortened = trimmed.chars().take(max_chars).collect::<String>();
     format!("{shortened}...")
-}
-
-fn record_exists(
-    existing: &[MemoryRecord],
-    kind: MemoryKind,
-    title: &str,
-    session_path: &str,
-) -> bool {
-    existing.iter().any(|record| {
-        record.kind == kind.as_str()
-            && record.title == title
-            && record.session_path.as_deref() == Some(session_path)
-    })
 }
 
 fn now_ms() -> u128 {

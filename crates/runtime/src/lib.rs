@@ -8,6 +8,7 @@ mod envfile;
 mod mcp;
 mod memory;
 mod permissions;
+mod portable_memory;
 mod profiles;
 mod provider;
 mod session;
@@ -45,6 +46,15 @@ pub use memory::{
     memory_dir, pending_model_handoff, render_model_handoff_text, save_session_memory_bundle,
     save_session_summary, search_memory_records, summarize_session_events, MemoryKind,
     MemoryRecord, ModelHandoffSnapshot, SavedMemoryBundle, SessionDigest, StoredModelHandoff,
+};
+pub use portable_memory::{
+    current_timestamp_iso, default_local_origin, default_local_scope, default_private_retention,
+    export_backend_jsonl, export_items_jsonl, import_backend_jsonl, iso_timestamp_from_millis,
+    metadata_legacy_kind, metadata_title, migrate_backend_items, parse_items_jsonl,
+    resolve_memory_backend_kind, resolve_selected_memory_backend, selected_backend_kind,
+    session_key_for_item, source_ref_uri, timestamp_millis, truncate_chars, AmcpMemoryBackend,
+    AmcpMemoryItem, AmcpOrigin, AmcpRetention, AmcpScope, AmcpSessionRef, AmcpSourceRef,
+    MemoryBackendKind,
 };
 pub use permissions::{can_exec, can_read, can_write, PermissionDecision, PermissionMode};
 pub use profiles::{

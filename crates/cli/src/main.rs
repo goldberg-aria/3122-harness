@@ -15,17 +15,18 @@ use runtime::{
     build_memory_recall_text, build_model_handoff_snapshot, build_resume_text, call_mcp_tool,
     create_slash_command_template, detect_provider_key, discover_mcp_servers, discover_skills,
     discover_slash_commands, doctor_report, edit_file, exec_command, expand_slash_command,
-    gather_workspace_context, glob_search, grep_search, init_slash_command_dir,
-    latest_model_handoff, list_mcp_tools, list_memory_records, list_recent_trajectories,
-    list_skill_candidates, load_config, load_provider_registry, parallel_read_only,
-    pending_model_handoff, provider_preset, provider_presets, read_file, remove_provider_profile,
-    promote_skill_candidate, record_session_trajectory, render_prompt_context, resolve_skill,
+    export_backend_jsonl, gather_workspace_context, glob_search, grep_search,
+    import_backend_jsonl, init_slash_command_dir, latest_model_handoff, list_mcp_tools,
+    list_memory_records, list_recent_trajectories, list_skill_candidates, load_config,
+    load_provider_registry, migrate_backend_items, parallel_read_only, pending_model_handoff,
+    promote_skill_candidate, provider_preset, provider_presets, read_file,
+    remove_provider_profile, record_session_trajectory, render_prompt_context, resolve_skill,
     resolve_slash_command, run_agent_loop, save_config, save_session_memory_bundle,
     search_memory_records, search_trajectories, slash_command_dir, upsert_provider_profile,
     validate_slash_command_args, write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy,
-    ApprovalRequest, ConnectionMode, LoadedConfig, MemoryRecord, ModelHandoffSnapshot,
-    PermissionMode, SavedProviderProfile, SessionStore, SlashCommandKind,
-    SlashCommandScope, ToolOutput, TrajectoryRecord, VerificationPolicy,
+    ApprovalRequest, ConnectionMode, LoadedConfig, MemoryBackendKind, MemoryRecord,
+    ModelHandoffSnapshot, PermissionMode, SavedProviderProfile, SessionStore,
+    SlashCommandKind, SlashCommandScope, ToolOutput, TrajectoryRecord, VerificationPolicy,
 };
 use serde_json::json;
 
@@ -616,7 +617,7 @@ fn core_slash_suggestions() -> Vec<SlashSuggestion> {
         ("resume", "Show latest session resume summary"),
         ("handoff", "Print the latest handoff block"),
         ("why-context", "Show the current prompt context"),
-        ("memory", "List, recall, search, or save local memory"),
+        ("memory", "List, recall, search, save, export, import, or migrate portable memory"),
         ("trajectory", "Inspect active and recent trajectories"),
         ("commands", "List custom slash commands"),
         ("login", "Show provider setup hints"),
@@ -936,6 +937,43 @@ fn process_repl_input_tui(
         ui.push_result(render_memory_search_text(workspace, query));
         return ReplDirective::Continue;
     }
+    if let Some(rest) = trimmed.strip_prefix("/memory export").map(str::trim) {
+        let args = rest
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        match parse_memory_export_args(&args) {
+            Ok((_format, output)) => {
+                ui.push_result(render_memory_export_text(workspace, config, output.as_deref()))
+            }
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/memory import").map(str::trim) {
+        let args = rest
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        match parse_memory_import_args(&args) {
+            Ok((_format, input)) => {
+                ui.push_result(render_memory_import_text(workspace, config, &input))
+            }
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/memory migrate").map(str::trim) {
+        let args = rest
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        match parse_memory_migrate_args(&args) {
+            Ok((from, to)) => ui.push_result(render_memory_migrate_text(workspace, config, from, to)),
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
     if trimmed == "/trajectory active" {
         ui.push_result(render_active_trajectory_text(workspace));
         return ReplDirective::Continue;
@@ -1234,6 +1272,39 @@ fn handle_repl_line(
         print_memory_search(workspace, query);
         return ReplDirective::Continue;
     }
+    if let Some(rest) = trimmed.strip_prefix("/memory export").map(str::trim) {
+        let args = rest
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        match parse_memory_export_args(&args) {
+            Ok((_format, output)) => print_memory_export(workspace, config, output.as_deref()),
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/memory import").map(str::trim) {
+        let args = rest
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        match parse_memory_import_args(&args) {
+            Ok((_format, input)) => print_memory_import(workspace, config, &input),
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/memory migrate").map(str::trim) {
+        let args = rest
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        match parse_memory_migrate_args(&args) {
+            Ok((from, to)) => print_memory_migrate(workspace, config, from, to),
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
     if trimmed == "/trajectory active" {
         print_active_trajectory(workspace);
         return ReplDirective::Continue;
@@ -1365,10 +1436,10 @@ fn render_repl_help_text() -> String {
         "/handoff    print a handoff block",
         "/handoff debug inspect the latest handoff state",
         "/why-context show the current prompt context",
-        "/memory     list/search/save local memory",
+        "/memory     list/search/save/export/import/migrate portable memory",
         "/trajectory inspect active and recent trajectories",
         "/memory show inspect one recent memory record",
-        "/memory recall print rendered recall text",
+        "/memory recall print rendered portable recall text",
         "/skills suggest list repeated workflow candidates",
         "/skills promote create a prompt-template from a candidate",
         "/commands   list custom slash commands",
@@ -1443,6 +1514,10 @@ fn render_repl_status_text(
     lines.push(format!(
         "verification_behavior: {}",
         verification_policy_hint(verification_policy)
+    ));
+    lines.push(format!(
+        "memory_backend: {}",
+        config_memory_backend_label(workspace)
     ));
     lines.push(format!("saved_providers: {provider_count}"));
     lines.push(format!("memory_records: {}", memory_records.len()));
@@ -1750,12 +1825,24 @@ fn render_init_text(
     Ok(lines.join("\n"))
 }
 
+fn config_memory_backend_label(workspace: &Path) -> String {
+    load_config(workspace)
+        .map(|config| config.memory_backend().to_string())
+        .unwrap_or_else(|_| "local-amcp".to_string())
+}
+
 fn render_memory_list_text(workspace: &Path) -> Result<String, String> {
     let records = list_memory_records(workspace)?;
     if records.is_empty() {
-        return Ok("no memory records".to_string());
+        return Ok(format!(
+            "memory_backend: {}\nno memory records",
+            config_memory_backend_label(workspace)
+        ));
     }
-    let mut lines = vec![format!("memory_records: {}", records.len())];
+    let mut lines = vec![
+        format!("memory_backend: {}", config_memory_backend_label(workspace)),
+        format!("memory_records: {}", records.len()),
+    ];
     let (summaries, decisions, tasks, errors, notes) = memory_kind_counts(&records);
     lines.push(format!(
         "kinds: summary={} decision={} task={} error={} note={}",
@@ -1950,6 +2037,60 @@ fn render_memory_search_text(workspace: &Path, query: &str) -> Result<String, St
         lines.push(String::new());
     }
     Ok(lines.join("\n"))
+}
+
+fn render_memory_export_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    output: Option<&Path>,
+) -> Result<String, String> {
+    let rendered = export_backend_jsonl(
+        workspace,
+        config,
+        parse_memory_backend_kind(config.memory_backend())?,
+    )?;
+    if let Some(path) = output {
+        std::fs::write(path, &rendered).map_err(|err| err.to_string())?;
+        return Ok(format!(
+            "exported portable memory\nbackend: {}\nformat: amcp-jsonl\npath: {}",
+            config.memory_backend(),
+            path.display()
+        ));
+    }
+    Ok(rendered)
+}
+
+fn render_memory_import_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    input: &Path,
+) -> Result<String, String> {
+    let contents = std::fs::read_to_string(input).map_err(|err| err.to_string())?;
+    let imported = import_backend_jsonl(
+        workspace,
+        config,
+        parse_memory_backend_kind(config.memory_backend())?,
+        &contents,
+    )?;
+    Ok(format!(
+        "imported portable memory\nbackend: {}\nformat: amcp-jsonl\ncount: {}\npath: {}",
+        config.memory_backend(),
+        imported,
+        input.display()
+    ))
+}
+
+fn render_memory_migrate_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    from: MemoryBackendKind,
+    to: MemoryBackendKind,
+) -> Result<String, String> {
+    let migrated = migrate_backend_items(workspace, config, from, to)?;
+    Ok(format!(
+        "migrated portable memory\nfrom: {}\nto: {}\ncount: {}",
+        from, to, migrated
+    ))
 }
 
 fn render_save_latest_session_memory(
@@ -2526,10 +2667,10 @@ fn print_repl_help() {
     println!("/handoff    print a handoff block");
     println!("/handoff debug inspect the latest handoff state");
     println!("/why-context show the current prompt context");
-    println!("/memory     list/search/save local memory");
+    println!("/memory     list/search/save/export/import/migrate portable memory");
     println!("/trajectory inspect active and recent trajectories");
     println!("/memory show inspect one recent memory record");
-    println!("/memory recall print rendered recall text");
+    println!("/memory recall print rendered portable recall text");
     println!("/skills suggest list repeated workflow candidates");
     println!("/skills promote create a prompt-template from a candidate");
     println!("/commands   list custom slash commands");
@@ -2751,9 +2892,11 @@ fn print_memory_list(workspace: &Path) {
     match list_memory_records(workspace) {
         Ok(records) => {
             if records.is_empty() {
+                println!("memory_backend: {}", config_memory_backend_label(workspace));
                 println!("no memory records");
                 return;
             }
+            println!("memory_backend: {}", config_memory_backend_label(workspace));
             println!("memory_records: {}", records.len());
             let (summaries, decisions, tasks, errors, notes) = memory_kind_counts(&records);
             println!(
@@ -2938,6 +3081,32 @@ fn print_memory_search(workspace: &Path, query: &str) {
     }
 }
 
+fn print_memory_export(workspace: &Path, config: &LoadedConfig, output: Option<&Path>) {
+    match render_memory_export_text(workspace, config, output) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_memory_import(workspace: &Path, config: &LoadedConfig, input: &Path) {
+    match render_memory_import_text(workspace, config, input) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_memory_migrate(
+    workspace: &Path,
+    config: &LoadedConfig,
+    from: MemoryBackendKind,
+    to: MemoryBackendKind,
+) {
+    match render_memory_migrate_text(workspace, config, from, to) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
 #[allow(dead_code)]
 fn save_latest_session_memory(workspace: &Path, session: &SessionStore) {
     match save_session_memory_bundle(workspace, session.path()) {
@@ -3077,7 +3246,7 @@ fn handle_model_command(workspace: &Path, config: &LoadedConfig, args: &[String]
     }
 }
 
-fn handle_memory_command(workspace: &Path, _config: &LoadedConfig, args: &[String]) {
+fn handle_memory_command(workspace: &Path, config: &LoadedConfig, args: &[String]) {
     match args.first().map(String::as_str) {
         None | Some("list") => print_memory_list(workspace),
         Some("show") => {
@@ -3144,6 +3313,27 @@ fn handle_memory_command(workspace: &Path, _config: &LoadedConfig, args: &[Strin
                 }
             }
         }
+        Some("export") => match parse_memory_export_args(&args[1..]) {
+            Ok((_format, output)) => print_memory_export(workspace, config, output.as_deref()),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        },
+        Some("import") => match parse_memory_import_args(&args[1..]) {
+            Ok((_format, input)) => print_memory_import(workspace, config, &input),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        },
+        Some("migrate") => match parse_memory_migrate_args(&args[1..]) {
+            Ok((from, to)) => print_memory_migrate(workspace, config, from, to),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        },
         Some(other) => {
             eprintln!("unknown memory command: {other}");
             std::process::exit(2);
@@ -3357,6 +3547,55 @@ fn parse_optional_limit(input: &str, default: usize) -> Result<usize, String> {
         return Err("limit must be >= 1".to_string());
     }
     Ok(value)
+}
+
+fn parse_memory_backend_kind(input: &str) -> Result<MemoryBackendKind, String> {
+    MemoryBackendKind::parse(input).ok_or_else(|| format!("unknown memory backend: {input}"))
+}
+
+fn parse_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2).find_map(|window| {
+        if window[0] == flag {
+            Some(window[1].as_str())
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_memory_export_args(args: &[String]) -> Result<(String, Option<PathBuf>), String> {
+    let format = parse_flag_value(args, "--format").unwrap_or("amcp-jsonl");
+    if format != "amcp-jsonl" {
+        return Err(format!("unsupported memory export format: {format}"));
+    }
+    let output = parse_flag_value(args, "--output").map(PathBuf::from);
+    Ok((format.to_string(), output))
+}
+
+fn parse_memory_import_args(args: &[String]) -> Result<(String, PathBuf), String> {
+    let format = parse_flag_value(args, "--format").unwrap_or("amcp-jsonl");
+    if format != "amcp-jsonl" {
+        return Err(format!("unsupported memory import format: {format}"));
+    }
+    let input = parse_flag_value(args, "--input")
+        .ok_or_else(|| "usage: 3122 memory import --format amcp-jsonl --input <path>".to_string())?;
+    Ok((format.to_string(), PathBuf::from(input)))
+}
+
+fn parse_memory_migrate_args(
+    args: &[String],
+) -> Result<(MemoryBackendKind, MemoryBackendKind), String> {
+    let from = parse_flag_value(args, "--from")
+        .ok_or_else(|| {
+            "usage: 3122 memory migrate --from <backend> --to <backend>".to_string()
+        })
+        .and_then(parse_memory_backend_kind)?;
+    let to = parse_flag_value(args, "--to")
+        .ok_or_else(|| {
+            "usage: 3122 memory migrate --from <backend> --to <backend>".to_string()
+        })
+        .and_then(parse_memory_backend_kind)?;
+    Ok((from, to))
 }
 
 fn handle_handoff_command(workspace: &Path, args: &[String]) {
@@ -4289,7 +4528,7 @@ fn print_help() {
     println!("  doctor      inspect local auth and binary availability");
     println!("  config      show resolved config");
     println!("  model       show or set default model config");
-    println!("  memory      list/show/search/recall/save local memory");
+    println!("  memory      list/show/search/recall/save/export/import/migrate portable memory");
     println!("  trajectory  list/show/search active trajectories");
     println!("  commands    list/show custom slash commands");
     println!("  resume      show latest session resume summary");

@@ -13,6 +13,8 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub providers: ProvidersConfig,
     #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default)]
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub approvals: ApprovalsConfig,
@@ -37,6 +39,30 @@ pub struct ModelConfig {
 pub struct ProvidersConfig {
     pub default_connection_mode: Option<String>,
     pub interactive_connection_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryConfig {
+    pub backend: Option<String>,
+    pub dual_write_legacy_jsonl: Option<bool>,
+    #[serde(default)]
+    pub nexus_cloud: NexusCloudMemoryConfig,
+    #[serde(default)]
+    pub third_party_amcp: ThirdPartyAmcpMemoryConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NexusCloudMemoryConfig {
+    pub endpoint: Option<String>,
+    pub api_key_env: Option<String>,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ThirdPartyAmcpMemoryConfig {
+    pub endpoint: Option<String>,
+    pub api_key_env: Option<String>,
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -78,6 +104,18 @@ pub struct LoadedConfig {
 }
 
 impl LoadedConfig {
+    pub fn memory_backend(&self) -> &str {
+        self.data
+            .memory
+            .backend
+            .as_deref()
+            .unwrap_or("local-amcp")
+    }
+
+    pub fn dual_write_legacy_jsonl(&self) -> bool {
+        self.data.memory.dual_write_legacy_jsonl.unwrap_or(true)
+    }
+
     pub fn default_connection_mode(&self) -> ConnectionMode {
         self.data
             .providers
@@ -246,6 +284,11 @@ impl LoadedConfig {
             format!(
                 "interactive_connection_mode: {}",
                 self.interactive_connection_mode()
+            ),
+            format!("memory_backend: {}", self.memory_backend()),
+            format!(
+                "memory_dual_write_legacy_jsonl: {}",
+                self.dual_write_legacy_jsonl()
             ),
             format!(
                 "session_dir: {}",
