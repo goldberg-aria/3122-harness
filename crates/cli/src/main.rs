@@ -18,15 +18,16 @@ use runtime::{
     export_backend_jsonl, gather_workspace_context, glob_search, grep_search,
     import_backend_jsonl, init_slash_command_dir, latest_model_handoff, list_mcp_tools,
     list_memory_records, list_recent_trajectories, list_skill_candidates, load_config,
-    load_provider_registry, migrate_backend_items, parallel_read_only, pending_model_handoff,
-    promote_skill_candidate, provider_preset, provider_presets, read_file,
-    remove_provider_profile, record_session_trajectory, render_prompt_context, resolve_skill,
-    resolve_slash_command, run_agent_loop, save_config, save_session_memory_bundle,
-    search_memory_records, search_trajectories, slash_command_dir, upsert_provider_profile,
-    validate_slash_command_args, write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy,
-    ApprovalRequest, ConnectionMode, LoadedConfig, MemoryBackendKind, MemoryRecord,
-    ModelHandoffSnapshot, PermissionMode, SavedProviderProfile, SessionStore,
-    SlashCommandKind, SlashCommandScope, ToolOutput, TrajectoryRecord, VerificationPolicy,
+    load_provider_registry, metadata_legacy_kind, metadata_title, migrate_backend_items,
+    parallel_read_only, pending_model_handoff, promote_skill_candidate, provider_preset,
+    provider_presets, read_file, remove_provider_profile, resolve_selected_memory_backend,
+    record_session_trajectory, render_prompt_context, resolve_skill, resolve_slash_command,
+    run_agent_loop, save_config, save_session_memory_bundle, search_memory_records,
+    search_trajectories, slash_command_dir, upsert_provider_profile, validate_slash_command_args,
+    write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ConnectionMode,
+    LoadedConfig, MemoryBackendKind, MemoryRecord, ModelHandoffSnapshot, PermissionMode,
+    SavedProviderProfile, SessionStore, SlashCommandKind, SlashCommandScope, ToolOutput,
+    TrajectoryRecord, VerificationPolicy,
 };
 use serde_json::json;
 
@@ -617,7 +618,10 @@ fn core_slash_suggestions() -> Vec<SlashSuggestion> {
         ("resume", "Show latest session resume summary"),
         ("handoff", "Print the latest handoff block"),
         ("why-context", "Show the current prompt context"),
-        ("memory", "List, recall, search, save, export, import, or migrate portable memory"),
+        (
+            "memory",
+            "List, inspect sessions, save, delete, export, import, or migrate portable memory",
+        ),
         ("trajectory", "Inspect active and recent trajectories"),
         ("commands", "List custom slash commands"),
         ("login", "Show provider setup hints"),
@@ -935,6 +939,25 @@ fn process_repl_input_tui(
     }
     if let Some(query) = trimmed.strip_prefix("/memory search ").map(str::trim) {
         ui.push_result(render_memory_search_text(workspace, query));
+        return ReplDirective::Continue;
+    }
+    if trimmed == "/memory sessions" {
+        ui.push_result(render_memory_sessions_text(workspace, config));
+        return ReplDirective::Continue;
+    }
+    if let Some(session_key) = trimmed.strip_prefix("/memory session ").map(str::trim) {
+        ui.push_result(render_memory_session_text(workspace, config, session_key));
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/memory delete").map(str::trim) {
+        let args = rest
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        match parse_memory_delete_args(&args) {
+            Ok(ids) => ui.push_result(render_memory_delete_text(workspace, config, &ids)),
+            Err(err) => ui.push_error(err),
+        }
         return ReplDirective::Continue;
     }
     if let Some(rest) = trimmed.strip_prefix("/memory export").map(str::trim) {
@@ -1272,6 +1295,25 @@ fn handle_repl_line(
         print_memory_search(workspace, query);
         return ReplDirective::Continue;
     }
+    if trimmed == "/memory sessions" {
+        print_memory_sessions(workspace, config);
+        return ReplDirective::Continue;
+    }
+    if let Some(session_key) = trimmed.strip_prefix("/memory session ").map(str::trim) {
+        print_memory_session(workspace, config, session_key);
+        return ReplDirective::Continue;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/memory delete").map(str::trim) {
+        let args = rest
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        match parse_memory_delete_args(&args) {
+            Ok(ids) => print_memory_delete(workspace, config, &ids),
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
     if let Some(rest) = trimmed.strip_prefix("/memory export").map(str::trim) {
         let args = rest
             .split_whitespace()
@@ -1436,9 +1478,10 @@ fn render_repl_help_text() -> String {
         "/handoff    print a handoff block",
         "/handoff debug inspect the latest handoff state",
         "/why-context show the current prompt context",
-        "/memory     list/search/save/export/import/migrate portable memory",
+        "/memory     list/search/sessions/save/delete/export/import/migrate portable memory",
         "/trajectory inspect active and recent trajectories",
         "/memory show inspect one recent memory record",
+        "/memory session inspect one portable memory session",
         "/memory recall print rendered portable recall text",
         "/skills suggest list repeated workflow candidates",
         "/skills promote create a prompt-template from a candidate",
@@ -2004,6 +2047,7 @@ fn render_memory_show_text(workspace: &Path, index: usize) -> Result<String, Str
     };
     let mut lines = vec![
         format!("index: {index}"),
+        format!("id: {}", record.id.as_deref().unwrap_or("-")),
         format!("kind: {}", record.kind),
         format!("title: {}", record.title),
         format!("ts_ms: {}", record.ts_ms),
@@ -2037,6 +2081,71 @@ fn render_memory_search_text(workspace: &Path, query: &str) -> Result<String, St
         lines.push(String::new());
     }
     Ok(lines.join("\n"))
+}
+
+fn render_memory_sessions_text(workspace: &Path, config: &LoadedConfig) -> Result<String, String> {
+    let backend = resolve_selected_memory_backend(workspace, config)?;
+    let sessions = backend.sessions()?;
+    if sessions.is_empty() {
+        return Ok("no portable memory sessions".to_string());
+    }
+    let mut lines = vec![
+        format!("memory_backend: {}", config.memory_backend()),
+        format!("sessions: {}", sessions.len()),
+    ];
+    for (index, session) in sessions.into_iter().enumerate() {
+        lines.push(format!(
+            "- #{} | {} | items={} | updated_at={}",
+            index + 1,
+            compact_line(&session.key, 72),
+            session.item_count,
+            session.updated_at
+        ));
+    }
+    lines.push("hint: use `memory session <key>` to inspect one portable memory session".to_string());
+    Ok(lines.join("\n"))
+}
+
+fn render_memory_session_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    session_key: &str,
+) -> Result<String, String> {
+    let backend = resolve_selected_memory_backend(workspace, config)?;
+    let items = backend.session(session_key)?;
+    if items.is_empty() {
+        return Ok("no portable memory items for that session".to_string());
+    }
+    let mut lines = vec![
+        format!("memory_backend: {}", config.memory_backend()),
+        format!("session: {session_key}"),
+        format!("items: {}", items.len()),
+    ];
+    for item in items {
+        lines.push(format!(
+            "- {} | {} | {} | {}",
+            item.id,
+            metadata_legacy_kind(&item),
+            metadata_title(&item),
+            item.updated_at
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_memory_delete_text(
+    workspace: &Path,
+    config: &LoadedConfig,
+    ids: &[String],
+) -> Result<String, String> {
+    let backend = resolve_selected_memory_backend(workspace, config)?;
+    let deleted = backend.delete(ids)?;
+    Ok(format!(
+        "deleted portable memory\nbackend: {}\nrequested: {}\ndeleted: {}",
+        config.memory_backend(),
+        ids.len(),
+        deleted
+    ))
 }
 
 fn render_memory_export_text(
@@ -2667,9 +2776,10 @@ fn print_repl_help() {
     println!("/handoff    print a handoff block");
     println!("/handoff debug inspect the latest handoff state");
     println!("/why-context show the current prompt context");
-    println!("/memory     list/search/save/export/import/migrate portable memory");
+    println!("/memory     list/search/sessions/save/delete/export/import/migrate portable memory");
     println!("/trajectory inspect active and recent trajectories");
     println!("/memory show inspect one recent memory record");
+    println!("/memory session inspect one portable memory session");
     println!("/memory recall print rendered portable recall text");
     println!("/skills suggest list repeated workflow candidates");
     println!("/skills promote create a prompt-template from a candidate");
@@ -2973,6 +3083,7 @@ fn print_memory_show(workspace: &Path, index: usize) {
                 return;
             };
             println!("index: {index}");
+            println!("id: {}", record.id.as_deref().unwrap_or("-"));
             println!("kind: {}", record.kind);
             println!("title: {}", record.title);
             println!("ts_ms: {}", record.ts_ms);
@@ -3077,6 +3188,27 @@ fn print_memory_search(workspace: &Path, query: &str) {
                 println!();
             }
         }
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_memory_sessions(workspace: &Path, config: &LoadedConfig) {
+    match render_memory_sessions_text(workspace, config) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_memory_session(workspace: &Path, config: &LoadedConfig, session_key: &str) {
+    match render_memory_session_text(workspace, config, session_key) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+fn print_memory_delete(workspace: &Path, config: &LoadedConfig, ids: &[String]) {
+    match render_memory_delete_text(workspace, config, ids) {
+        Ok(text) => println!("{text}"),
         Err(err) => eprintln!("{err}"),
     }
 }
@@ -3280,6 +3412,14 @@ fn handle_memory_command(workspace: &Path, config: &LoadedConfig, args: &[String
             };
             print_memory_search(workspace, query);
         }
+        Some("sessions") => print_memory_sessions(workspace, config),
+        Some("session") => {
+            let Some(session_key) = args.get(1) else {
+                eprintln!("usage: {} memory session <session-key>", APP_NAME);
+                std::process::exit(2);
+            };
+            print_memory_session(workspace, config, session_key);
+        }
         Some("save") => {
             let session_path = if let Some(path) = args.get(1) {
                 PathBuf::from(path)
@@ -3313,6 +3453,13 @@ fn handle_memory_command(workspace: &Path, config: &LoadedConfig, args: &[String
                 }
             }
         }
+        Some("delete") => match parse_memory_delete_args(&args[1..]) {
+            Ok(ids) => print_memory_delete(workspace, config, &ids),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        },
         Some("export") => match parse_memory_export_args(&args[1..]) {
             Ok((_format, output)) => print_memory_export(workspace, config, output.as_deref()),
             Err(err) => {
@@ -3596,6 +3743,34 @@ fn parse_memory_migrate_args(
         })
         .and_then(parse_memory_backend_kind)?;
     Ok((from, to))
+}
+
+fn parse_memory_delete_args(args: &[String]) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                index += 1;
+                let Some(id) = args.get(index) else {
+                    return Err(
+                        "usage: 3122 memory delete --id <memory-id> [--id <memory-id> ...]"
+                            .to_string(),
+                    );
+                };
+                ids.push(id.clone());
+            }
+            other if !other.trim().is_empty() => ids.push(other.to_string()),
+            _ => {}
+        }
+        index += 1;
+    }
+    if ids.is_empty() {
+        return Err(
+            "usage: 3122 memory delete --id <memory-id> [--id <memory-id> ...]".to_string(),
+        );
+    }
+    Ok(ids)
 }
 
 fn handle_handoff_command(workspace: &Path, args: &[String]) {
@@ -4528,7 +4703,7 @@ fn print_help() {
     println!("  doctor      inspect local auth and binary availability");
     println!("  config      show resolved config");
     println!("  model       show or set default model config");
-    println!("  memory      list/show/search/recall/save/export/import/migrate portable memory");
+    println!("  memory      list/show/search/sessions/session/recall/save/delete/export/import/migrate portable memory");
     println!("  trajectory  list/show/search active trajectories");
     println!("  commands    list/show custom slash commands");
     println!("  resume      show latest session resume summary");

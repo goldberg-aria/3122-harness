@@ -86,6 +86,9 @@ cargo run -p cli -- memory show 1
 cargo run -p cli -- memory recall 6
 cargo run -p cli -- memory save
 cargo run -p cli -- memory search provider
+cargo run -p cli -- memory sessions
+cargo run -p cli -- memory session file:///absolute/path/to/.harness/sessions/session-123.jsonl
+cargo run -p cli -- memory delete --id amcp-example-id
 cargo run -p cli -- memory export --format amcp-jsonl --output memory-export.jsonl
 cargo run -p cli -- memory import --format amcp-jsonl --input memory-export.jsonl
 cargo run -p cli -- memory migrate --from local-amcp --to nexus-cloud
@@ -272,8 +275,11 @@ Local-Lite memory:
 - prompt context now includes file-level memory when the current query or active trajectory points at specific files
 - `memory` lists recent memory records
 - `memory show <index>` prints one saved memory record with tags and source session
+- `memory sessions` lists portable memory sessions from the selected backend
+- `memory session <session-key>` prints the portable memory items attached to one session
 - `memory recall [limit]` prints the exact recall block the harness would inject
 - `memory search <query>` searches saved memory locally
+- `memory delete --id <memory-id>` deletes one or more AMCP items by id
 - `memory export --format amcp-jsonl` exports portable memory in AMCP JSONL
 - `memory import --format amcp-jsonl` imports portable memory into the selected backend
 - `memory migrate --from <backend> --to <backend>` moves AMCP items between backends

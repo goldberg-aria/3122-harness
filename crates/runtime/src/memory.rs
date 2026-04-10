@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::session::SessionEvent;
 use crate::SessionStore;
 use crate::{
-    active_trajectory, build_trajectory_recall_text, current_timestamp_iso, default_local_origin,
-    default_local_scope, default_private_retention, load_config, metadata_legacy_kind,
-    metadata_title, record_session_trajectory, resolve_selected_memory_backend,
-    session_key_for_item, source_ref_uri, timestamp_millis, AmcpMemoryItem, AmcpSourceRef,
+    active_trajectory, current_timestamp_iso, default_local_origin, default_local_scope,
+    default_private_retention, load_config, metadata_legacy_kind, metadata_title,
+    record_session_trajectory, resolve_selected_memory_backend, session_key_for_item,
+    source_ref_uri, timestamp_millis, AmcpMemoryItem, AmcpSourceRef,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +56,8 @@ impl MemoryKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryRecord {
+    #[serde(default)]
+    pub id: Option<String>,
     pub ts_ms: u128,
     pub kind: String,
     pub title: String,
@@ -345,6 +347,7 @@ fn portable_item_type(kind: MemoryKind) -> &'static str {
 
 fn memory_record_from_item(item: &AmcpMemoryItem) -> MemoryRecord {
     MemoryRecord {
+        id: Some(item.id.clone()),
         ts_ms: timestamp_millis(&item.updated_at).unwrap_or_default(),
         kind: metadata_legacy_kind(item),
         title: metadata_title(item),
@@ -620,11 +623,6 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
 pub fn build_memory_recall_text(workspace_root: &Path, limit: usize) -> Result<String, String> {
     if let Some(path) = SessionStore::latest(workspace_root)? {
         let _ = record_session_trajectory(workspace_root, &path);
-    }
-    if let Ok(text) = build_trajectory_recall_text(workspace_root, limit) {
-        if text.trim() != "none" {
-            return Ok(text);
-        }
     }
     let config = load_config(workspace_root).unwrap_or_default();
     let backend = resolve_selected_memory_backend(workspace_root, &config)?;

@@ -5,8 +5,9 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::{
-    build_file_memory_recall_text, build_memory_recall_text, pending_model_handoff,
-    render_model_handoff_text, LoadedConfig, PermissionMode, SessionStore,
+    build_file_memory_recall_text, build_memory_recall_text, build_trajectory_recall_text,
+    pending_model_handoff, record_session_trajectory, render_model_handoff_text, LoadedConfig,
+    PermissionMode, SessionStore,
 };
 
 const MAX_INSTRUCTION_CHARS: usize = 8000;
@@ -21,6 +22,7 @@ const DEFAULT_PROMPT_CONTEXT_CHARS: usize = 12000;
 const DEFAULT_BUDGETED_INSTRUCTION_CHARS: usize = 4000;
 const DEFAULT_BUDGETED_MODEL_HANDOFF_CHARS: usize = 700;
 const DEFAULT_BUDGETED_RECENT_HISTORY_CHARS: usize = 1200;
+const DEFAULT_BUDGETED_TRAJECTORY_RECALL_CHARS: usize = 900;
 const DEFAULT_BUDGETED_MEMORY_RECALL_CHARS: usize = 1200;
 const DEFAULT_BUDGETED_FILE_MEMORY_RECALL_CHARS: usize = 700;
 const DEFAULT_BUDGETED_CONVERSATION_RECALL_CHARS: usize = 900;
@@ -28,6 +30,7 @@ const COMPACT_PROMPT_CONTEXT_CHARS: usize = 8500;
 const COMPACT_BUDGETED_INSTRUCTION_CHARS: usize = 2200;
 const COMPACT_BUDGETED_MODEL_HANDOFF_CHARS: usize = 550;
 const COMPACT_BUDGETED_RECENT_HISTORY_CHARS: usize = 900;
+const COMPACT_BUDGETED_TRAJECTORY_RECALL_CHARS: usize = 650;
 const COMPACT_BUDGETED_MEMORY_RECALL_CHARS: usize = 850;
 const COMPACT_BUDGETED_FILE_MEMORY_RECALL_CHARS: usize = 500;
 const COMPACT_BUDGETED_CONVERSATION_RECALL_CHARS: usize = 450;
@@ -39,6 +42,7 @@ struct ContextBudgetProfile {
     instructions_chars: usize,
     model_handoff_chars: usize,
     recent_history_chars: usize,
+    trajectory_recall_chars: usize,
     memory_recall_chars: usize,
     file_memory_recall_chars: usize,
     conversation_recall_chars: usize,
@@ -58,6 +62,7 @@ pub struct WorkspaceContext {
     pub instructions: Vec<InstructionContext>,
     pub model_handoff: String,
     pub recent_history: String,
+    pub trajectory_recall: String,
     pub memory_recall: String,
     pub file_memory_recall: String,
     pub conversation_recall: String,
@@ -96,6 +101,9 @@ pub fn gather_workspace_context(
         .ok()
         .flatten()
         .flatten();
+    if let Some(path) = latest_session_path.as_deref() {
+        let _ = record_session_trajectory(workspace_root, path);
+    }
     WorkspaceContext {
         workspace_root: workspace_root.to_path_buf(),
         config_source: config.source.clone(),
@@ -120,6 +128,9 @@ pub fn gather_workspace_context(
             .unwrap_or_else(|| "none".to_string()),
         recent_history: build_recent_history(config, workspace_root)
             .unwrap_or_else(|_| "none".to_string()),
+        trajectory_recall: build_trajectory_recall_text(workspace_root, 3)
+            .map(|text| truncate_text(&text, MAX_MEMORY_RECALL_CHARS))
+            .unwrap_or_else(|_| "none".to_string()),
         memory_recall: build_memory_recall_text(workspace_root, 5)
             .map(|text| truncate_text(&text, MAX_MEMORY_RECALL_CHARS))
             .unwrap_or_else(|_| "none".to_string()),
@@ -142,6 +153,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     let mut instructions = render_instructions_block(&context.instructions);
     let mut model_handoff = context.model_handoff.clone();
     let mut recent_history = context.recent_history.clone();
+    let mut trajectory_recall = context.trajectory_recall.clone();
     let mut memory_recall = context.memory_recall.clone();
     let mut file_memory_recall = context.file_memory_recall.clone();
     let mut conversation_recall = context.conversation_recall.clone();
@@ -151,6 +163,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &instructions,
         &model_handoff,
         &recent_history,
+        &trajectory_recall,
         &memory_recall,
         &file_memory_recall,
         &conversation_recall,
@@ -166,6 +179,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &instructions,
         &model_handoff,
         &recent_history,
+        &trajectory_recall,
         &memory_recall,
         &file_memory_recall,
         &conversation_recall,
@@ -181,6 +195,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &instructions,
         &model_handoff,
         &recent_history,
+        &trajectory_recall,
         &memory_recall,
         &file_memory_recall,
         &conversation_recall,
@@ -196,6 +211,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &instructions,
         &model_handoff,
         &recent_history,
+        &trajectory_recall,
         &memory_recall,
         &file_memory_recall,
         &conversation_recall,
@@ -211,6 +227,23 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &instructions,
         &model_handoff,
         &recent_history,
+        &trajectory_recall,
+        &memory_recall,
+        &file_memory_recall,
+        &conversation_recall,
+        budget.name,
+    );
+    if out.chars().count() <= budget.total_chars {
+        return out;
+    }
+
+    trajectory_recall = budget_section(&trajectory_recall, budget.trajectory_recall_chars);
+    out = render_prompt_context_sections(
+        context,
+        &instructions,
+        &model_handoff,
+        &recent_history,
+        &trajectory_recall,
         &memory_recall,
         &file_memory_recall,
         &conversation_recall,
@@ -226,6 +259,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &instructions,
         &model_handoff,
         &recent_history,
+        &trajectory_recall,
         &memory_recall,
         &file_memory_recall,
         &conversation_recall,
@@ -241,6 +275,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         &instructions,
         &model_handoff,
         &recent_history,
+        &trajectory_recall,
         &memory_recall,
         &file_memory_recall,
         &conversation_recall,
@@ -258,6 +293,7 @@ fn render_prompt_context_sections(
     instructions: &str,
     model_handoff: &str,
     recent_history: &str,
+    trajectory_recall: &str,
     memory_recall: &str,
     file_memory_recall: &str,
     conversation_recall: &str,
@@ -340,6 +376,10 @@ fn render_prompt_context_sections(
     out.push_str(recent_history);
     out.push('\n');
 
+    out.push_str("trajectory_recall:\n");
+    out.push_str(trajectory_recall);
+    out.push('\n');
+
     out.push_str("local_lite_recall:\n");
     out.push_str(memory_recall);
     out.push('\n');
@@ -383,6 +423,7 @@ fn context_budget_profile(model: Option<&str>) -> ContextBudgetProfile {
             instructions_chars: COMPACT_BUDGETED_INSTRUCTION_CHARS,
             model_handoff_chars: COMPACT_BUDGETED_MODEL_HANDOFF_CHARS,
             recent_history_chars: COMPACT_BUDGETED_RECENT_HISTORY_CHARS,
+            trajectory_recall_chars: COMPACT_BUDGETED_TRAJECTORY_RECALL_CHARS,
             memory_recall_chars: COMPACT_BUDGETED_MEMORY_RECALL_CHARS,
             file_memory_recall_chars: COMPACT_BUDGETED_FILE_MEMORY_RECALL_CHARS,
             conversation_recall_chars: COMPACT_BUDGETED_CONVERSATION_RECALL_CHARS,
@@ -395,6 +436,7 @@ fn context_budget_profile(model: Option<&str>) -> ContextBudgetProfile {
         instructions_chars: DEFAULT_BUDGETED_INSTRUCTION_CHARS,
         model_handoff_chars: DEFAULT_BUDGETED_MODEL_HANDOFF_CHARS,
         recent_history_chars: DEFAULT_BUDGETED_RECENT_HISTORY_CHARS,
+        trajectory_recall_chars: DEFAULT_BUDGETED_TRAJECTORY_RECALL_CHARS,
         memory_recall_chars: DEFAULT_BUDGETED_MEMORY_RECALL_CHARS,
         file_memory_recall_chars: DEFAULT_BUDGETED_FILE_MEMORY_RECALL_CHARS,
         conversation_recall_chars: DEFAULT_BUDGETED_CONVERSATION_RECALL_CHARS,
@@ -916,9 +958,12 @@ mod tests {
         assert!(rendered.contains("boss rules"));
         assert!(rendered.contains("recent_working_history:"));
         assert!(rendered.contains("continue provider integration"));
-        assert!(rendered.contains("local_lite_recall:"));
+        assert!(rendered.contains("trajectory_recall:"));
         assert!(rendered.contains("[active_trajectory]"));
         assert!(rendered.contains("Goal: continue provider integration"));
+        assert!(rendered.contains("local_lite_recall:"));
+        assert!(rendered.contains("[note] Memory title"));
+        assert!(rendered.contains("Recall body"));
         assert!(rendered.contains("recall_reason:"));
         assert!(rendered.contains("file_memory_recall:"));
         assert!(rendered.contains("conversation_recall:"));
@@ -954,6 +999,7 @@ mod tests {
             }],
             model_handoff: huge.clone(),
             recent_history: huge.clone(),
+            trajectory_recall: huge.clone(),
             memory_recall: huge.clone(),
             file_memory_recall: huge.clone(),
             conversation_recall: huge,
@@ -993,6 +1039,7 @@ mod tests {
             }],
             model_handoff: huge.clone(),
             recent_history: huge.clone(),
+            trajectory_recall: huge.clone(),
             memory_recall: huge.clone(),
             file_memory_recall: huge.clone(),
             conversation_recall: huge,
