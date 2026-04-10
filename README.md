@@ -1,36 +1,89 @@
 # 3122
 
-AMCP-native, model-neutral coding harness.
+**EN**: `3122` is an AMCP-native, model-neutral coding harness.  
+**KO**: `3122`는 AMCP 네이티브, 모델 중립 코딩 하네스입니다.
 
-Terminal-first coding agent harness scaffold.
+It is not a standalone memory product. It is the reference client layer in the broader Synapsis ecosystem.  
+단독 메모리 제품이 아니라, 더 큰 Synapsis 생태계 안에서 동작하는 레퍼런스 클라이언트 레이어입니다.
 
-## Goal
+## Ecosystem | 생태계
 
-Build a local coding agent runtime with:
+**EN**: The current ecosystem is organized like this.  
+**KO**: 현재 제품군은 아래처럼 나뉩니다.
 
-- a terminal REPL and one-shot command surface
-- a permission-gated tool loop
-- skill discovery
-- MCP server discovery
-- session storage and resumability
-- BYOK model providers
-- local Ollama support
-- optional authenticated adapters for external CLIs such as Claude Code and Codex
+| Product | English role | 한국어 역할 |
+| --- | --- | --- |
+| `AMCP` | Vendor-neutral memory contract | 벤더 중립 메모리 계약 / 표준 |
+| `Nexus` | Reference AMCP backend for agents and developers | 에이전트와 개발자를 위한 레퍼런스 AMCP 백엔드 |
+| `Norfolk` | Personal lifetime memory backend | 개인용 평생 메모리 백엔드 |
+| `MaaS` | Enterprise memory infrastructure | 엔터프라이즈 메모리 인프라 |
+| `3122` | Reference client and coding harness | 레퍼런스 클라이언트이자 코딩 하네스 |
 
-## Product stance
+**EN**: In short, AMCP is the contract, Nexus is the first reference backend, Norfolk is the personal memory backend, MaaS is the enterprise deployment model, and 3122 is the client that proves the contract can power real agent workflows.  
+**KO**: 한 줄로 말하면, AMCP는 계약이고, Nexus는 첫 레퍼런스 백엔드이며, Norfolk는 개인 메모리 백엔드, MaaS는 엔터프라이즈 배포 모델, 3122는 그 계약이 실제 에이전트 작업 흐름을 감쌀 수 있음을 보여주는 클라이언트입니다.
 
-This project is not trying to clone another agent byte-for-byte.
-It is building a clean-room harness with similar strengths:
+## What 3122 Is | 3122의 자리
 
-- model independence
-- strong permissions
-- explicit tool execution
-- session durability
-- local memory continuity
-- provider portability
-- terminal-native workflows
+**EN**:
+- terminal-first coding harness
+- local-first by default
+- model-neutral across API and local model providers
+- AMCP portable memory client
+- continuity runtime for coding sessions, handoff, and verification
 
-## Current status
+**KO**:
+- 터미널 중심 코딩 하네스
+- 기본값은 로컬 우선
+- API 모델과 로컬 모델을 모두 감싸는 모델 중립 런타임
+- AMCP portable memory 클라이언트
+- 코딩 세션, handoff, verification을 위한 continuity 런타임
+
+**EN**: 3122 owns the harness layer: prompts, permissions, tool execution, session continuity, and backend selection.  
+**KO**: 3122는 하네스 레이어를 담당합니다. 프롬프트, 권한, 도구 실행, 세션 연속성, 백엔드 선택이 여기에 있습니다.
+
+## What 3122 Is Not | 3122가 아닌 것
+
+**EN**:
+- not a hosted memory backend by itself
+- not a note app
+- not a clone of Claude Code, Codex, or Aider
+- not the AMCP spec itself
+
+**KO**:
+- 자체가 hosted memory 백엔드는 아닙니다
+- 노트 앱도 아닙니다
+- Claude Code, Codex, Aider의 복제도 아닙니다
+- AMCP 스펙 그 자체도 아닙니다
+
+## Memory Architecture | 메모리 구조
+
+**EN**: 3122 separates continuity state from portable memory.  
+**KO**: 3122는 continuity 상태와 portable memory를 분리합니다.
+
+### Continuity Runtime State | 연속성 런타임 상태
+
+**EN**: These stay local and operational.  
+**KO**: 이 레이어는 로컬에 남고, 운영용 상태입니다.
+
+- `.harness/sessions/` JSONL transcripts
+- `.harness/memory.db` trajectory state
+- handoff snapshots
+- file memory
+- skill candidate detection
+
+### Portable Memory | 이식 가능한 메모리
+
+**EN**: Portable memory uses one AMCP item shape across backends.  
+**KO**: portable memory는 백엔드가 달라도 하나의 AMCP item shape를 씁니다.
+
+- `local-amcp`: local SQLite portable memory
+- `nexus-cloud`: first hosted backend over Nexus `/v1/amcp`
+- `third-party-amcp`: extension slot
+
+**EN**: This means local export, import, and backend migration are based on one portable record contract instead of a harness-only format.  
+**KO**: 그래서 로컬 export, import, backend migration이 하네스 전용 포맷이 아니라 하나의 portable record 계약 위에서 동작합니다.
+
+## Current Status | 현재 상태
 
 This repository currently contains:
 
@@ -130,6 +183,9 @@ cargo run -p cli -- repl
 
 `nexus-cloud` is the first hosted portable memory backend.
 It uses the same AMCP item shape as `local-amcp` and talks to Nexus over `/v1/amcp`.
+
+**EN**: Today, Nexus is the first hosted backend. Norfolk and MaaS are ecosystem targets, but they are not the first 3122 transport target in this phase.  
+**KO**: 현재는 Nexus가 첫 hosted backend입니다. Norfolk와 MaaS도 같은 생태계 대상이지만, 이번 phase에서 3122의 첫 transport 대상은 아닙니다.
 
 Example config:
 
