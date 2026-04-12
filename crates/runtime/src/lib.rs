@@ -32,7 +32,9 @@ pub use commands::{
     init_slash_command_dir, resolve_slash_command, slash_command_dir, validate_slash_command_args,
     SlashCommand, SlashCommandKind, SlashCommandScope,
 };
-pub use config::{load_config, save_config, ConnectionMode, HarnessConfig, LoadedConfig};
+pub use config::{
+    load_config, save_config, AutoPromotePolicy, ConnectionMode, HarnessConfig, LoadedConfig,
+};
 pub use context::{
     gather_workspace_context, render_prompt_context, GitContext, InstructionContext,
     WorkspaceContext,
@@ -42,21 +44,25 @@ pub use envfile::load_workspace_env;
 pub use mcp::{call_tool as call_mcp_tool, list_tools as list_mcp_tools, McpToolInfo};
 pub use memory::{
     append_memory_record, build_handoff_text, build_memory_recall_text,
-    build_model_handoff_snapshot, build_resume_text, latest_model_handoff, list_memory_records,
-    memory_dir, pending_model_handoff, render_model_handoff_text, save_session_memory_bundle,
-    save_session_summary, search_memory_records, summarize_session_events, MemoryKind,
-    MemoryRecord, ModelHandoffSnapshot, SavedMemoryBundle, SessionDigest, StoredModelHandoff,
+    build_memory_recall_text_with_request, build_model_handoff_snapshot, build_resume_text,
+    dismiss_memory_candidate, latest_model_handoff, list_memory_candidates, list_memory_records,
+    maybe_record_prompt_compaction_checkpoint, maybe_track_skill_candidate_promotion, memory_dir,
+    pending_model_handoff, promote_memory_candidate, render_model_handoff_text,
+    save_session_memory_bundle, save_session_summary, search_memory_records,
+    summarize_session_events, MemoryKind, MemoryRecord, ModelHandoffSnapshot, SavedMemoryBundle,
+    SessionDigest, StoredModelHandoff,
 };
+pub use permissions::{can_exec, can_read, can_write, PermissionDecision, PermissionMode};
 pub use portable_memory::{
     current_timestamp_iso, default_local_origin, default_local_scope, default_private_retention,
     export_backend_jsonl, export_items_jsonl, import_backend_jsonl, iso_timestamp_from_millis,
     metadata_legacy_kind, metadata_title, migrate_backend_items, parse_items_jsonl,
     resolve_memory_backend_kind, resolve_selected_memory_backend, selected_backend_kind,
-    session_key_for_item, source_ref_uri, timestamp_millis, truncate_chars, AmcpMemoryBackend,
-    AmcpMemoryItem, AmcpOrigin, AmcpRetention, AmcpScope, AmcpSessionRef, AmcpSourceRef,
-    MemoryBackendKind,
+    session_derived_retention, session_key_for_item, source_ref_uri, timestamp_millis,
+    truncate_chars, AmcpBackendCapabilities, AmcpMemoryBackend, AmcpMemoryItem, AmcpOrigin,
+    AmcpRetention, AmcpScope, AmcpSessionRef, AmcpSourceRef, MemoryBackendKind,
+    RecallContextBudget, RecallRequest,
 };
-pub use permissions::{can_exec, can_read, can_write, PermissionDecision, PermissionMode};
 pub use profiles::{
     detect_provider_key, find_provider_profile, load_provider_registry, provider_preset,
     provider_presets, provider_registry_path, remove_provider_profile, save_provider_registry,
@@ -75,8 +81,11 @@ pub use tools::{
 };
 pub use trajectory::{
     active_trajectory, build_file_memory_recall_text, build_trajectory_recall_text,
-    list_recent_trajectories, list_skill_candidates, memory_db_path, promote_skill_candidate,
-    record_session_trajectory, search_trajectories, FileMemoryRecord, SkillCandidate,
+    count_matching_failure_sessions, list_promotion_candidates, list_recent_trajectories,
+    list_skill_candidates, load_promotion_candidate, load_skill_candidate, memory_db_path,
+    normalize_failure_text, pending_promotion_candidate_count, promote_skill_candidate,
+    record_session_trajectory, search_trajectories, store_promotion_candidate,
+    update_promotion_candidate_status, FileMemoryRecord, PromotionCandidate, SkillCandidate,
     TrajectoryRecord, TrajectoryStep,
 };
 pub use verifier::{assess_verification, VerificationAssessment, VerificationEvent};

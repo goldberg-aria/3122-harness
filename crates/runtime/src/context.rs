@@ -5,9 +5,10 @@ use std::process::Command;
 use serde_json::Value;
 
 use crate::{
-    build_file_memory_recall_text, build_memory_recall_text, build_trajectory_recall_text,
-    pending_model_handoff, record_session_trajectory, render_model_handoff_text, LoadedConfig,
-    PermissionMode, SessionStore,
+    active_trajectory, build_file_memory_recall_text, build_memory_recall_text_with_request,
+    build_trajectory_recall_text, maybe_record_prompt_compaction_checkpoint, pending_model_handoff,
+    record_session_trajectory, render_model_handoff_text, LoadedConfig, PermissionMode,
+    RecallContextBudget, RecallRequest, SessionStore,
 };
 
 const MAX_INSTRUCTION_CHARS: usize = 8000;
@@ -70,6 +71,16 @@ pub struct WorkspaceContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptCompactionReport {
+    kept_summary: String,
+    dropped_signals: Vec<String>,
+    truncated_sections: Vec<String>,
+    budget_profile: String,
+    session_id: Option<String>,
+    turn_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitContext {
     pub repo_root: Option<PathBuf>,
     pub branch: Option<String>,
@@ -94,6 +105,13 @@ pub fn gather_workspace_context(
     let latest_session_path = SessionStore::latest_in(&config.session_dir(workspace_root))
         .ok()
         .flatten();
+    let latest_session_events = latest_session_path
+        .as_deref()
+        .map(SessionStore::read_events)
+        .transpose()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let pending_handoff = latest_session_path
         .as_deref()
         .map(pending_model_handoff)
@@ -104,6 +122,15 @@ pub fn gather_workspace_context(
     if let Some(path) = latest_session_path.as_deref() {
         let _ = record_session_trajectory(workspace_root, path);
     }
+    let active_trajectory = active_trajectory(workspace_root).ok().flatten();
+    let recall_request = build_portable_recall_request(
+        active_model.or(config.primary_model()),
+        latest_session_events.len(),
+        active_trajectory
+            .as_ref()
+            .map(|record| record.active_files.as_slice())
+            .unwrap_or(&[]),
+    );
     WorkspaceContext {
         workspace_root: workspace_root.to_path_buf(),
         config_source: config.source.clone(),
@@ -131,7 +158,7 @@ pub fn gather_workspace_context(
         trajectory_recall: build_trajectory_recall_text(workspace_root, 3)
             .map(|text| truncate_text(&text, MAX_MEMORY_RECALL_CHARS))
             .unwrap_or_else(|_| "none".to_string()),
-        memory_recall: build_memory_recall_text(workspace_root, 5)
+        memory_recall: build_memory_recall_text_with_request(workspace_root, recall_request)
             .map(|text| truncate_text(&text, MAX_MEMORY_RECALL_CHARS))
             .unwrap_or_else(|_| "none".to_string()),
         file_memory_recall: build_file_memory_recall_text(workspace_root, user_query, 3)
@@ -157,6 +184,7 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
     let mut memory_recall = context.memory_recall.clone();
     let mut file_memory_recall = context.file_memory_recall.clone();
     let mut conversation_recall = context.conversation_recall.clone();
+    let mut truncated_sections = Vec::new();
 
     let mut out = render_prompt_context_sections(
         context,
@@ -170,10 +198,16 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         budget.name,
     );
     if out.chars().count() <= budget.total_chars {
+        emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
         return out;
     }
 
-    conversation_recall = budget_section(&conversation_recall, budget.conversation_recall_chars);
+    conversation_recall = track_budget_section(
+        "conversation_recall",
+        &conversation_recall,
+        budget.conversation_recall_chars,
+        &mut truncated_sections,
+    );
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -186,10 +220,16 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         budget.name,
     );
     if out.chars().count() <= budget.total_chars {
+        emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
         return out;
     }
 
-    file_memory_recall = budget_section(&file_memory_recall, budget.file_memory_recall_chars);
+    file_memory_recall = track_budget_section(
+        "file_memory_recall",
+        &file_memory_recall,
+        budget.file_memory_recall_chars,
+        &mut truncated_sections,
+    );
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -202,10 +242,16 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         budget.name,
     );
     if out.chars().count() <= budget.total_chars {
+        emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
         return out;
     }
 
-    memory_recall = budget_section(&memory_recall, budget.memory_recall_chars);
+    memory_recall = track_budget_section(
+        "memory_recall",
+        &memory_recall,
+        budget.memory_recall_chars,
+        &mut truncated_sections,
+    );
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -218,10 +264,16 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         budget.name,
     );
     if out.chars().count() <= budget.total_chars {
+        emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
         return out;
     }
 
-    recent_history = budget_section(&recent_history, budget.recent_history_chars);
+    recent_history = track_budget_section(
+        "recent_history",
+        &recent_history,
+        budget.recent_history_chars,
+        &mut truncated_sections,
+    );
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -234,10 +286,16 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         budget.name,
     );
     if out.chars().count() <= budget.total_chars {
+        emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
         return out;
     }
 
-    trajectory_recall = budget_section(&trajectory_recall, budget.trajectory_recall_chars);
+    trajectory_recall = track_budget_section(
+        "trajectory_recall",
+        &trajectory_recall,
+        budget.trajectory_recall_chars,
+        &mut truncated_sections,
+    );
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -250,10 +308,16 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         budget.name,
     );
     if out.chars().count() <= budget.total_chars {
+        emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
         return out;
     }
 
-    model_handoff = budget_section(&model_handoff, budget.model_handoff_chars);
+    model_handoff = track_budget_section(
+        "model_handoff",
+        &model_handoff,
+        budget.model_handoff_chars,
+        &mut truncated_sections,
+    );
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -266,10 +330,16 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         budget.name,
     );
     if out.chars().count() <= budget.total_chars {
+        emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
         return out;
     }
 
-    instructions = budget_section(&instructions, budget.instructions_chars);
+    instructions = track_budget_section(
+        "instructions",
+        &instructions,
+        budget.instructions_chars,
+        &mut truncated_sections,
+    );
     out = render_prompt_context_sections(
         context,
         &instructions,
@@ -282,10 +352,14 @@ pub fn render_prompt_context(context: &WorkspaceContext) -> String {
         budget.name,
     );
     if out.chars().count() <= budget.total_chars {
+        emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
         return out;
     }
 
-    truncate_text(&out, budget.total_chars)
+    truncated_sections.push("final_prompt".to_string());
+    let final_out = truncate_text(&out, budget.total_chars);
+    emit_prompt_compaction_checkpoint(context, budget.name, &truncated_sections, &instructions);
+    final_out
 }
 
 fn render_prompt_context_sections(
@@ -415,6 +489,114 @@ fn budget_section(input: &str, max_chars: usize) -> String {
     truncate_text(input, max_chars)
 }
 
+fn track_budget_section(
+    name: &str,
+    input: &str,
+    max_chars: usize,
+    truncated_sections: &mut Vec<String>,
+) -> String {
+    let output = budget_section(input, max_chars);
+    if output != input && !truncated_sections.iter().any(|existing| existing == name) {
+        truncated_sections.push(name.to_string());
+    }
+    output
+}
+
+fn build_portable_recall_request(
+    model: Option<&str>,
+    session_turn_count: usize,
+    active_files: &[String],
+) -> RecallRequest {
+    let budget = context_budget_profile(model);
+    let reserved = budget.instructions_chars
+        + budget.model_handoff_chars
+        + budget.recent_history_chars
+        + budget.trajectory_recall_chars
+        + budget.file_memory_recall_chars
+        + budget.conversation_recall_chars;
+    let memory_tokens = budget.total_chars.saturating_sub(reserved).max(400);
+    let priority = if budget.name == "compact" || session_turn_count >= 24 {
+        "critical-only"
+    } else if !active_files.is_empty() {
+        "balanced"
+    } else {
+        "generous"
+    };
+    RecallRequest {
+        query: None,
+        limit: 5,
+        token_budget: memory_tokens,
+        context_budget: Some(RecallContextBudget {
+            max_tokens: memory_tokens,
+            priority: priority.to_string(),
+            active_files: active_files.to_vec(),
+        }),
+    }
+}
+
+fn emit_prompt_compaction_checkpoint(
+    context: &WorkspaceContext,
+    budget_profile: &str,
+    truncated_sections: &[String],
+    instructions: &str,
+) {
+    if truncated_sections.is_empty() {
+        return;
+    }
+    let turn_count = context
+        .session_path
+        .as_deref()
+        .and_then(|path| SessionStore::read_events(path).ok())
+        .map(|events| events.len())
+        .unwrap_or(0);
+    let kept_summary = format!(
+        "instructions={} recent_history={} trajectory={} portable_memory={}",
+        section_state(instructions),
+        section_state(&context.recent_history),
+        section_state(&context.trajectory_recall),
+        section_state(&context.memory_recall),
+    );
+    let dropped_signals = truncated_sections
+        .iter()
+        .map(|section| match section.as_str() {
+            "conversation_recall" => "older conversation recall".to_string(),
+            "file_memory_recall" => "file memory recall".to_string(),
+            "memory_recall" => "portable memory recall".to_string(),
+            "recent_history" => "recent working history".to_string(),
+            "trajectory_recall" => "active trajectory recall".to_string(),
+            "model_handoff" => "model handoff detail".to_string(),
+            "instructions" => "instruction context".to_string(),
+            other => other.replace('_', " "),
+        })
+        .collect::<Vec<_>>();
+    let report = PromptCompactionReport {
+        kept_summary,
+        dropped_signals,
+        truncated_sections: truncated_sections.to_vec(),
+        budget_profile: budget_profile.to_string(),
+        session_id: context.session_id.clone(),
+        turn_count,
+    };
+    let _ = maybe_record_prompt_compaction_checkpoint(
+        &context.workspace_root,
+        context.session_path.as_deref(),
+        context.session_id.as_deref(),
+        &report.budget_profile,
+        &report.kept_summary,
+        &report.dropped_signals,
+        &report.truncated_sections,
+        report.turn_count,
+    );
+}
+
+fn section_state(input: &str) -> &'static str {
+    if input == "none" {
+        "none"
+    } else {
+        "present"
+    }
+}
+
 fn context_budget_profile(model: Option<&str>) -> ContextBudgetProfile {
     if uses_compact_context_budget(model) {
         return ContextBudgetProfile {
@@ -455,7 +637,8 @@ fn build_recall_reason(
     ));
     if let Some(query) = user_query.map(str::trim).filter(|value| !value.is_empty()) {
         if query.contains('/') || query.contains('.') {
-            reasons.push("query mentions file-like tokens, so file memory was preferred".to_string());
+            reasons
+                .push("query mentions file-like tokens, so file memory was preferred".to_string());
         } else {
             reasons.push("query matched prior task and conversation keywords".to_string());
         }

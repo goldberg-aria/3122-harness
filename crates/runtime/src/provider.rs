@@ -455,7 +455,11 @@ fn http_client() -> Result<Client, String> {
         .map_err(|err| err.to_string())
 }
 
-fn resolve_ollama_fallback_model(client: &Client, base: &str, requested_model: &str) -> Option<String> {
+fn resolve_ollama_fallback_model(
+    client: &Client,
+    base: &str,
+    requested_model: &str,
+) -> Option<String> {
     let url = join_url(base, "/api/tags");
     let response = client.get(url).send().ok()?;
     let status = response.status();
@@ -463,7 +467,11 @@ fn resolve_ollama_fallback_model(client: &Client, base: &str, requested_model: &
         return None;
     }
     let parsed = response.json::<OllamaTagsResponse>().ok()?;
-    let names = parsed.models.into_iter().map(|model| model.name).collect::<Vec<_>>();
+    let names = parsed
+        .models
+        .into_iter()
+        .map(|model| model.name)
+        .collect::<Vec<_>>();
     pick_ollama_fallback_model(&names, requested_model)
 }
 
@@ -982,9 +990,7 @@ fn repair_tool_arguments(arguments: &str) -> String {
     let quote_count = repaired
         .chars()
         .enumerate()
-        .filter(|(index, ch)| {
-            *ch == '"' && (index == &0 || !repaired[..*index].ends_with('\\'))
-        })
+        .filter(|(index, ch)| *ch == '"' && (index == &0 || !repaired[..*index].ends_with('\\')))
         .count();
     if quote_count % 2 == 1 {
         repaired.push('"');
@@ -1096,9 +1102,8 @@ mod tests {
     use super::{
         join_url, parse_anthropic_tool_calls, parse_model_target, parse_ollama_tool_calls,
         parse_openai_tool_calls, pick_ollama_fallback_model, resolve_model_target,
-        resolve_model_target_with_mode,
-        AnthropicContentBlock, OllamaFunctionCall, OllamaToolCall, OpenAiFunctionCall,
-        OpenAiToolCall, ProviderRoute,
+        resolve_model_target_with_mode, AnthropicContentBlock, OllamaFunctionCall, OllamaToolCall,
+        OpenAiFunctionCall, OpenAiToolCall, ProviderRoute,
     };
     use serde_json::json;
 

@@ -45,6 +45,7 @@ pub struct ProvidersConfig {
 pub struct MemoryConfig {
     pub backend: Option<String>,
     pub dual_write_legacy_jsonl: Option<bool>,
+    pub auto_promote_policy: Option<String>,
     #[serde(default)]
     pub nexus_cloud: NexusCloudMemoryConfig,
     #[serde(default)]
@@ -103,17 +104,54 @@ pub struct LoadedConfig {
     pub data: HarnessConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoPromotePolicy {
+    Off,
+    Suggest,
+    Auto,
+}
+
+impl AutoPromotePolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "suggest" => Some(Self::Suggest),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Suggest => "suggest",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl std::fmt::Display for AutoPromotePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl LoadedConfig {
     pub fn memory_backend(&self) -> &str {
-        self.data
-            .memory
-            .backend
-            .as_deref()
-            .unwrap_or("local-amcp")
+        self.data.memory.backend.as_deref().unwrap_or("local-amcp")
     }
 
     pub fn dual_write_legacy_jsonl(&self) -> bool {
         self.data.memory.dual_write_legacy_jsonl.unwrap_or(true)
+    }
+
+    pub fn auto_promote_policy(&self) -> AutoPromotePolicy {
+        self.data
+            .memory
+            .auto_promote_policy
+            .as_deref()
+            .and_then(AutoPromotePolicy::parse)
+            .unwrap_or(AutoPromotePolicy::Suggest)
     }
 
     pub fn default_connection_mode(&self) -> ConnectionMode {
@@ -290,6 +328,7 @@ impl LoadedConfig {
                 "memory_dual_write_legacy_jsonl: {}",
                 self.dual_write_legacy_jsonl()
             ),
+            format!("memory_auto_promote_policy: {}", self.auto_promote_policy()),
             format!(
                 "session_dir: {}",
                 self.session_dir(workspace_root).display()

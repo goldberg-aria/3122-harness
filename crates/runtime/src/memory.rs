@@ -4,13 +4,18 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+
 use crate::session::SessionEvent;
 use crate::SessionStore;
 use crate::{
-    active_trajectory, current_timestamp_iso, default_local_origin, default_local_scope,
-    default_private_retention, load_config, metadata_legacy_kind, metadata_title,
-    record_session_trajectory, resolve_selected_memory_backend, session_key_for_item,
-    source_ref_uri, timestamp_millis, AmcpMemoryItem, AmcpSourceRef,
+    active_trajectory, assess_verification, count_matching_failure_sessions, current_timestamp_iso,
+    default_local_origin, default_local_scope, load_config, load_promotion_candidate,
+    load_skill_candidate, metadata_legacy_kind, metadata_title, normalize_failure_text,
+    pending_promotion_candidate_count, record_session_trajectory, resolve_selected_memory_backend,
+    session_derived_retention, session_key_for_item, source_ref_uri, store_promotion_candidate,
+    timestamp_millis, update_promotion_candidate_status, AmcpMemoryItem, AmcpRetention,
+    AmcpSourceRef, AutoPromotePolicy, RecallRequest, VerificationEvent,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +85,7 @@ pub struct SessionDigest {
 #[derive(Debug, Clone)]
 pub struct SavedMemoryBundle {
     pub saved_records: Vec<MemoryRecord>,
+    pub pending_candidates: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +118,25 @@ pub struct StoredModelHandoff {
     pub snapshot: ModelHandoffSnapshot,
 }
 
+#[derive(Debug, Clone)]
+struct ItemProvenance {
+    origin: String,
+    trigger: String,
+    source_session: Option<String>,
+    source_turns: Vec<usize>,
+    derived_from: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BuildAmcpItemOptions {
+    id_seed: String,
+    legacy_kind: String,
+    item_type: String,
+    retention: AmcpRetention,
+    provenance: ItemProvenance,
+    metadata_extra: Option<Value>,
+}
+
 pub fn memory_dir(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".harness").join("memory")
 }
@@ -126,14 +151,35 @@ pub fn append_memory_record(
 ) -> Result<PathBuf, String> {
     let config = load_config(workspace_root).unwrap_or_default();
     let backend = resolve_selected_memory_backend(workspace_root, &config)?;
-    let item = build_amcp_item(
-        kind,
+    let item = build_amcp_item_with_options(
         title,
         body,
         tags,
         session_path,
         &[],
-        session_path.and_then(|path| SessionStore::session_id_from_path(path)),
+        session_path.and_then(SessionStore::session_id_from_path),
+        BuildAmcpItemOptions {
+            id_seed: format!(
+                "manual-memory|{}|{}|{}|{}",
+                kind.as_str(),
+                title,
+                body,
+                session_path
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            ),
+            legacy_kind: kind.as_str().to_string(),
+            item_type: portable_item_type(kind).to_string(),
+            retention: crate::default_private_retention(),
+            provenance: ItemProvenance {
+                origin: "manual-memory".to_string(),
+                trigger: "append-memory-record".to_string(),
+                source_session: session_path.and_then(SessionStore::session_id_from_path),
+                source_turns: Vec::new(),
+                derived_from: Vec::new(),
+            },
+            metadata_extra: None,
+        },
     );
     let _ = backend.remember(&item)?;
     let record = memory_record_from_item(&item);
@@ -168,7 +214,12 @@ pub fn search_memory_records(
     let config = load_config(workspace_root).unwrap_or_default();
     let backend = resolve_selected_memory_backend(workspace_root, &config)?;
     Ok(backend
-        .recall(Some(&query), 24)?
+        .recall(&RecallRequest {
+            query: Some(query),
+            limit: 24,
+            token_budget: 4000,
+            context_budget: None,
+        })?
         .into_iter()
         .map(|item| memory_record_from_item(&item))
         .collect())
@@ -182,8 +233,8 @@ pub fn save_session_summary(
     let _ = record_session_trajectory(workspace_root, session_path);
     let digest = summarize_session_events(&events);
     let trajectory = active_trajectory(workspace_root).ok().flatten();
-    let item = build_amcp_item(
-        MemoryKind::Summary,
+    let session_id = SessionStore::session_id_from_path(session_path);
+    let item = build_amcp_item_with_options(
         &digest.title,
         &digest.summary,
         &digest.tools,
@@ -192,7 +243,25 @@ pub fn save_session_summary(
             .as_ref()
             .map(|record| record.active_files.clone())
             .unwrap_or_default(),
-        SessionStore::session_id_from_path(session_path),
+        session_id.clone(),
+        BuildAmcpItemOptions {
+            id_seed: format!(
+                "session-summary|{}|{}",
+                session_id.as_deref().unwrap_or("-"),
+                digest.title
+            ),
+            legacy_kind: MemoryKind::Summary.as_str().to_string(),
+            item_type: portable_item_type(MemoryKind::Summary).to_string(),
+            retention: crate::default_private_retention(),
+            provenance: ItemProvenance {
+                origin: "session-promotion".to_string(),
+                trigger: "memory-save".to_string(),
+                source_session: session_id,
+                source_turns: all_event_indexes(&events),
+                derived_from: Vec::new(),
+            },
+            metadata_extra: None,
+        },
     );
     let record = memory_record_from_item(&item);
     let config = load_config(workspace_root).unwrap_or_default();
@@ -217,6 +286,7 @@ pub fn save_session_memory_bundle(
     let config = load_config(workspace_root).unwrap_or_default();
     let backend = resolve_selected_memory_backend(workspace_root, &config)?;
     let mut saved_records = Vec::new();
+    let source_turns = all_event_indexes(&events);
 
     let file_paths = trajectory
         .as_ref()
@@ -224,14 +294,31 @@ pub fn save_session_memory_bundle(
         .unwrap_or_default();
     let session_id = SessionStore::session_id_from_path(session_path);
 
-    let summary_item = build_amcp_item(
-        MemoryKind::Summary,
+    let summary_item = build_amcp_item_with_options(
         &digest.title,
         &digest.summary,
         &digest.tools,
         Some(session_path),
         &file_paths,
         session_id.clone(),
+        BuildAmcpItemOptions {
+            id_seed: format!(
+                "session-summary|{}|{}",
+                session_id.as_deref().unwrap_or("-"),
+                digest.title
+            ),
+            legacy_kind: MemoryKind::Summary.as_str().to_string(),
+            item_type: portable_item_type(MemoryKind::Summary).to_string(),
+            retention: crate::default_private_retention(),
+            provenance: ItemProvenance {
+                origin: "session-promotion".to_string(),
+                trigger: "memory-save".to_string(),
+                source_session: session_id.clone(),
+                source_turns: source_turns.clone(),
+                derived_from: Vec::new(),
+            },
+            metadata_extra: None,
+        },
     );
     if backend.remember(&summary_item)? {
         let record = memory_record_from_item(&summary_item);
@@ -242,14 +329,31 @@ pub fn save_session_memory_bundle(
     }
 
     for goal in &digest.goals {
-        let item = build_amcp_item(
-            MemoryKind::Task,
+        let item = build_amcp_item_with_options(
             goal,
             goal,
             &digest.tools,
             Some(session_path),
             &file_paths,
             session_id.clone(),
+            BuildAmcpItemOptions {
+                id_seed: format!(
+                    "session-task|{}|{}",
+                    session_id.as_deref().unwrap_or("-"),
+                    goal
+                ),
+                legacy_kind: MemoryKind::Task.as_str().to_string(),
+                item_type: portable_item_type(MemoryKind::Task).to_string(),
+                retention: crate::default_private_retention(),
+                provenance: ItemProvenance {
+                    origin: "session-promotion".to_string(),
+                    trigger: "memory-save".to_string(),
+                    source_session: session_id.clone(),
+                    source_turns: source_turns.clone(),
+                    derived_from: Vec::new(),
+                },
+                metadata_extra: None,
+            },
         );
         if backend.remember(&item)? {
             saved_records.push(memory_record_from_item(&item));
@@ -260,14 +364,31 @@ pub fn save_session_memory_bundle(
     }
 
     for error in &digest.errors {
-        let item = build_amcp_item(
-            MemoryKind::Error,
+        let item = build_amcp_item_with_options(
             error,
             error,
             &digest.tools,
             Some(session_path),
             &file_paths,
             session_id.clone(),
+            BuildAmcpItemOptions {
+                id_seed: format!(
+                    "session-error|{}|{}",
+                    session_id.as_deref().unwrap_or("-"),
+                    error
+                ),
+                legacy_kind: MemoryKind::Error.as_str().to_string(),
+                item_type: portable_item_type(MemoryKind::Error).to_string(),
+                retention: crate::default_private_retention(),
+                provenance: ItemProvenance {
+                    origin: "session-promotion".to_string(),
+                    trigger: "memory-save".to_string(),
+                    source_session: session_id.clone(),
+                    source_turns: source_turns.clone(),
+                    derived_from: Vec::new(),
+                },
+                metadata_extra: None,
+            },
         );
         if backend.remember(&item)? {
             saved_records.push(memory_record_from_item(&item));
@@ -277,28 +398,35 @@ pub fn save_session_memory_bundle(
         }
     }
 
-    Ok(SavedMemoryBundle { saved_records })
+    let mut auto_saved = run_auto_promotion_pipeline(
+        workspace_root,
+        session_path,
+        &events,
+        trajectory.as_ref(),
+        &digest,
+        &config,
+        &*backend,
+    )?;
+    saved_records.append(&mut auto_saved);
+
+    Ok(SavedMemoryBundle {
+        saved_records,
+        pending_candidates: pending_promotion_candidate_count(workspace_root).unwrap_or(0),
+    })
 }
 
-fn build_amcp_item(
-    kind: MemoryKind,
+fn build_amcp_item_with_options(
     title: &str,
     body: &str,
     tags: &[String],
     session_path: Option<&Path>,
     file_paths: &[String],
     session_id: Option<String>,
+    options: BuildAmcpItemOptions,
 ) -> AmcpMemoryItem {
     let timestamp = now_ms();
     let timestamp_iso = current_timestamp_iso();
     let session_text = session_path.map(|path| path.display().to_string());
-    let stable_seed = format!(
-        "{}|{}|{}|{}",
-        kind.as_str(),
-        title,
-        body,
-        session_text.as_deref().unwrap_or("-")
-    );
     let mut source_refs = Vec::new();
     if let Some(path) = session_path {
         source_refs.push(AmcpSourceRef {
@@ -315,24 +443,100 @@ fn build_amcp_item(
             uri: format!("file://{path}"),
         });
     }
+    let mut metadata = crate::portable_memory::default_semantic_metadata(
+        title,
+        &options.legacy_kind,
+        session_text.as_deref(),
+    );
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "inference_basis".to_string(),
+            Value::String(options.provenance.trigger.clone()),
+        );
+        object.insert(
+            "provenance".to_string(),
+            json!({
+                "origin": options.provenance.origin,
+                "trigger": options.provenance.trigger,
+                "source_session": options.provenance.source_session,
+                "source_turns": options.provenance.source_turns,
+                "derived_from": options.provenance.derived_from,
+            }),
+        );
+        if let Some(extra) = options.metadata_extra {
+            merge_metadata_map(object, extra);
+        }
+    }
     AmcpMemoryItem {
-        id: format!("amcp-{}", stable_hex_hash(&stable_seed)),
+        id: format!("amcp-{}", stable_hex_hash(&options.id_seed)),
         content: body.to_string(),
-        item_type: portable_item_type(kind).to_string(),
+        item_type: options.item_type,
         scope: default_local_scope(),
         origin: default_local_origin(session_id.as_deref(), timestamp),
         visibility: "private".to_string(),
-        retention: default_private_retention(),
+        retention: options.retention,
         tags: tags.to_vec(),
-        metadata: crate::portable_memory::default_semantic_metadata(
-            title,
-            kind.as_str(),
-            session_text.as_deref(),
-        ),
+        metadata,
         source_refs,
         energy: 1.0,
         created_at: timestamp_iso.clone(),
         updated_at: timestamp_iso,
+    }
+}
+
+fn merge_metadata_map(target: &mut Map<String, Value>, extra: Value) {
+    let Some(extra_map) = extra.as_object() else {
+        return;
+    };
+    for (key, value) in extra_map {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn all_event_indexes(events: &[SessionEvent]) -> Vec<usize> {
+    (0..events.len()).collect()
+}
+
+fn session_verification_events(events: &[SessionEvent]) -> Vec<VerificationEvent> {
+    let mut verification_events = Vec::new();
+    for event in events {
+        match event.kind.as_str() {
+            "agent_tool" => {
+                if let Some(arguments) = event.payload.get("arguments").and_then(Value::as_object) {
+                    verification_events.push(VerificationEvent {
+                        name: event
+                            .payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool")
+                            .to_string(),
+                        arguments: Value::Object(arguments.clone()),
+                    });
+                }
+            }
+            "tool_result" | "tool_error" => {
+                let command = event
+                    .payload
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                verification_events.push(VerificationEvent {
+                    name: "exec".to_string(),
+                    arguments: json!({ "command": command }),
+                });
+            }
+            _ => {}
+        }
+    }
+    verification_events
+}
+
+fn default_recall_request(limit: usize) -> RecallRequest {
+    RecallRequest {
+        query: None,
+        limit: limit.max(1),
+        token_budget: 4000,
+        context_budget: None,
     }
 }
 
@@ -588,7 +792,10 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
             out.push_str(&format!("Active model: {model}\n"));
         }
         if !trajectory.active_files.is_empty() {
-            out.push_str(&format!("Active files: {}\n", trajectory.active_files.join(", ")));
+            out.push_str(&format!(
+                "Active files: {}\n",
+                trajectory.active_files.join(", ")
+            ));
         }
         out.push('\n');
     }
@@ -620,13 +827,16 @@ pub fn build_handoff_text(workspace_root: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-pub fn build_memory_recall_text(workspace_root: &Path, limit: usize) -> Result<String, String> {
+pub fn build_memory_recall_text_with_request(
+    workspace_root: &Path,
+    request: RecallRequest,
+) -> Result<String, String> {
     if let Some(path) = SessionStore::latest(workspace_root)? {
         let _ = record_session_trajectory(workspace_root, &path);
     }
     let config = load_config(workspace_root).unwrap_or_default();
     let backend = resolve_selected_memory_backend(workspace_root, &config)?;
-    let items = backend.recall(None, limit.max(1))?;
+    let items = backend.recall(&request)?;
     if items.is_empty() {
         return Ok("none".to_string());
     }
@@ -639,7 +849,7 @@ pub fn build_memory_recall_text(workspace_root: &Path, limit: usize) -> Result<S
         if seen.insert(key) {
             deduped.push(record);
         }
-        if deduped.len() >= limit {
+        if deduped.len() >= request.limit.max(1) {
             break;
         }
     }
@@ -651,6 +861,504 @@ pub fn build_memory_recall_text(workspace_root: &Path, limit: usize) -> Result<S
         out.push_str("\n\n");
     }
     Ok(out.trim().to_string())
+}
+
+pub fn build_memory_recall_text(workspace_root: &Path, limit: usize) -> Result<String, String> {
+    build_memory_recall_text_with_request(workspace_root, default_recall_request(limit))
+}
+
+pub fn list_memory_candidates(
+    workspace_root: &Path,
+    limit: usize,
+) -> Result<Vec<crate::PromotionCandidate>, String> {
+    crate::list_promotion_candidates(workspace_root, limit)
+}
+
+pub fn promote_memory_candidate(
+    workspace_root: &Path,
+    candidate_id: i64,
+) -> Result<Option<MemoryRecord>, String> {
+    let Some(candidate) = load_promotion_candidate(workspace_root, candidate_id)? else {
+        return Ok(None);
+    };
+    let config = load_config(workspace_root).unwrap_or_default();
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    let inserted = backend.remember(&candidate.item)?;
+    let _ = update_promotion_candidate_status(workspace_root, candidate_id, "promoted");
+    Ok(inserted.then(|| memory_record_from_item(&candidate.item)))
+}
+
+pub fn dismiss_memory_candidate(workspace_root: &Path, candidate_id: i64) -> Result<bool, String> {
+    update_promotion_candidate_status(workspace_root, candidate_id, "dismissed")
+}
+
+pub fn maybe_record_prompt_compaction_checkpoint(
+    workspace_root: &Path,
+    session_path: Option<&Path>,
+    session_id: Option<&str>,
+    budget_profile: &str,
+    kept_summary: &str,
+    dropped_signals: &[String],
+    truncated_sections: &[String],
+    turn_count: usize,
+) -> Result<Option<MemoryRecord>, String> {
+    if truncated_sections.is_empty() {
+        return Ok(None);
+    }
+    let config = load_config(workspace_root).unwrap_or_default();
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    let capabilities = backend
+        .capabilities()
+        .unwrap_or_else(|_| crate::AmcpBackendCapabilities::minimal());
+    if !capabilities.supports_compaction_checkpoints {
+        return Ok(None);
+    }
+
+    let item = build_amcp_item_with_options(
+        "Prompt compaction checkpoint",
+        &format!(
+            "Prompt context compaction occurred.\nBudget profile: {budget_profile}\nTruncated sections: {}\nKept summary: {kept_summary}",
+            truncated_sections.join(", ")
+        ),
+        &["compaction-checkpoint".to_string(), "prompt-compaction".to_string()],
+        session_path,
+        &[],
+        session_id.map(ToOwned::to_owned),
+        BuildAmcpItemOptions {
+            id_seed: format!(
+                "prompt-compaction|{}|{}|{}",
+                session_id.unwrap_or("-"),
+                turn_count,
+                truncated_sections.join("|")
+            ),
+            legacy_kind: MemoryKind::Note.as_str().to_string(),
+            item_type: "compaction-checkpoint".to_string(),
+            retention: session_derived_retention(),
+            provenance: ItemProvenance {
+                origin: "compaction".to_string(),
+                trigger: "prompt-compaction".to_string(),
+                source_session: session_id.map(ToOwned::to_owned),
+                source_turns: (0..turn_count).collect(),
+                derived_from: Vec::new(),
+            },
+            metadata_extra: Some(json!({
+                "budget_profile": budget_profile,
+                "kept_summary": kept_summary,
+                "dropped_signals": dropped_signals,
+                "truncated_sections": truncated_sections,
+                "turn_count": turn_count,
+            })),
+        },
+    );
+    let inserted = backend.remember(&item)?;
+    if inserted {
+        maybe_append_compaction_event(
+            session_path,
+            &item.id,
+            budget_profile,
+            dropped_signals,
+            truncated_sections,
+        )?;
+    }
+    Ok(inserted.then(|| memory_record_from_item(&item)))
+}
+
+pub fn maybe_track_skill_candidate_promotion(
+    workspace_root: &Path,
+    candidate_id: i64,
+) -> Result<Option<MemoryRecord>, String> {
+    let Some(candidate) = load_skill_candidate(workspace_root, candidate_id)? else {
+        return Ok(None);
+    };
+    let config = load_config(workspace_root).unwrap_or_default();
+    let policy = config.auto_promote_policy();
+    if policy == AutoPromotePolicy::Off {
+        return Ok(None);
+    }
+    let item = build_amcp_item_with_options(
+        &candidate.command_name,
+        &format!(
+            "Promoted repeated workflow `{}` into a slash command. Sequence: {}",
+            candidate.command_name,
+            candidate.tool_sequence.join(" -> ")
+        ),
+        &[
+            "trajectory-auto".to_string(),
+            "skill-command-promoted".to_string(),
+        ],
+        None,
+        &[],
+        None,
+        BuildAmcpItemOptions {
+            id_seed: format!("skill-command-promoted|{}", candidate.id),
+            legacy_kind: MemoryKind::Note.as_str().to_string(),
+            item_type: "context".to_string(),
+            retention: session_derived_retention(),
+            provenance: ItemProvenance {
+                origin: "trajectory-auto".to_string(),
+                trigger: "skill-command-promoted".to_string(),
+                source_session: None,
+                source_turns: Vec::new(),
+                derived_from: Vec::new(),
+            },
+            metadata_extra: Some(json!({
+                "command_name": candidate.command_name,
+                "tool_sequence": candidate.tool_sequence,
+            })),
+        },
+    );
+    let backend = resolve_selected_memory_backend(workspace_root, &config)?;
+    submit_auto_promotion_item(
+        workspace_root,
+        policy,
+        &*backend,
+        "skill-command-promoted",
+        "Workflow promoted to reusable command",
+        None,
+        &item,
+    )
+}
+
+fn run_auto_promotion_pipeline(
+    workspace_root: &Path,
+    session_path: &Path,
+    events: &[SessionEvent],
+    trajectory: Option<&crate::TrajectoryRecord>,
+    digest: &SessionDigest,
+    config: &crate::LoadedConfig,
+    backend: &dyn crate::AmcpMemoryBackend,
+) -> Result<Vec<MemoryRecord>, String> {
+    let policy = config.auto_promote_policy();
+    if policy == AutoPromotePolicy::Off {
+        return Ok(Vec::new());
+    }
+
+    let mut saved = Vec::new();
+    let session_id = SessionStore::session_id_from_path(session_path);
+    let file_paths = trajectory
+        .map(|record| record.active_files.clone())
+        .unwrap_or_default();
+    let source_turns = all_event_indexes(events);
+
+    if let Some(item) = build_verified_completion_item(
+        workspace_root,
+        session_path,
+        events,
+        digest,
+        trajectory,
+        &file_paths,
+        session_id.clone(),
+        source_turns.clone(),
+    ) {
+        if let Some(record) = submit_auto_promotion_item(
+            workspace_root,
+            policy,
+            backend,
+            "verification-passed",
+            "Verified successful task completion",
+            session_id.as_deref(),
+            &item,
+        )? {
+            saved.push(record);
+        }
+    }
+
+    if let Some(item) = build_repeated_failure_item(
+        workspace_root,
+        session_path,
+        trajectory,
+        &file_paths,
+        session_id.clone(),
+    )? {
+        if let Some(record) = submit_auto_promotion_item(
+            workspace_root,
+            policy,
+            backend,
+            "repeated-failure-pattern",
+            "Repeated failure pattern detected across sessions",
+            session_id.as_deref(),
+            &item,
+        )? {
+            saved.push(record);
+        }
+    }
+
+    if let Some(item) = build_handoff_consumed_item(
+        session_path,
+        events,
+        trajectory,
+        &file_paths,
+        session_id.clone(),
+    ) {
+        if let Some(record) = submit_auto_promotion_item(
+            workspace_root,
+            policy,
+            backend,
+            "handoff-consumed",
+            "Model handoff context boost was consumed",
+            session_id.as_deref(),
+            &item,
+        )? {
+            saved.push(record);
+        }
+    }
+
+    Ok(saved)
+}
+
+fn build_verified_completion_item(
+    workspace_root: &Path,
+    session_path: &Path,
+    events: &[SessionEvent],
+    digest: &SessionDigest,
+    trajectory: Option<&crate::TrajectoryRecord>,
+    file_paths: &[String],
+    session_id: Option<String>,
+    source_turns: Vec<usize>,
+) -> Option<AmcpMemoryItem> {
+    let verification = assess_verification(workspace_root, &session_verification_events(events));
+    if !verification.requires_verification || !verification.has_verification_after_last_mutation {
+        return None;
+    }
+    let outcome = digest.last_assistant_text.as_deref()?.trim();
+    if outcome.is_empty() {
+        return None;
+    }
+    let goal = trajectory
+        .map(|record| record.current_goal.clone())
+        .or_else(|| digest.goals.first().cloned())
+        .unwrap_or_else(|| "Completed task".to_string());
+    let body = format!(
+        "Goal: {goal}\nOutcome: {outcome}\nFiles: {}",
+        if file_paths.is_empty() {
+            "-".to_string()
+        } else {
+            file_paths.join(", ")
+        }
+    );
+    Some(build_amcp_item_with_options(
+        &goal,
+        &body,
+        &[
+            "trajectory-auto".to_string(),
+            "verification-passed".to_string(),
+        ],
+        Some(session_path),
+        file_paths,
+        session_id.clone(),
+        BuildAmcpItemOptions {
+            id_seed: format!(
+                "verification-passed|{}",
+                session_id.as_deref().unwrap_or("-")
+            ),
+            legacy_kind: MemoryKind::Note.as_str().to_string(),
+            item_type: "context".to_string(),
+            retention: session_derived_retention(),
+            provenance: ItemProvenance {
+                origin: "trajectory-auto".to_string(),
+                trigger: "verification-passed".to_string(),
+                source_session: session_id,
+                source_turns,
+                derived_from: Vec::new(),
+            },
+            metadata_extra: Some(json!({
+                "goal": goal,
+                "outcome": outcome,
+                "files_touched": file_paths,
+            })),
+        },
+    ))
+}
+
+fn build_repeated_failure_item(
+    workspace_root: &Path,
+    session_path: &Path,
+    trajectory: Option<&crate::TrajectoryRecord>,
+    file_paths: &[String],
+    session_id: Option<String>,
+) -> Result<Option<AmcpMemoryItem>, String> {
+    let Some(failure) = trajectory.and_then(|record| record.latest_failure.clone()) else {
+        return Ok(None);
+    };
+    let normalized = normalize_failure_text(&failure);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if count_matching_failure_sessions(workspace_root, &normalized)? < 3 {
+        return Ok(None);
+    }
+    let body = format!(
+        "Repeated failure pattern: {failure}\nNormalized class: {normalized}\nFiles: {}",
+        if file_paths.is_empty() {
+            "-".to_string()
+        } else {
+            file_paths.join(", ")
+        }
+    );
+    Ok(Some(build_amcp_item_with_options(
+        &failure,
+        &body,
+        &[
+            "trajectory-auto".to_string(),
+            "repeated-failure-pattern".to_string(),
+        ],
+        Some(session_path),
+        file_paths,
+        session_id.clone(),
+        BuildAmcpItemOptions {
+            id_seed: format!("repeated-failure-pattern|{normalized}"),
+            legacy_kind: MemoryKind::Error.as_str().to_string(),
+            item_type: "error".to_string(),
+            retention: session_derived_retention(),
+            provenance: ItemProvenance {
+                origin: "trajectory-auto".to_string(),
+                trigger: "repeated-failure-pattern".to_string(),
+                source_session: session_id,
+                source_turns: Vec::new(),
+                derived_from: Vec::new(),
+            },
+            metadata_extra: Some(json!({
+                "normalized_failure": normalized,
+                "files_touched": file_paths,
+            })),
+        },
+    )))
+}
+
+fn build_handoff_consumed_item(
+    session_path: &Path,
+    events: &[SessionEvent],
+    trajectory: Option<&crate::TrajectoryRecord>,
+    file_paths: &[String],
+    session_id: Option<String>,
+) -> Option<AmcpMemoryItem> {
+    let handoff_index = events
+        .iter()
+        .rposition(|event| event.kind == "model_handoff")?;
+    let consumed_index =
+        events
+            .iter()
+            .enumerate()
+            .skip(handoff_index + 1)
+            .find_map(|(index, event)| {
+                matches!(event.kind.as_str(), "agent_result" | "prompt_result").then_some(index)
+            })?;
+    let goal = trajectory
+        .map(|record| record.current_goal.clone())
+        .unwrap_or_else(|| "Model handoff".to_string());
+    let body = format!(
+        "Model handoff context boost was consumed.\nGoal: {goal}\nFiles: {}",
+        if file_paths.is_empty() {
+            "-".to_string()
+        } else {
+            file_paths.join(", ")
+        }
+    );
+    Some(build_amcp_item_with_options(
+        &goal,
+        &body,
+        &[
+            "trajectory-auto".to_string(),
+            "handoff-consumed".to_string(),
+        ],
+        Some(session_path),
+        file_paths,
+        session_id.clone(),
+        BuildAmcpItemOptions {
+            id_seed: format!(
+                "handoff-consumed|{}|{}",
+                session_id.as_deref().unwrap_or("-"),
+                handoff_index
+            ),
+            legacy_kind: MemoryKind::Note.as_str().to_string(),
+            item_type: "context".to_string(),
+            retention: session_derived_retention(),
+            provenance: ItemProvenance {
+                origin: "handoff-derived".to_string(),
+                trigger: "handoff-consumed".to_string(),
+                source_session: session_id,
+                source_turns: vec![handoff_index, consumed_index],
+                derived_from: Vec::new(),
+            },
+            metadata_extra: Some(json!({
+                "handoff_event_index": handoff_index,
+                "consumed_event_index": consumed_index,
+                "files_touched": file_paths,
+            })),
+        },
+    ))
+}
+
+fn submit_auto_promotion_item(
+    workspace_root: &Path,
+    policy: AutoPromotePolicy,
+    backend: &dyn crate::AmcpMemoryBackend,
+    trigger: &str,
+    summary: &str,
+    session_id: Option<&str>,
+    item: &AmcpMemoryItem,
+) -> Result<Option<MemoryRecord>, String> {
+    match policy {
+        AutoPromotePolicy::Off => Ok(None),
+        AutoPromotePolicy::Suggest => {
+            let _ = store_promotion_candidate(
+                workspace_root,
+                trigger,
+                summary,
+                session_id,
+                item,
+                "pending",
+            )?;
+            Ok(None)
+        }
+        AutoPromotePolicy::Auto => {
+            let inserted = backend.remember(item)?;
+            let _ = store_promotion_candidate(
+                workspace_root,
+                trigger,
+                summary,
+                session_id,
+                item,
+                "auto-saved",
+            );
+            Ok(inserted.then(|| memory_record_from_item(item)))
+        }
+    }
+}
+
+fn maybe_append_compaction_event(
+    session_path: Option<&Path>,
+    fingerprint: &str,
+    budget_profile: &str,
+    dropped_signals: &[String],
+    truncated_sections: &[String],
+) -> Result<(), String> {
+    let Some(session_path) = session_path else {
+        return Ok(());
+    };
+    let events = SessionStore::read_events(session_path).unwrap_or_default();
+    if events.iter().any(|event| {
+        event.kind == "prompt_compaction"
+            && event.payload.get("fingerprint").and_then(Value::as_str) == Some(fingerprint)
+    }) {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(session_path)
+        .map_err(|err| err.to_string())?;
+    let line = serde_json::to_string(&SessionEvent {
+        ts_ms: now_ms(),
+        kind: "prompt_compaction".to_string(),
+        payload: json!({
+            "fingerprint": fingerprint,
+            "budget_profile": budget_profile,
+            "dropped_signals": dropped_signals,
+            "truncated_sections": truncated_sections,
+        }),
+    })
+    .map_err(|err| err.to_string())?;
+    writeln!(file, "{line}").map_err(|err| err.to_string())
 }
 
 pub fn build_model_handoff_snapshot(
@@ -1021,8 +1729,9 @@ mod tests {
 
     use super::{
         append_memory_record, build_handoff_text, build_memory_recall_text,
-        build_model_handoff_snapshot, build_resume_text, latest_model_handoff, list_memory_records,
-        pending_model_handoff, save_session_memory_bundle, save_session_summary,
+        build_model_handoff_snapshot, build_resume_text, latest_model_handoff,
+        list_memory_candidates, list_memory_records, pending_model_handoff,
+        promote_memory_candidate, save_session_memory_bundle, save_session_summary,
         search_memory_records, summarize_session_events, MemoryKind,
     };
 
@@ -1175,7 +1884,10 @@ mod tests {
             },
         ]);
 
-        assert_eq!(digest.goals, vec!["현재 프로젝트 구조를 설명해".to_string()]);
+        assert_eq!(
+            digest.goals,
+            vec!["현재 프로젝트 구조를 설명해".to_string()]
+        );
     }
 
     #[test]
@@ -1353,6 +2065,61 @@ mod tests {
 
         let recall = build_memory_recall_text(&workspace, 5).unwrap();
         assert_eq!(recall.matches("Same title").count(), 1);
+
+        cleanup(&workspace);
+    }
+
+    #[test]
+    fn suggest_auto_promotion_creates_pending_candidate_and_can_promote_it() {
+        let workspace = temp_workspace("memory-auto-promote");
+        let session_path = workspace.join(".harness/sessions/session-test.jsonl");
+        fs::write(
+            &session_path,
+            [
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 1,
+                    kind: "user_input".to_string(),
+                    payload: json!({ "text": "finish the provider refactor" }),
+                })
+                .unwrap(),
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 2,
+                    kind: "agent_tool".to_string(),
+                    payload: json!({
+                        "name": "edit",
+                        "arguments": { "path": "src/lib.rs", "needle": "old", "replacement": "new" },
+                        "summary": "updated provider wiring"
+                    }),
+                })
+                .unwrap(),
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 3,
+                    kind: "tool_result".to_string(),
+                    payload: json!({ "command": "cargo test --workspace", "summary": "tests passed" }),
+                })
+                .unwrap(),
+                serde_json::to_string(&SessionEvent {
+                    ts_ms: 4,
+                    kind: "agent_result".to_string(),
+                    payload: json!({ "text": "provider refactor verified and complete" }),
+                })
+                .unwrap(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let bundle = save_session_memory_bundle(&workspace, &session_path).unwrap();
+        assert!(bundle.pending_candidates >= 1);
+
+        let candidates = list_memory_candidates(&workspace, 8).unwrap();
+        let verification_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.trigger == "verification-passed")
+            .unwrap();
+        let promoted = promote_memory_candidate(&workspace, verification_candidate.id).unwrap();
+        assert!(promoted.is_some());
+        assert!(list_memory_candidates(&workspace, 8).unwrap().is_empty());
 
         cleanup(&workspace);
     }

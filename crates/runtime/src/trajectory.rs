@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::session::SessionEvent;
-use crate::SessionStore;
+use crate::{parse_items_jsonl, AmcpMemoryItem, SessionStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrajectoryRecord {
@@ -60,6 +60,18 @@ pub struct FileMemoryRecord {
     pub last_failure: Option<String>,
     pub last_verification: Option<String>,
     pub session_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PromotionCandidate {
+    pub id: i64,
+    pub trigger: String,
+    pub status: String,
+    pub summary: String,
+    pub session_id: Option<String>,
+    pub created_ts_ms: u128,
+    pub updated_ts_ms: u128,
+    pub item: AmcpMemoryItem,
 }
 
 struct DerivedTrajectory {
@@ -171,6 +183,41 @@ pub fn search_trajectories(
     Ok(records)
 }
 
+pub fn count_matching_failure_sessions(
+    workspace_root: &Path,
+    normalized_failure: &str,
+) -> Result<usize, String> {
+    let normalized_failure = normalized_failure.trim();
+    if normalized_failure.is_empty() {
+        return Ok(0);
+    }
+    let connection = open_memory_db(workspace_root)?;
+    let mut statement = connection
+        .prepare("SELECT session_id, session_path, latest_failure FROM trajectories")
+        .map_err(|err| err.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|err| err.to_string())?;
+    let mut sessions = HashSet::new();
+    for row in rows {
+        let (session_id, session_path, latest_failure) = row.map_err(|err| err.to_string())?;
+        let Some(latest_failure) = latest_failure else {
+            continue;
+        };
+        if normalize_failure_text(&latest_failure) != normalized_failure {
+            continue;
+        }
+        sessions.insert(session_id.unwrap_or(session_path));
+    }
+    Ok(sessions.len())
+}
+
 pub fn build_trajectory_recall_text(workspace_root: &Path, limit: usize) -> Result<String, String> {
     let mut sections = Vec::new();
     if let Some(active) = active_trajectory(workspace_root)? {
@@ -269,7 +316,139 @@ pub fn promote_skill_candidate(
     candidate_id: i64,
 ) -> Result<PathBuf, String> {
     let connection = open_memory_db(workspace_root)?;
-    let candidate = connection
+    let candidate = load_skill_candidate_from_connection(&connection, candidate_id)?
+        .ok_or_else(|| format!("skill candidate not found: {candidate_id}"))?;
+
+    let dir = workspace_root.join(".harness").join("commands");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join(format!("{}.toml", candidate.command_name));
+    if path.exists() {
+        return Err(format!("command already exists: {}", path.display()));
+    }
+    let prompt = candidate.prompt.replace('"', "\\\"");
+    let contents = format!(
+        "name = \"{name}\"\ndescription = \"{description}\"\nkind = \"prompt-template\"\nusage = \"/{name} [task]\"\nprompt = \"{prompt} {{args}}\"\n",
+        name = candidate.command_name,
+        description = candidate.description.replace('"', "\\\""),
+        prompt = prompt
+    );
+    fs::write(&path, contents).map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
+pub fn load_skill_candidate(
+    workspace_root: &Path,
+    candidate_id: i64,
+) -> Result<Option<SkillCandidate>, String> {
+    let connection = open_memory_db(workspace_root)?;
+    load_skill_candidate_from_connection(&connection, candidate_id)
+}
+
+pub fn list_promotion_candidates(
+    workspace_root: &Path,
+    limit: usize,
+) -> Result<Vec<PromotionCandidate>, String> {
+    let connection = open_memory_db(workspace_root)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, trigger, status, summary, session_id, created_ts_ms, updated_ts_ms, item_json
+             FROM promotion_candidates
+             WHERE status = 'pending'
+             ORDER BY updated_ts_ms DESC, id DESC
+             LIMIT ?1",
+        )
+        .map_err(|err| err.to_string())?;
+    let rows = statement
+        .query_map([limit.max(1) as i64], row_to_promotion_candidate)
+        .map_err(|err| err.to_string())?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        candidates.push(row.map_err(|err| err.to_string())?);
+    }
+    Ok(candidates)
+}
+
+pub fn pending_promotion_candidate_count(workspace_root: &Path) -> Result<usize, String> {
+    let connection = open_memory_db(workspace_root)?;
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM promotion_candidates WHERE status = 'pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .map_err(|err| err.to_string())
+}
+
+pub fn store_promotion_candidate(
+    workspace_root: &Path,
+    trigger: &str,
+    summary: &str,
+    session_id: Option<&str>,
+    item: &AmcpMemoryItem,
+    status: &str,
+) -> Result<bool, String> {
+    let connection = open_memory_db(workspace_root)?;
+    connection
+        .execute(
+            "INSERT INTO promotion_candidates (
+               candidate_key, trigger, status, summary, session_id, created_ts_ms, updated_ts_ms, item_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(candidate_key) DO NOTHING",
+            params![
+                item.id,
+                trigger,
+                status,
+                summary,
+                session_id,
+                to_sql_i64(now_ms()),
+                to_sql_i64(now_ms()),
+                serde_json::to_string(item).map_err(|err| err.to_string())?,
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(connection.changes() > 0)
+}
+
+pub fn load_promotion_candidate(
+    workspace_root: &Path,
+    candidate_id: i64,
+) -> Result<Option<PromotionCandidate>, String> {
+    let connection = open_memory_db(workspace_root)?;
+    connection
+        .query_row(
+            "SELECT id, trigger, status, summary, session_id, created_ts_ms, updated_ts_ms, item_json
+             FROM promotion_candidates
+             WHERE id = ?1",
+            [candidate_id],
+            row_to_promotion_candidate,
+        )
+        .optional()
+        .map_err(|err| err.to_string())
+}
+
+pub fn update_promotion_candidate_status(
+    workspace_root: &Path,
+    candidate_id: i64,
+    status: &str,
+) -> Result<bool, String> {
+    let connection = open_memory_db(workspace_root)?;
+    let updated = connection
+        .execute(
+            "UPDATE promotion_candidates
+             SET status = ?2, updated_ts_ms = ?3
+             WHERE id = ?1",
+            params![candidate_id, status, to_sql_i64(now_ms())],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(updated > 0)
+}
+
+fn load_skill_candidate_from_connection(
+    connection: &Connection,
+    candidate_id: i64,
+) -> Result<Option<SkillCandidate>, String> {
+    connection
         .query_row(
             "SELECT id, command_name, description, prompt, tool_sequence_json, occurrence_count,
                     first_seen_ts_ms, last_seen_ts_ms
@@ -291,30 +470,14 @@ pub fn promote_skill_candidate(
             },
         )
         .optional()
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| format!("skill candidate not found: {candidate_id}"))?;
-
-    let dir = workspace_root.join(".harness").join("commands");
-    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join(format!("{}.toml", candidate.command_name));
-    if path.exists() {
-        return Err(format!("command already exists: {}", path.display()));
-    }
-    let prompt = candidate.prompt.replace('"', "\\\"");
-    let contents = format!(
-        "name = \"{name}\"\ndescription = \"{description}\"\nkind = \"prompt-template\"\nusage = \"/{name} [task]\"\nprompt = \"{prompt} {{args}}\"\n",
-        name = candidate.command_name,
-        description = candidate.description.replace('"', "\\\""),
-        prompt = prompt
-    );
-    fs::write(&path, contents).map_err(|err| err.to_string())?;
-    Ok(path)
+        .map_err(|err| err.to_string())
 }
 
 fn open_memory_db(workspace_root: &Path) -> Result<Connection, String> {
     let harness_dir = workspace_root.join(".harness");
     fs::create_dir_all(&harness_dir).map_err(|err| err.to_string())?;
-    let connection = Connection::open(memory_db_path(workspace_root)).map_err(|err| err.to_string())?;
+    let connection =
+        Connection::open(memory_db_path(workspace_root)).map_err(|err| err.to_string())?;
     connection
         .execute_batch(
             "PRAGMA foreign_keys = ON;
@@ -374,6 +537,17 @@ fn open_memory_db(workspace_root: &Path) -> Result<Connection, String> {
                last_verification TEXT,
                session_path TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS promotion_candidates (
+               id INTEGER PRIMARY KEY,
+               candidate_key TEXT NOT NULL UNIQUE,
+               trigger TEXT NOT NULL,
+               status TEXT NOT NULL,
+               summary TEXT NOT NULL,
+               session_id TEXT,
+               created_ts_ms INTEGER NOT NULL,
+               updated_ts_ms INTEGER NOT NULL,
+               item_json TEXT NOT NULL
+             );
              CREATE VIRTUAL TABLE IF NOT EXISTS trajectory_fts USING fts5(
                title, current_goal, recent_work_summary, latest_attempt, latest_failure, next_step
              );",
@@ -421,10 +595,13 @@ fn upsert_trajectory(connection: &Connection, derived: &DerivedTrajectory) -> Re
                 derived.record.latest_failure,
                 derived.record.last_verification,
                 derived.record.next_step,
-                serde_json::to_string(&derived.record.active_files).map_err(|err| err.to_string())?,
+                serde_json::to_string(&derived.record.active_files)
+                    .map_err(|err| err.to_string())?,
                 serde_json::to_string(&derived.record.open_tasks).map_err(|err| err.to_string())?,
-                serde_json::to_string(&derived.record.recent_errors).map_err(|err| err.to_string())?,
-                serde_json::to_string(&derived.record.verification_hints).map_err(|err| err.to_string())?,
+                serde_json::to_string(&derived.record.recent_errors)
+                    .map_err(|err| err.to_string())?,
+                serde_json::to_string(&derived.record.verification_hints)
+                    .map_err(|err| err.to_string())?,
             ],
         )
         .map_err(|err| err.to_string())?;
@@ -460,7 +637,10 @@ fn upsert_trajectory(connection: &Connection, derived: &DerivedTrajectory) -> Re
     }
 
     connection
-        .execute("DELETE FROM trajectory_fts WHERE rowid = ?1", [trajectory_id])
+        .execute(
+            "DELETE FROM trajectory_fts WHERE rowid = ?1",
+            [trajectory_id],
+        )
         .map_err(|err| err.to_string())?;
     connection
         .execute(
@@ -587,7 +767,11 @@ fn relevant_file_memories(
         let lowered = query.to_ascii_lowercase();
         for token in lowered.split_whitespace() {
             if token.contains('/') || token.contains('.') {
-                targets.push(token.trim_matches(|ch: char| ",:;()[]{}".contains(ch)).to_string());
+                targets.push(
+                    token
+                        .trim_matches(|ch: char| ",:;()[]{}".contains(ch))
+                        .to_string(),
+                );
             }
         }
     }
@@ -685,6 +869,45 @@ fn row_to_trajectory(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrajectoryReco
     })
 }
 
+fn row_to_promotion_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromotionCandidate> {
+    let item_json = row.get::<_, String>(7)?;
+    let item = parse_items_jsonl(&item_json)
+        .ok()
+        .and_then(|mut items| {
+            if items.is_empty() {
+                None
+            } else {
+                Some(items.remove(0))
+            }
+        })
+        .or_else(|| serde_json::from_str::<AmcpMemoryItem>(&item_json).ok())
+        .unwrap_or_else(|| AmcpMemoryItem {
+            id: "invalid".to_string(),
+            content: String::new(),
+            item_type: "context".to_string(),
+            scope: crate::default_local_scope(),
+            origin: crate::default_local_origin(None, 0),
+            visibility: "private".to_string(),
+            retention: crate::default_private_retention(),
+            tags: Vec::new(),
+            metadata: Value::Null,
+            source_refs: Vec::new(),
+            energy: 0.0,
+            created_at: crate::iso_timestamp_from_millis(0),
+            updated_at: crate::iso_timestamp_from_millis(0),
+        });
+    Ok(PromotionCandidate {
+        id: row.get(0)?,
+        trigger: row.get(1)?,
+        status: row.get(2)?,
+        summary: row.get(3)?,
+        session_id: row.get(4)?,
+        created_ts_ms: row.get::<_, i64>(5)?.max(0) as u128,
+        updated_ts_ms: row.get::<_, i64>(6)?.max(0) as u128,
+        item,
+    })
+}
+
 fn derive_trajectory(
     workspace_root: &Path,
     session_path: &Path,
@@ -705,7 +928,11 @@ fn derive_trajectory(
     let next_step = open_tasks
         .first()
         .map(|goal| format!("Continue with: {goal}"))
-        .or_else(|| latest_failure.as_ref().map(|failure| format!("Recover from: {failure}")))
+        .or_else(|| {
+            latest_failure
+                .as_ref()
+                .map(|failure| format!("Recover from: {failure}"))
+        })
         .unwrap_or_else(|| "Continue the current task with the latest context.".to_string());
     let verification_hints = project_verification_hints(workspace_root);
     let steps = build_trajectory_steps(events);
@@ -745,16 +972,21 @@ fn derive_trajectory(
 }
 
 fn latest_goal(events: &[SessionEvent]) -> Option<String> {
-    events.iter().rev().find_map(|event| match event.kind.as_str() {
-        "user_input" | "prompt_start" => event
-            .payload
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty() && !text.starts_with('/') && !is_low_signal_user_text(text))
-            .map(ToOwned::to_owned),
-        _ => None,
-    })
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event.kind.as_str() {
+            "user_input" | "prompt_start" => event
+                .payload
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| {
+                    !text.is_empty() && !text.starts_with('/') && !is_low_signal_user_text(text)
+                })
+                .map(ToOwned::to_owned),
+            _ => None,
+        })
 }
 
 fn collect_goals(events: &[SessionEvent], limit: usize) -> Vec<String> {
@@ -788,9 +1020,15 @@ fn collect_errors(events: &[SessionEvent], limit: usize) -> Vec<String> {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
                 .or_else(|| {
-                    event.payload.get("errors").and_then(Value::as_array).and_then(|items| {
-                        items.iter().find_map(|item| item.as_str().map(ToOwned::to_owned))
-                    })
+                    event
+                        .payload
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .and_then(|items| {
+                            items
+                                .iter()
+                                .find_map(|item| item.as_str().map(ToOwned::to_owned))
+                        })
                 }),
             "model_probe_failed" => event
                 .payload
@@ -813,13 +1051,29 @@ fn latest_attempt(events: &[SessionEvent]) -> Option<String> {
     for event in events.iter().rev() {
         match event.kind.as_str() {
             "agent_tool" => {
-                let name = event.payload.get("name").and_then(Value::as_str).unwrap_or("tool");
-                let summary = event.payload.get("summary").and_then(Value::as_str).unwrap_or("-");
+                let name = event
+                    .payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let summary = event
+                    .payload
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
                 return Some(truncate_text(format!("{name}: {summary}").trim(), 160));
             }
             "tool_result" => {
-                let name = event.payload.get("command").and_then(Value::as_str).unwrap_or("tool");
-                let summary = event.payload.get("summary").and_then(Value::as_str).unwrap_or("-");
+                let name = event
+                    .payload
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                let summary = event
+                    .payload
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
                 return Some(truncate_text(format!("{name}: {summary}").trim(), 160));
             }
             "prompt_start" | "user_input" => {
@@ -838,6 +1092,24 @@ fn latest_attempt(events: &[SessionEvent]) -> Option<String> {
 
 fn latest_failure(events: &[SessionEvent]) -> Option<String> {
     collect_errors(events, 1).into_iter().next()
+}
+
+pub fn normalize_failure_text(input: &str) -> String {
+    input
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn latest_models(events: &[SessionEvent]) -> (Option<String>, Option<String>) {
@@ -905,11 +1177,18 @@ fn build_recent_summary(events: &[SessionEvent]) -> String {
     if let Some(verification) = latest_verification(events) {
         lines.push(format!("Last verification: {verification}"));
     }
-    if let Some(result) = events.iter().rev().find_map(|event| match event.kind.as_str() {
-        "agent_result" | "prompt_result" => event.payload.get("text").and_then(Value::as_str),
-        _ => None,
-    }) {
-        lines.push(format!("Last result: {}", truncate_text(result.trim(), 220)));
+    if let Some(result) = events
+        .iter()
+        .rev()
+        .find_map(|event| match event.kind.as_str() {
+            "agent_result" | "prompt_result" => event.payload.get("text").and_then(Value::as_str),
+            _ => None,
+        })
+    {
+        lines.push(format!(
+            "Last result: {}",
+            truncate_text(result.trim(), 220)
+        ));
     }
     if lines.is_empty() {
         "No recent work summary captured.".to_string()
@@ -1055,7 +1334,13 @@ fn render_active_trajectory_recall(record: &TrajectoryRecord) -> String {
     if !record.active_files.is_empty() {
         lines.push(format!(
             "Files: {}",
-            record.active_files.iter().take(4).cloned().collect::<Vec<_>>().join(", ")
+            record
+                .active_files
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if !record.recent_errors.is_empty() {
@@ -1136,9 +1421,12 @@ fn qualifies_skill_candidate(tool_sequence: &[String]) -> bool {
     let has_discovery = tool_sequence
         .iter()
         .any(|tool| matches!(tool.as_str(), "read" | "grep" | "glob" | "parallel_read"));
-    let has_action = tool_sequence
-        .iter()
-        .any(|tool| matches!(tool.as_str(), "edit" | "write" | "exec" | "skill" | "mcp_call"));
+    let has_action = tool_sequence.iter().any(|tool| {
+        matches!(
+            tool.as_str(),
+            "edit" | "write" | "exec" | "skill" | "mcp_call"
+        )
+    });
     has_discovery && has_action
 }
 
@@ -1170,8 +1458,21 @@ fn suggest_command_name(tool_sequence: &[String], current_goal: &str) -> String 
 
 fn goal_keywords(current_goal: &str, limit: usize) -> Vec<String> {
     let stop_words = [
-        "the", "and", "for", "with", "from", "that", "this", "into", "현재", "프로젝트",
-        "내용", "설명", "continue", "current", "task",
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "into",
+        "현재",
+        "프로젝트",
+        "내용",
+        "설명",
+        "continue",
+        "current",
+        "task",
     ];
     let mut parts = Vec::new();
     for token in current_goal
@@ -1198,7 +1499,10 @@ fn goal_keywords(current_goal: &str, limit: usize) -> Vec<String> {
 }
 
 fn newest_event_ts(events: &[SessionEvent]) -> u128 {
-    events.last().map(|event| event.ts_ms).unwrap_or_else(now_ms)
+    events
+        .last()
+        .map(|event| event.ts_ms)
+        .unwrap_or_else(now_ms)
 }
 
 fn to_sql_i64(value: u128) -> i64 {
@@ -1239,7 +1543,16 @@ fn is_low_signal_user_text(text: &str) -> bool {
         return true;
     }
     let low_signal = [
-        "hi", "hello", "hey", "안녕", "안녕하세요", "ㅎㅇ", "ㅂㅇ", "test", "ping", "pong",
+        "hi",
+        "hello",
+        "hey",
+        "안녕",
+        "안녕하세요",
+        "ㅎㅇ",
+        "ㅂㅇ",
+        "test",
+        "ping",
+        "pong",
     ];
     if low_signal.iter().any(|item| normalized == *item) {
         return true;

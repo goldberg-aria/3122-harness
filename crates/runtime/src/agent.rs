@@ -710,9 +710,7 @@ fn parse_tool_call(text: &str) -> Result<Option<ToolCallEnvelope>, String> {
     let json_body = extract_first_json_object(&body).unwrap_or_else(|| body.clone());
     let repaired = repair_text_tool_call_body(&json_body);
     let parsed = serde_json::from_str::<ToolCallEnvelope>(&repaired).map_err(|err| {
-        format!(
-            "tool call arguments were not valid JSON: {err}; raw={body}; repaired={repaired}"
-        )
+        format!("tool call arguments were not valid JSON: {err}; raw={body}; repaired={repaired}")
     })?;
     if parsed.tool.trim().is_empty() {
         return Err("tool call is missing tool name".to_string());
@@ -944,7 +942,14 @@ fn execute_tool_request(
             let scope = optional_string_aliases(
                 &request.arguments,
                 "path",
-                &["filepath", "file_path", "file", "directory", "dir", "target"],
+                &[
+                    "filepath",
+                    "file_path",
+                    "file",
+                    "directory",
+                    "dir",
+                    "target",
+                ],
             );
             grep_search(
                 &query,
@@ -958,7 +963,14 @@ fn execute_tool_request(
             let scope = optional_string_aliases(
                 &request.arguments,
                 "path",
-                &["filepath", "file_path", "file", "directory", "dir", "target"],
+                &[
+                    "filepath",
+                    "file_path",
+                    "file",
+                    "directory",
+                    "dir",
+                    "target",
+                ],
             );
             glob_search(
                 &pattern,
@@ -1101,8 +1113,9 @@ mod tests {
     };
 
     use super::{
-        coerce_string_value, enforce_verification_policy, parse_tool_call, run_agent_loop_with_runner,
-        strip_thinking_blocks, AgentOptions, ApprovalOutcome, ApprovalRequest,
+        coerce_string_value, enforce_verification_policy, parse_tool_call,
+        run_agent_loop_with_runner, strip_thinking_blocks, AgentOptions, ApprovalOutcome,
+        ApprovalRequest,
     };
 
     fn temp_workspace(prefix: &str) -> PathBuf {

@@ -6,6 +6,10 @@
 It is not a standalone memory product. It is the reference client layer in the broader Synapsis ecosystem.  
 단독 메모리 제품이 아니라, 더 큰 Synapsis 생태계 안에서 동작하는 레퍼런스 클라이언트 레이어입니다.
 
+## Memory Ecosystem | 메모리 생태계
+
+![Nunchi AI memory ecosystem architecture](docs/assets/nunchiai-ecosystem-architecture.svg)
+
 ## Ecosystem | 생태계
 
 **EN**: The current ecosystem is organized like this.  
@@ -13,14 +17,15 @@ It is not a standalone memory product. It is the reference client layer in the b
 
 | Product | English role | 한국어 역할 |
 | --- | --- | --- |
+| `Synapsis Engine` | Shared runtime and orchestration layer across the ecosystem | 생태계 전반의 공통 런타임 및 오케스트레이션 레이어 |
 | `AMCP` | Vendor-neutral memory contract | 벤더 중립 메모리 계약 / 표준 |
 | `Nexus` | Reference AMCP backend for agents and developers | 에이전트와 개발자를 위한 레퍼런스 AMCP 백엔드 |
 | `Norfolk` | Personal lifetime memory backend | 개인용 평생 메모리 백엔드 |
 | `MaaS` | Enterprise memory infrastructure | 엔터프라이즈 메모리 인프라 |
-| `3122` | Reference client and coding harness | 레퍼런스 클라이언트이자 코딩 하네스 |
+| `3122-harness` | Reference client and coding harness | 레퍼런스 클라이언트이자 코딩 하네스 |
 
-**EN**: In short, AMCP is the contract, Nexus is the first reference backend, Norfolk is the personal memory backend, MaaS is the enterprise deployment model, and 3122 is the client that proves the contract can power real agent workflows.  
-**KO**: 한 줄로 말하면, AMCP는 계약이고, Nexus는 첫 레퍼런스 백엔드이며, Norfolk는 개인 메모리 백엔드, MaaS는 엔터프라이즈 배포 모델, 3122는 그 계약이 실제 에이전트 작업 흐름을 감쌀 수 있음을 보여주는 클라이언트입니다.
+**EN**: In short, Synapsis Engine is the shared runtime layer, AMCP is the contract, Nexus is the first reference backend, Norfolk is the personal memory backend, MaaS is the enterprise deployment model, and `3122-harness` is the client that proves the contract can power real agent workflows.  
+**KO**: 한 줄로 말하면, Synapsis Engine은 공통 런타임 레이어이고, AMCP는 계약이며, Nexus는 첫 레퍼런스 백엔드, Norfolk는 개인 메모리 백엔드, MaaS는 엔터프라이즈 배포 모델, `3122-harness`는 그 계약이 실제 에이전트 작업 흐름을 감쌀 수 있음을 보여주는 클라이언트입니다.
 
 ## What 3122 Is | 3122의 자리
 
@@ -40,6 +45,19 @@ It is not a standalone memory product. It is the reference client layer in the b
 
 **EN**: 3122 owns the harness layer: prompts, permissions, tool execution, session continuity, and backend selection.  
 **KO**: 3122는 하네스 레이어를 담당합니다. 프롬프트, 권한, 도구 실행, 세션 연속성, 백엔드 선택이 여기에 있습니다.
+
+**EN**: Retrieval alone is not memory. `3122-harness` treats similarity recall as one capability inside a larger memory architecture that also needs continuity, portability, and backend swapability.  
+**KO**: retrieval만으로는 memory가 아닙니다. `3122-harness`는 similarity recall을 더 큰 메모리 구조 안의 한 기능으로 보고, continuity, portability, backend 교체 가능성까지 함께 다룹니다.
+
+**EN**:
+- the harness owns context management and prompt budgeting
+- the memory backend owns persistence and recall
+- AMCP prevents lock-in between them
+
+**KO**:
+- 하네스는 context 관리와 prompt budget을 담당합니다
+- memory backend는 persistence와 recall을 담당합니다
+- AMCP는 둘 사이의 lock-in을 막습니다
 
 ## What 3122 Is Not | 3122가 아닌 것
 
@@ -82,6 +100,9 @@ It is not a standalone memory product. It is the reference client layer in the b
 
 **EN**: This means local export, import, and backend migration are based on one portable record contract instead of a harness-only format.  
 **KO**: 그래서 로컬 export, import, backend migration이 하네스 전용 포맷이 아니라 하나의 portable record 계약 위에서 동작합니다.
+
+**EN**: Memory should survive tool changes, backend changes, and workspace rebuilds.  
+**KO**: 메모리는 도구를 바꿔도, 백엔드를 바꿔도, 워크스페이스를 다시 만들어도 살아남아야 합니다.
 
 ## Current Status | 현재 상태
 
@@ -193,6 +214,7 @@ Example config:
 [memory]
 backend = "nexus-cloud"
 dual_write_legacy_jsonl = true
+auto_promote_policy = "suggest"
 
 [memory.nexus_cloud]
 endpoint = "https://nexus-api.example.com"
@@ -204,8 +226,10 @@ Runtime rules:
 
 - the endpoint is the API host, not the web host
 - the raw key stays in the environment variable named by `api_key_env`
+- hosted backends may advertise optional AMCP capabilities through `/v1/amcp/capabilities`
 - `memory migrate --from local-amcp --to nexus-cloud` moves portable AMCP items only
 - transcripts and trajectory continuity remain local runtime state
+- strengthening source of truth: `docs/AMCP_MEMORY_STRENGTHENING_DIRECTIVE_2026-04-13.md`
 
 ## Tool-call protocol
 
@@ -325,12 +349,16 @@ Local-Lite memory:
 - portable memory uses one AMCP item shape across local and hosted backends
 - `[memory].backend` selects `local-amcp`, `nexus-cloud`, or `third-party-amcp`
 - `[memory].dual_write_legacy_jsonl = true` keeps `.harness/memory/*.jsonl` compatibility files during migration
+- `[memory].auto_promote_policy = suggest` stores trajectory-derived AMCP candidates without auto-writing them
 - `trajectory` lists recent compressed work trajectories
 - `trajectory active` shows the current active trajectory with files, failure, and verification hints
 - `trajectory search <query>` runs local FTS search across stored trajectories
 - prompt context now includes file-level memory when the current query or active trajectory points at specific files
 - `memory` lists recent memory records
 - `memory show <index>` prints one saved memory record with tags and source session
+- `memory candidates` lists pending auto-promotion candidates from continuity state
+- `memory promote <index>` writes one pending candidate into portable memory
+- `memory dismiss <index>` clears one pending candidate without storing it
 - `memory sessions` lists portable memory sessions from the selected backend
 - `memory session <session-key>` prints the portable memory items attached to one session
 - `memory recall [limit]` prints the exact recall block the harness would inject

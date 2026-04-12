@@ -112,7 +112,9 @@ Current hosted implementation:
 - `nexus-cloud` is wired to the Nexus `/v1/amcp` contract
 - the harness sends one AMCP item shape in local and hosted modes
 - hosted sessions come from `GET /v1/amcp/sessions` and `GET /v1/amcp/sessions/:id`
+- hosted capabilities may be discovered from `GET /v1/amcp/capabilities`
 - hosted chain items may include continuity fields, but the harness only requires AMCP core plus optional profile fields
+- strengthening follow-up is specified in `docs/AMCP_MEMORY_STRENGTHENING_DIRECTIVE_2026-04-13.md`
 
 ## Core loop
 

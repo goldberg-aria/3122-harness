@@ -6,22 +6,23 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{
-    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-    enable_raw_mode,
+    self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use crossterm::{execute, queue};
 use runtime::{
     active_trajectory, backend_catalog, blueprint_summary, build_handoff_text,
     build_memory_recall_text, build_model_handoff_snapshot, build_resume_text, call_mcp_tool,
     create_slash_command_template, detect_provider_key, discover_mcp_servers, discover_skills,
-    discover_slash_commands, doctor_report, edit_file, exec_command, expand_slash_command,
-    export_backend_jsonl, gather_workspace_context, glob_search, grep_search,
+    discover_slash_commands, dismiss_memory_candidate, doctor_report, edit_file, exec_command,
+    expand_slash_command, export_backend_jsonl, gather_workspace_context, glob_search, grep_search,
     import_backend_jsonl, init_slash_command_dir, latest_model_handoff, list_mcp_tools,
-    list_memory_records, list_recent_trajectories, list_skill_candidates, load_config,
-    load_provider_registry, metadata_legacy_kind, metadata_title, migrate_backend_items,
-    parallel_read_only, pending_model_handoff, promote_skill_candidate, provider_preset,
-    provider_presets, read_file, remove_provider_profile, resolve_selected_memory_backend,
-    record_session_trajectory, render_prompt_context, resolve_skill, resolve_slash_command,
+    list_memory_candidates, list_memory_records, list_recent_trajectories, list_skill_candidates,
+    load_config, load_provider_registry, maybe_track_skill_candidate_promotion,
+    metadata_legacy_kind, metadata_title, migrate_backend_items, parallel_read_only,
+    pending_model_handoff, promote_memory_candidate, promote_skill_candidate, provider_preset,
+    provider_presets, read_file, record_session_trajectory, remove_provider_profile,
+    render_prompt_context, resolve_selected_memory_backend, resolve_skill, resolve_slash_command,
     run_agent_loop, save_config, save_session_memory_bundle, search_memory_records,
     search_trajectories, slash_command_dir, upsert_provider_profile, validate_slash_command_args,
     write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ConnectionMode,
@@ -236,7 +237,8 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 }
             }
             KeyEvent {
-                code: KeyCode::Down, ..
+                code: KeyCode::Down,
+                ..
             } => {
                 let total = build_slash_suggestions(workspace, &ui.input).len();
                 if ui.input.starts_with('/') && total > 0 {
@@ -252,8 +254,7 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
                 modifiers,
                 ..
             } => {
-                if modifiers.contains(KeyModifiers::SHIFT)
-                    || modifiers.contains(KeyModifiers::ALT)
+                if modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT)
                 {
                     ui.input.push('\n');
                     continue;
@@ -508,7 +509,10 @@ fn redraw_tui(
     let header = vec![
         format!(
             "{APP_NAME} | {} | {} | {}",
-            current_model.as_deref().or_else(|| config.primary_model()).unwrap_or("-"),
+            current_model
+                .as_deref()
+                .or_else(|| config.primary_model())
+                .unwrap_or("-"),
             mode,
             approval_policy,
         ),
@@ -545,8 +549,12 @@ fn redraw_tui(
 
     let mut row = header.len() as u16;
     for line in visible {
-        queue!(stdout, MoveTo(0, row), Print(truncate_for_terminal(line, width as usize)))
-            .map_err(|err| err.to_string())?;
+        queue!(
+            stdout,
+            MoveTo(0, row),
+            Print(truncate_for_terminal(line, width as usize))
+        )
+        .map_err(|err| err.to_string())?;
         row += 1;
     }
 
@@ -665,7 +673,10 @@ fn render_suggestion_lines(
         let absolute_index = start + offset;
         let marker = if absolute_index == selected { ">" } else { " " };
         lines.push(truncate_for_terminal(
-            &format!("{marker} /{:<14} {}", suggestion.name, suggestion.description),
+            &format!(
+                "{marker} /{:<14} {}",
+                suggestion.name, suggestion.description
+            ),
             width,
         ));
     }
@@ -770,17 +781,18 @@ fn process_repl_input_tui(
             return ReplDirective::Continue;
         }
         "/model" => {
-            let (text, choices) = render_model_status_text(
-                workspace,
-                config,
-                current_model.as_deref(),
-            );
+            let (text, choices) =
+                render_model_status_text(workspace, config, current_model.as_deref());
             ui.model_choices = choices;
             ui.push_block(&text);
             return ReplDirective::Continue;
         }
         "/init" => {
-            ui.push_result(render_init_text(workspace, config, current_model.as_deref()));
+            ui.push_result(render_init_text(
+                workspace,
+                config,
+                current_model.as_deref(),
+            ));
             return ReplDirective::Continue;
         }
         "/resume" => {
@@ -863,7 +875,10 @@ fn process_repl_input_tui(
                     .or_else(|| config.primary_model())
                     .map(ToOwned::to_owned);
                 *current_model = Some(model.clone());
-                let _ = session.append("model_change", json!({ "from": previous_model, "model": model }));
+                let _ = session.append(
+                    "model_change",
+                    json!({ "from": previous_model, "model": model }),
+                );
                 match build_model_handoff_snapshot(
                     workspace,
                     session.path(),
@@ -877,7 +892,9 @@ fn process_repl_input_tui(
                         );
                         ui.push_block(&render_model_switch_summary_text(&snapshot));
                     }
-                    Err(err) => ui.push_error(format!("model set to {model}; failed to build handoff: {err}")),
+                    Err(err) => ui.push_error(format!(
+                        "model set to {model}; failed to build handoff: {err}"
+                    )),
                 }
                 ui.model_choices.clear();
                 return ReplDirective::Continue;
@@ -887,7 +904,10 @@ fn process_repl_input_tui(
         }
     }
 
-    if let Some(next_mode) = trimmed.strip_prefix("/mode ").and_then(PermissionMode::parse) {
+    if let Some(next_mode) = trimmed
+        .strip_prefix("/mode ")
+        .and_then(PermissionMode::parse)
+    {
         *mode = next_mode;
         let _ = session.append("mode_change", json!({ "mode": mode.as_str() }));
         ui.push_system(format!("mode set to {mode}"));
@@ -904,9 +924,16 @@ fn process_repl_input_tui(
             .or_else(|| config.primary_model())
             .map(ToOwned::to_owned);
         *current_model = Some(model.to_string());
-        let _ = session.append("model_change", json!({ "from": previous_model, "model": model }));
-        match build_model_handoff_snapshot(workspace, session.path(), previous_model.as_deref(), model)
-        {
+        let _ = session.append(
+            "model_change",
+            json!({ "from": previous_model, "model": model }),
+        );
+        match build_model_handoff_snapshot(
+            workspace,
+            session.path(),
+            previous_model.as_deref(),
+            model,
+        ) {
             Ok(snapshot) => {
                 let _ = session.append(
                     "model_handoff",
@@ -914,7 +941,9 @@ fn process_repl_input_tui(
                 );
                 ui.push_block(&render_model_switch_summary_text(&snapshot));
             }
-            Err(err) => ui.push_error(format!("model set to {model}; failed to build handoff: {err}")),
+            Err(err) => ui.push_error(format!(
+                "model set to {model}; failed to build handoff: {err}"
+            )),
         }
         return ReplDirective::Continue;
     }
@@ -945,6 +974,24 @@ fn process_repl_input_tui(
         ui.push_result(render_memory_sessions_text(workspace, config));
         return ReplDirective::Continue;
     }
+    if trimmed == "/memory candidates" {
+        ui.push_result(render_memory_candidates_text(workspace, 8));
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/memory promote ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => ui.push_result(run_memory_candidate_promotion_text(workspace, index)),
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/memory dismiss ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => ui.push_result(run_memory_candidate_dismiss_text(workspace, index)),
+            Err(err) => ui.push_error(err),
+        }
+        return ReplDirective::Continue;
+    }
     if let Some(session_key) = trimmed.strip_prefix("/memory session ").map(str::trim) {
         ui.push_result(render_memory_session_text(workspace, config, session_key));
         return ReplDirective::Continue;
@@ -966,9 +1013,11 @@ fn process_repl_input_tui(
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
         match parse_memory_export_args(&args) {
-            Ok((_format, output)) => {
-                ui.push_result(render_memory_export_text(workspace, config, output.as_deref()))
-            }
+            Ok((_format, output)) => ui.push_result(render_memory_export_text(
+                workspace,
+                config,
+                output.as_deref(),
+            )),
             Err(err) => ui.push_error(err),
         }
         return ReplDirective::Continue;
@@ -992,7 +1041,9 @@ fn process_repl_input_tui(
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
         match parse_memory_migrate_args(&args) {
-            Ok((from, to)) => ui.push_result(render_memory_migrate_text(workspace, config, from, to)),
+            Ok((from, to)) => {
+                ui.push_result(render_memory_migrate_text(workspace, config, from, to))
+            }
             Err(err) => ui.push_error(err),
         }
         return ReplDirective::Continue;
@@ -1033,7 +1084,9 @@ fn process_repl_input_tui(
     }
     if let Some(rest) = trimmed.strip_prefix("/commands new ").map(str::trim) {
         match parse_new_command_args(rest) {
-            Ok((name, kind, scope)) => ui.push_result(run_commands_new_text(workspace, name, kind, scope)),
+            Ok((name, kind, scope)) => {
+                ui.push_result(run_commands_new_text(workspace, name, kind, scope))
+            }
             Err(err) => ui.push_error(err),
         }
         return ReplDirective::Continue;
@@ -1042,7 +1095,10 @@ fn process_repl_input_tui(
         ui.push_result(render_handoff_debug_text(workspace));
         return ReplDirective::Continue;
     }
-    if let Some(next_policy) = trimmed.strip_prefix("/approval ").and_then(ApprovalPolicy::parse) {
+    if let Some(next_policy) = trimmed
+        .strip_prefix("/approval ")
+        .and_then(ApprovalPolicy::parse)
+    {
         *approval_policy = next_policy;
         let _ = session.append(
             "approval_change",
@@ -1071,7 +1127,9 @@ fn process_repl_input_tui(
     if let Some(body) = trimmed.strip_prefix("/mcp-call ") {
         match split_mcp_call_command(body) {
             Some((server, tool, arguments)) => {
-                ui.push_result(render_mcp_call_text(workspace, config, server, tool, arguments, session));
+                ui.push_result(render_mcp_call_text(
+                    workspace, config, server, tool, arguments, session,
+                ));
             }
             None => ui.push_error("usage: /mcp-call <server> <tool> [json-args]".to_string()),
         }
@@ -1299,6 +1357,30 @@ fn handle_repl_line(
         print_memory_sessions(workspace, config);
         return ReplDirective::Continue;
     }
+    if trimmed == "/memory candidates" {
+        print_memory_candidates(workspace, 8);
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/memory promote ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => match run_memory_candidate_promotion_text(workspace, index) {
+                Ok(text) => println!("{text}"),
+                Err(err) => eprintln!("{err}"),
+            },
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
+    if let Some(index) = trimmed.strip_prefix("/memory dismiss ").map(str::trim) {
+        match parse_positive_index(index) {
+            Ok(index) => match run_memory_candidate_dismiss_text(workspace, index) {
+                Ok(text) => println!("{text}"),
+                Err(err) => eprintln!("{err}"),
+            },
+            Err(err) => eprintln!("{err}"),
+        }
+        return ReplDirective::Continue;
+    }
     if let Some(session_key) = trimmed.strip_prefix("/memory session ").map(str::trim) {
         print_memory_session(workspace, config, session_key);
         return ReplDirective::Continue;
@@ -1478,9 +1560,12 @@ fn render_repl_help_text() -> String {
         "/handoff    print a handoff block",
         "/handoff debug inspect the latest handoff state",
         "/why-context show the current prompt context",
-        "/memory     list/search/sessions/save/delete/export/import/migrate portable memory",
+        "/memory     list/search/candidates/sessions/save/delete/export/import/migrate portable memory",
         "/trajectory inspect active and recent trajectories",
         "/memory show inspect one recent memory record",
+        "/memory candidates list pending auto-promotion candidates",
+        "/memory promote save one pending candidate into portable memory",
+        "/memory dismiss drop one pending candidate",
         "/memory session inspect one portable memory session",
         "/memory recall print rendered portable recall text",
         "/skills suggest list repeated workflow candidates",
@@ -1537,10 +1622,16 @@ fn render_repl_status_text(
         if let Some(previous) = handoff.snapshot.from_model.as_deref() {
             lines.push(format!("previous_model: {previous}"));
         }
-        lines.push(format!("next_step: {}", handoff.snapshot.suggested_next_step));
+        lines.push(format!(
+            "next_step: {}",
+            handoff.snapshot.suggested_next_step
+        ));
     }
     if let Ok(Some(handoff)) = pending_model_handoff(session.path()) {
-        lines.push(format!("handoff_boost: pending for {}", handoff.snapshot.to_model));
+        lines.push(format!(
+            "handoff_boost: pending for {}",
+            handoff.snapshot.to_model
+        ));
     }
     lines.push(format!("mode: {mode}"));
     lines.push(format!("connection: {connection_mode}"));
@@ -1587,7 +1678,10 @@ fn render_model_status_text(
         }
     }
     if !config.data.model.fallback.is_empty() {
-        lines.push(format!("fallback: {}", config.data.model.fallback.join(", ")));
+        lines.push(format!(
+            "fallback: {}",
+            config.data.model.fallback.join(", ")
+        ));
     }
     if !choices.is_empty() {
         lines.push("switch:".to_string());
@@ -1627,10 +1721,14 @@ fn render_login_status_text(workspace: &Path) -> String {
     }
     lines.push("Next steps:".to_string());
     lines.push(format!("- `{APP_NAME} providers presets`"));
-    lines.push(format!("- `{APP_NAME} providers add <alias> --api-key <key>`"));
+    lines.push(format!(
+        "- `{APP_NAME} providers add <alias> --api-key <key>`"
+    ));
     lines.push("- use `profile/<alias>/<model>` in `/model`".to_string());
     lines.push("External CLIs:".to_string());
-    lines.push(format!("- run `{APP_NAME} doctor` to inspect `claude` and `codex`"));
+    lines.push(format!(
+        "- run `{APP_NAME} doctor` to inspect `claude` and `codex`"
+    ));
     lines.join("\n")
 }
 
@@ -1653,10 +1751,7 @@ fn build_model_choices(
     let registry = load_provider_registry(workspace).unwrap_or_default();
     for profile in registry.profiles {
         if let Some(model) = default_model_for_profile(&profile.alias, &profile.route) {
-            push_unique_choice(
-                &mut choices,
-                format!("profile/{}/{}", profile.alias, model),
-            );
+            push_unique_choice(&mut choices, format!("profile/{}/{}", profile.alias, model));
         }
     }
     choices
@@ -1792,7 +1887,10 @@ fn render_slash_command_show_text(workspace: &Path, name: &str) -> Result<String
     ];
     match command.kind {
         SlashCommandKind::Alias => {
-            lines.push(format!("target: {}", command.target.as_deref().unwrap_or("-")));
+            lines.push(format!(
+                "target: {}",
+                command.target.as_deref().unwrap_or("-")
+            ));
         }
         SlashCommandKind::Macro => {
             lines.push("steps:".to_string());
@@ -1801,7 +1899,10 @@ fn render_slash_command_show_text(workspace: &Path, name: &str) -> Result<String
             }
         }
         SlashCommandKind::PromptTemplate => {
-            lines.push(format!("prompt: {}", command.prompt.as_deref().unwrap_or("-")));
+            lines.push(format!(
+                "prompt: {}",
+                command.prompt.as_deref().unwrap_or("-")
+            ));
         }
     }
     Ok(lines.join("\n"))
@@ -1848,7 +1949,10 @@ fn render_init_text(
 
     let mut lines = vec![
         format!("project: {}", workspace.display()),
-        format!("active_model: {}", current_model.unwrap_or_else(|| config.primary_model().unwrap_or("-"))),
+        format!(
+            "active_model: {}",
+            current_model.unwrap_or_else(|| config.primary_model().unwrap_or("-"))
+        ),
         format!(
             "config: {}",
             config
@@ -1886,6 +1990,10 @@ fn render_memory_list_text(workspace: &Path) -> Result<String, String> {
         format!("memory_backend: {}", config_memory_backend_label(workspace)),
         format!("memory_records: {}", records.len()),
     ];
+    let pending_candidates = list_memory_candidates(workspace, 32)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    lines.push(format!("pending_candidates: {pending_candidates}"));
     let (summaries, decisions, tasks, errors, notes) = memory_kind_counts(&records);
     lines.push(format!(
         "kinds: summary={} decision={} task={} error={} note={}",
@@ -1920,7 +2028,10 @@ fn render_trajectory_list_text(workspace: &Path, limit: usize) -> Result<String,
             compact_line(&trajectory.next_step, 56)
         ));
     }
-    lines.push("hint: use `trajectory active`, `trajectory show <index>`, or `trajectory search <query>`".to_string());
+    lines.push(
+        "hint: use `trajectory active`, `trajectory show <index>`, or `trajectory search <query>`"
+            .to_string(),
+    );
     Ok(lines.join("\n"))
 }
 
@@ -1971,7 +2082,10 @@ fn render_trajectory_detail(trajectory: &TrajectoryRecord) -> String {
         lines.push(format!("previous_model: {previous}"));
     }
     if !trajectory.active_files.is_empty() {
-        lines.push(format!("active_files: {}", trajectory.active_files.join(", ")));
+        lines.push(format!(
+            "active_files: {}",
+            trajectory.active_files.join(", ")
+        ));
     }
     if let Some(attempt) = trajectory.latest_attempt.as_deref() {
         lines.push(format!("latest_attempt: {attempt}"));
@@ -2020,7 +2134,8 @@ fn render_skill_candidates_text(workspace: &Path, limit: usize) -> Result<String
             compact_line(&candidate.description, 72)
         ));
     }
-    lines.push("hint: use `skills promote <index>` to create a prompt-template command".to_string());
+    lines
+        .push("hint: use `skills promote <index>` to create a prompt-template command".to_string());
     Ok(lines.join("\n"))
 }
 
@@ -2030,11 +2145,71 @@ fn run_skill_candidate_promotion_text(workspace: &Path, index: usize) -> Result<
         return Err(format!("skill candidate index out of range: {index}"));
     };
     let path = promote_skill_candidate(workspace, candidate.id)?;
-    Ok(format!(
+    let memory_result = maybe_track_skill_candidate_promotion(workspace, candidate.id)?;
+    let mut lines = vec![format!(
         "promoted skill candidate\nname: /{}\npath: {}",
         candidate.command_name,
         path.display()
-    ))
+    )];
+    if let Some(record) = memory_result {
+        lines.push(format!(
+            "portable_memory: saved {} | {}",
+            record.kind, record.title
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_memory_candidates_text(workspace: &Path, limit: usize) -> Result<String, String> {
+    let candidates = list_memory_candidates(workspace, limit)?;
+    if candidates.is_empty() {
+        return Ok("no pending promotion candidates".to_string());
+    }
+    let mut lines = vec![format!("memory_candidates: {}", candidates.len())];
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        lines.push(format!(
+            "- #{} | {} | {} | {}",
+            index + 1,
+            candidate.trigger,
+            metadata_legacy_kind(&candidate.item),
+            compact_line(&candidate.summary, 72)
+        ));
+    }
+    lines.push("hint: use `memory promote <index>` or `memory dismiss <index>`".to_string());
+    Ok(lines.join("\n"))
+}
+
+fn run_memory_candidate_promotion_text(workspace: &Path, index: usize) -> Result<String, String> {
+    let candidates = list_memory_candidates(workspace, index)?;
+    let Some(candidate) = candidates.get(index.saturating_sub(1)) else {
+        return Err(format!("memory candidate index out of range: {index}"));
+    };
+    match promote_memory_candidate(workspace, candidate.id)? {
+        Some(record) => Ok(format!(
+            "promoted memory candidate\ntrigger: {}\nrecord: {} | {}",
+            candidate.trigger, record.kind, record.title
+        )),
+        None => Ok(format!(
+            "promoted memory candidate\ntrigger: {}\nrecord: already existed",
+            candidate.trigger
+        )),
+    }
+}
+
+fn run_memory_candidate_dismiss_text(workspace: &Path, index: usize) -> Result<String, String> {
+    let candidates = list_memory_candidates(workspace, index)?;
+    let Some(candidate) = candidates.get(index.saturating_sub(1)) else {
+        return Err(format!("memory candidate index out of range: {index}"));
+    };
+    let dismissed = dismiss_memory_candidate(workspace, candidate.id)?;
+    if dismissed {
+        Ok(format!(
+            "dismissed memory candidate\ntrigger: {}",
+            candidate.trigger
+        ))
+    } else {
+        Ok("memory candidate already dismissed".to_string())
+    }
 }
 
 fn render_memory_show_text(workspace: &Path, index: usize) -> Result<String, String> {
@@ -2102,7 +2277,9 @@ fn render_memory_sessions_text(workspace: &Path, config: &LoadedConfig) -> Resul
             session.updated_at
         ));
     }
-    lines.push("hint: use `memory session <key>` to inspect one portable memory session".to_string());
+    lines.push(
+        "hint: use `memory session <key>` to inspect one portable memory session".to_string(),
+    );
     Ok(lines.join("\n"))
 }
 
@@ -2208,19 +2385,29 @@ fn render_save_latest_session_memory(
 ) -> Result<String, String> {
     let bundle = save_session_memory_bundle(workspace, session.path())?;
     if bundle.saved_records.is_empty() {
-        return Ok("memory unchanged".to_string());
+        return Ok(format!(
+            "memory unchanged\npending_candidates: {}",
+            bundle.pending_candidates
+        ));
     }
-    let mut lines = vec![format!("saved {} memory record(s)", bundle.saved_records.len())];
+    let mut lines = vec![format!(
+        "saved {} memory record(s)",
+        bundle.saved_records.len()
+    )];
     for record in bundle.saved_records {
         lines.push(format!("{} | {}", record.kind, record.title));
     }
+    lines.push(format!("pending_candidates: {}", bundle.pending_candidates));
     Ok(lines.join("\n"))
 }
 
 fn render_model_switch_summary_text(snapshot: &ModelHandoffSnapshot) -> String {
     let mut lines = vec![
         format!("active: {}", snapshot.to_model),
-        format!("previous: {}", snapshot.from_model.as_deref().unwrap_or("-")),
+        format!(
+            "previous: {}",
+            snapshot.from_model.as_deref().unwrap_or("-")
+        ),
         format!("handoff: {}", compact_line(&snapshot.current_goal, 96)),
         format!("next: {}", compact_line(&snapshot.suggested_next_step, 96)),
     ];
@@ -2322,7 +2509,10 @@ fn format_tool_output(output: &ToolOutput) -> String {
 }
 
 fn format_approval_status(policy: ApprovalPolicy) -> String {
-    format!("approval: {policy}\nbehavior: {}", approval_policy_hint(policy))
+    format!(
+        "approval: {policy}\nbehavior: {}",
+        approval_policy_hint(policy)
+    )
 }
 
 fn render_skills_text(workspace: &Path, config: &LoadedConfig) -> String {
@@ -2399,7 +2589,13 @@ fn render_mcp_tools_text(
     }
     Ok(tools
         .into_iter()
-        .map(|tool| format!("{} | {}", tool.name, tool.description.unwrap_or_else(|| "-".to_string())))
+        .map(|tool| {
+            format!(
+                "{} | {}",
+                tool.name,
+                tool.description.unwrap_or_else(|| "-".to_string())
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -2452,7 +2648,10 @@ fn maybe_run_custom_slash_command_tui(
     validate_slash_command_args(command, args_raw)?;
     let expanded = expand_slash_command(command, args_raw);
     if expanded.is_empty() {
-        return Err(format!("custom command /{} expanded to no steps", command.name));
+        return Err(format!(
+            "custom command /{} expanded to no steps",
+            command.name
+        ));
     }
     ui.push_system(format!(
         "custom: /{} ({}, {})",
@@ -2764,7 +2963,10 @@ fn print_login_status(workspace: &Path) {
     println!("- `{} providers add <alias> --api-key <key>`", APP_NAME);
     println!("- use `profile/<alias>/<model>` in `/model` or `prompt --model`");
     println!("External CLIs:");
-    println!("- run `{} doctor` to inspect `claude` and `codex` availability", APP_NAME);
+    println!(
+        "- run `{} doctor` to inspect `claude` and `codex` availability",
+        APP_NAME
+    );
 }
 
 #[allow(dead_code)]
@@ -2776,9 +2978,12 @@ fn print_repl_help() {
     println!("/handoff    print a handoff block");
     println!("/handoff debug inspect the latest handoff state");
     println!("/why-context show the current prompt context");
-    println!("/memory     list/search/sessions/save/delete/export/import/migrate portable memory");
+    println!("/memory     list/search/candidates/sessions/save/delete/export/import/migrate portable memory");
     println!("/trajectory inspect active and recent trajectories");
     println!("/memory show inspect one recent memory record");
+    println!("/memory candidates list pending auto-promotion candidates");
+    println!("/memory promote save one pending candidate into portable memory");
+    println!("/memory dismiss drop one pending candidate");
     println!("/memory session inspect one portable memory session");
     println!("/memory recall print rendered portable recall text");
     println!("/skills suggest list repeated workflow candidates");
@@ -3199,6 +3404,13 @@ fn print_memory_sessions(workspace: &Path, config: &LoadedConfig) {
     }
 }
 
+fn print_memory_candidates(workspace: &Path, limit: usize) {
+    match render_memory_candidates_text(workspace, limit) {
+        Ok(text) => println!("{text}"),
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
 fn print_memory_session(workspace: &Path, config: &LoadedConfig, session_key: &str) {
     match render_memory_session_text(workspace, config, session_key) {
         Ok(text) => println!("{text}"),
@@ -3412,6 +3624,45 @@ fn handle_memory_command(workspace: &Path, config: &LoadedConfig, args: &[String
             };
             print_memory_search(workspace, query);
         }
+        Some("candidates") => print_memory_candidates(workspace, 12),
+        Some("promote") => {
+            let Some(index) = args.get(1) else {
+                eprintln!("usage: {} memory promote <index>", APP_NAME);
+                std::process::exit(2);
+            };
+            match parse_positive_index(index) {
+                Ok(index) => match run_memory_candidate_promotion_text(workspace, index) {
+                    Ok(text) => println!("{text}"),
+                    Err(err) => {
+                        eprintln!("{err}");
+                        std::process::exit(1);
+                    }
+                },
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("dismiss") => {
+            let Some(index) = args.get(1) else {
+                eprintln!("usage: {} memory dismiss <index>", APP_NAME);
+                std::process::exit(2);
+            };
+            match parse_positive_index(index) {
+                Ok(index) => match run_memory_candidate_dismiss_text(workspace, index) {
+                    Ok(text) => println!("{text}"),
+                    Err(err) => {
+                        eprintln!("{err}");
+                        std::process::exit(1);
+                    }
+                },
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("sessions") => print_memory_sessions(workspace, config),
         Some("session") => {
             let Some(session_key) = args.get(1) else {
@@ -3440,12 +3691,14 @@ fn handle_memory_command(workspace: &Path, config: &LoadedConfig, args: &[String
                 Ok(bundle) => {
                     if bundle.saved_records.is_empty() {
                         println!("memory unchanged");
+                        println!("pending_candidates: {}", bundle.pending_candidates);
                         return;
                     }
                     println!("saved {} memory record(s)", bundle.saved_records.len());
                     for record in bundle.saved_records {
                         println!("{} | {}", record.kind, record.title);
                     }
+                    println!("pending_candidates: {}", bundle.pending_candidates);
                 }
                 Err(err) => {
                     eprintln!("{err}");
@@ -3724,8 +3977,9 @@ fn parse_memory_import_args(args: &[String]) -> Result<(String, PathBuf), String
     if format != "amcp-jsonl" {
         return Err(format!("unsupported memory import format: {format}"));
     }
-    let input = parse_flag_value(args, "--input")
-        .ok_or_else(|| "usage: 3122 memory import --format amcp-jsonl --input <path>".to_string())?;
+    let input = parse_flag_value(args, "--input").ok_or_else(|| {
+        "usage: 3122 memory import --format amcp-jsonl --input <path>".to_string()
+    })?;
     Ok((format.to_string(), PathBuf::from(input)))
 }
 
@@ -3733,14 +3987,10 @@ fn parse_memory_migrate_args(
     args: &[String],
 ) -> Result<(MemoryBackendKind, MemoryBackendKind), String> {
     let from = parse_flag_value(args, "--from")
-        .ok_or_else(|| {
-            "usage: 3122 memory migrate --from <backend> --to <backend>".to_string()
-        })
+        .ok_or_else(|| "usage: 3122 memory migrate --from <backend> --to <backend>".to_string())
         .and_then(parse_memory_backend_kind)?;
     let to = parse_flag_value(args, "--to")
-        .ok_or_else(|| {
-            "usage: 3122 memory migrate --from <backend> --to <backend>".to_string()
-        })
+        .ok_or_else(|| "usage: 3122 memory migrate --from <backend> --to <backend>".to_string())
         .and_then(parse_memory_backend_kind)?;
     Ok((from, to))
 }
@@ -4242,7 +4492,10 @@ fn print_skills(workspace: &Path, config: &LoadedConfig, show_all: bool) {
 
 fn render_skill_list(skills: &[runtime::SkillEntry], show_all: bool) -> String {
     let mut lines = Vec::new();
-    let workspace_count = skills.iter().filter(|skill| skill.source == "workspace").count();
+    let workspace_count = skills
+        .iter()
+        .filter(|skill| skill.source == "workspace")
+        .count();
     let user_count = skills.iter().filter(|skill| skill.source == "user").count();
     lines.push(format!("skills: {}", skills.len()));
     lines.push(format!(
@@ -4703,7 +4956,7 @@ fn print_help() {
     println!("  doctor      inspect local auth and binary availability");
     println!("  config      show resolved config");
     println!("  model       show or set default model config");
-    println!("  memory      list/show/search/sessions/session/recall/save/delete/export/import/migrate portable memory");
+    println!("  memory      list/show/search/candidates/sessions/session/recall/save/delete/export/import/migrate portable memory");
     println!("  trajectory  list/show/search active trajectories");
     println!("  commands    list/show custom slash commands");
     println!("  resume      show latest session resume summary");
@@ -4824,6 +5077,9 @@ mod tests {
         ui.remember_input("same");
         ui.remember_input("other");
 
-        assert_eq!(ui.input_history, vec!["same".to_string(), "other".to_string()]);
+        assert_eq!(
+            ui.input_history,
+            vec!["same".to_string(), "other".to_string()]
+        );
     }
 }

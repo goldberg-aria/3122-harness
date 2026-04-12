@@ -1,5 +1,5 @@
-use std::fs;
 use std::fmt;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

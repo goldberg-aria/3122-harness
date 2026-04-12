@@ -222,10 +222,7 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let temp_path = parent.join(format!(
-        ".harness-tmp-{}-{unique}",
-        std::process::id()
-    ));
+    let temp_path = parent.join(format!(".harness-tmp-{}-{unique}", std::process::id()));
 
     let mut file = File::create(&temp_path).map_err(|err| err.to_string())?;
     file.write_all(contents.as_bytes())
@@ -385,7 +382,9 @@ mod tests {
 
     use crate::PermissionMode;
 
-    use super::{edit_file, exec_command, parallel_read_only, read_file, wildcard_match, write_file};
+    use super::{
+        edit_file, exec_command, parallel_read_only, read_file, wildcard_match, write_file,
+    };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -502,8 +501,14 @@ mod tests {
 
     #[test]
     fn wildcard_match_handles_many_stars_without_backtracking_explosion() {
-        assert!(wildcard_match("**/src/**/main.rs", "crates/runtime/src/bin/main.rs"));
+        assert!(wildcard_match(
+            "**/src/**/main.rs",
+            "crates/runtime/src/bin/main.rs"
+        ));
         assert!(wildcard_match("*****main.rs", "main.rs"));
-        assert!(!wildcard_match("**/src/**/lib.rs", "crates/runtime/src/bin/main.rs"));
+        assert!(!wildcard_match(
+            "**/src/**/lib.rs",
+            "crates/runtime/src/bin/main.rs"
+        ));
     }
 }

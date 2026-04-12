@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -73,6 +74,68 @@ pub struct AmcpSessionRef {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RecallContextBudget {
+    pub max_tokens: usize,
+    pub priority: String,
+    #[serde(default)]
+    pub active_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RecallRequest {
+    #[serde(default)]
+    pub query: Option<String>,
+    pub limit: usize,
+    pub token_budget: usize,
+    #[serde(default)]
+    pub context_budget: Option<RecallContextBudget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AmcpBackendCapabilities {
+    #[serde(default)]
+    pub supports_budget_recall: bool,
+    #[serde(default)]
+    pub supports_compaction_checkpoints: bool,
+    #[serde(default)]
+    pub supports_provenance: bool,
+    #[serde(default = "default_capability_max_item_size")]
+    pub max_item_size: usize,
+    #[serde(default)]
+    pub retention_policies: Vec<String>,
+}
+
+impl AmcpBackendCapabilities {
+    pub fn local_full() -> Self {
+        Self {
+            supports_budget_recall: true,
+            supports_compaction_checkpoints: true,
+            supports_provenance: true,
+            max_item_size: 65_536,
+            retention_policies: vec![
+                "persistent".to_string(),
+                "session-derived".to_string(),
+                "ephemeral".to_string(),
+            ],
+        }
+    }
+
+    pub fn minimal() -> Self {
+        Self {
+            supports_budget_recall: false,
+            supports_compaction_checkpoints: false,
+            supports_provenance: false,
+            max_item_size: 65_536,
+            retention_policies: vec!["persistent".to_string()],
+        }
+    }
+}
+
+fn default_capability_max_item_size() -> usize {
+    65_536
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryBackendKind {
     LocalAmcp,
@@ -107,8 +170,9 @@ impl std::fmt::Display for MemoryBackendKind {
 
 pub trait AmcpMemoryBackend {
     fn kind(&self) -> MemoryBackendKind;
+    fn capabilities(&self) -> Result<AmcpBackendCapabilities, String>;
     fn remember(&self, item: &AmcpMemoryItem) -> Result<bool, String>;
-    fn recall(&self, query: Option<&str>, limit: usize) -> Result<Vec<AmcpMemoryItem>, String>;
+    fn recall(&self, request: &RecallRequest) -> Result<Vec<AmcpMemoryItem>, String>;
     fn sessions(&self) -> Result<Vec<AmcpSessionRef>, String>;
     fn session(&self, session_key: &str) -> Result<Vec<AmcpMemoryItem>, String>;
     fn export_items(&self) -> Result<Vec<AmcpMemoryItem>, String>;
@@ -134,19 +198,18 @@ pub fn resolve_memory_backend_kind(
 ) -> Result<Box<dyn AmcpMemoryBackend>, String> {
     match kind {
         MemoryBackendKind::LocalAmcp => Ok(Box::new(LocalAmcpBackend::new(workspace_root))),
-        MemoryBackendKind::NexusCloud => Ok(Box::new(NexusCloudBackend::new(
-            workspace_root,
-            config,
-        ))),
-        MemoryBackendKind::ThirdPartyAmcp => Ok(Box::new(ThirdPartyAmcpBackend::new(
-            workspace_root,
-            config,
-        ))),
+        MemoryBackendKind::NexusCloud => {
+            Ok(Box::new(NexusCloudBackend::new(workspace_root, config)))
+        }
+        MemoryBackendKind::ThirdPartyAmcp => {
+            Ok(Box::new(ThirdPartyAmcpBackend::new(workspace_root, config)))
+        }
     }
 }
 
 pub fn export_items_jsonl(items: &[AmcpMemoryItem]) -> Result<String, String> {
-    items.iter()
+    items
+        .iter()
         .map(|item| serde_json::to_string(item).map_err(|err| err.to_string()))
         .collect::<Result<Vec<_>, _>>()
         .map(|lines| {
@@ -223,7 +286,9 @@ where
 fn normalize_timestamp_value(value: Value) -> Option<String> {
     match value {
         Value::String(text) => normalize_timestamp_string(&text),
-        Value::Number(number) => number.as_u64().map(|millis| iso_timestamp_from_millis(millis as u128)),
+        Value::Number(number) => number
+            .as_u64()
+            .map(|millis| iso_timestamp_from_millis(millis as u128)),
         _ => None,
     }
 }
@@ -288,7 +353,17 @@ pub fn default_private_retention() -> AmcpRetention {
     }
 }
 
-pub fn default_semantic_metadata(title: &str, legacy_kind: &str, session_path: Option<&str>) -> Value {
+pub fn session_derived_retention() -> AmcpRetention {
+    AmcpRetention {
+        mode: "session-derived".to_string(),
+    }
+}
+
+pub fn default_semantic_metadata(
+    title: &str,
+    legacy_kind: &str,
+    session_path: Option<&str>,
+) -> Value {
     json!({
         "title": title,
         "legacy_kind": legacy_kind,
@@ -321,8 +396,8 @@ impl LocalAmcpBackend {
     fn open(&self) -> Result<Connection, String> {
         let harness_dir = self.workspace_root.join(".harness");
         std::fs::create_dir_all(&harness_dir).map_err(|err| err.to_string())?;
-        let connection =
-            Connection::open(memory_db_path(&self.workspace_root)).map_err(|err| err.to_string())?;
+        let connection = Connection::open(memory_db_path(&self.workspace_root))
+            .map_err(|err| err.to_string())?;
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS amcp_memory_items (
@@ -376,6 +451,10 @@ impl LocalAmcpBackend {
 impl AmcpMemoryBackend for LocalAmcpBackend {
     fn kind(&self) -> MemoryBackendKind {
         MemoryBackendKind::LocalAmcp
+    }
+
+    fn capabilities(&self) -> Result<AmcpBackendCapabilities, String> {
+        Ok(AmcpBackendCapabilities::local_full())
     }
 
     fn remember(&self, item: &AmcpMemoryItem) -> Result<bool, String> {
@@ -434,10 +513,10 @@ impl AmcpMemoryBackend for LocalAmcpBackend {
         Ok(!existed)
     }
 
-    fn recall(&self, query: Option<&str>, limit: usize) -> Result<Vec<AmcpMemoryItem>, String> {
+    fn recall(&self, request: &RecallRequest) -> Result<Vec<AmcpMemoryItem>, String> {
         let connection = self.open()?;
-        let limit = limit.max(1) as i64;
-        let trimmed = query.unwrap_or_default().trim();
+        let limit = request.limit.max(1) as i64;
+        let trimmed = request.query.as_deref().unwrap_or_default().trim();
         let mut items = Vec::new();
         if trimmed.is_empty() {
             let mut statement = connection
@@ -455,7 +534,7 @@ impl AmcpMemoryBackend for LocalAmcpBackend {
             for row in rows {
                 items.push(row.map_err(|err| err.to_string())?);
             }
-            return Ok(items);
+            return Ok(reorder_items_for_budget(items, request));
         }
 
         let mut statement = connection
@@ -476,7 +555,7 @@ impl AmcpMemoryBackend for LocalAmcpBackend {
         for row in rows {
             items.push(row.map_err(|err| err.to_string())?);
         }
-        Ok(items)
+        Ok(reorder_items_for_budget(items, request))
     }
 
     fn sessions(&self) -> Result<Vec<AmcpSessionRef>, String> {
@@ -564,6 +643,7 @@ struct NexusCloudBackend {
     api_key_env: Option<String>,
     namespace: Option<String>,
     client: Client,
+    capabilities_cache: RefCell<Option<AmcpBackendCapabilities>>,
 }
 
 impl NexusCloudBackend {
@@ -574,6 +654,7 @@ impl NexusCloudBackend {
             api_key_env: config.data.memory.nexus_cloud.api_key_env.clone(),
             namespace: config.data.memory.nexus_cloud.namespace.clone(),
             client: Client::new(),
+            capabilities_cache: RefCell::new(None),
         }
     }
 
@@ -594,10 +675,15 @@ impl NexusCloudBackend {
 
     fn api_key(&self) -> Result<String, String> {
         let env_name = self.api_key_env.as_deref().unwrap_or("NEXUS_API_KEY");
-        env::var(env_name).map_err(|_| format!("missing nexus-cloud api key in env var `{env_name}`"))
+        env::var(env_name)
+            .map_err(|_| format!("missing nexus-cloud api key in env var `{env_name}`"))
     }
 
-    fn request(&self, method: Method, path: &str) -> Result<reqwest::blocking::RequestBuilder, String> {
+    fn request(
+        &self,
+        method: Method,
+        path: &str,
+    ) -> Result<reqwest::blocking::RequestBuilder, String> {
         let url = format!("{}{}", self.api_base()?, path);
         let mut request = self
             .client
@@ -606,7 +692,12 @@ impl NexusCloudBackend {
             .header(header::ACCEPT, "application/json")
             .header("X-AMCP-Agent-Name", "3122-harness")
             .header("X-Nexus-Agent-Name", "3122-harness");
-        if let Some(namespace) = self.namespace.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(namespace) = self
+            .namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             request = request.header("X-Workspace-Id", namespace);
         }
         Ok(request)
@@ -645,13 +736,34 @@ impl NexusCloudBackend {
         response.json::<T>().map_err(|err| err.to_string())
     }
 
+    fn discover_capabilities(&self) -> AmcpBackendCapabilities {
+        if let Some(cached) = self.capabilities_cache.borrow().clone() {
+            return cached;
+        }
+
+        let discovered = self
+            .request(Method::GET, "/capabilities")
+            .and_then(|request| request.send().map_err(|err| err.to_string()))
+            .ok()
+            .and_then(|response| match response.status() {
+                status if status.is_success() => response.json::<AmcpBackendCapabilities>().ok(),
+                StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED => None,
+                _ => None,
+            })
+            .unwrap_or_else(AmcpBackendCapabilities::minimal);
+        self.capabilities_cache.replace(Some(discovered.clone()));
+        discovered
+    }
+
     fn export_response_items(&self) -> Result<Vec<AmcpMemoryItem>, String> {
-        let response: ExportResponse = self.send_json(Method::POST, "/export", Some(json!({ "format": "json" })))?;
+        let response: ExportResponse =
+            self.send_json(Method::POST, "/export", Some(json!({ "format": "json" })))?;
         Ok(response.items)
     }
 
     fn delete_one(&self, id: &str) -> Result<bool, String> {
-        let response = self.request(Method::DELETE, &format!("/memories/{id}"))?
+        let response = self
+            .request(Method::DELETE, &format!("/memories/{id}"))?
             .send()
             .map_err(|err| err.to_string())?;
         match response.status() {
@@ -674,38 +786,44 @@ impl AmcpMemoryBackend for NexusCloudBackend {
         MemoryBackendKind::NexusCloud
     }
 
+    fn capabilities(&self) -> Result<AmcpBackendCapabilities, String> {
+        Ok(self.discover_capabilities())
+    }
+
     fn remember(&self, item: &AmcpMemoryItem) -> Result<bool, String> {
-        let _: RememberResponse = self.send_json(
-            Method::POST,
-            "/remember",
-            Some(json!({ "items": [item] })),
-        )?;
+        let _: RememberResponse =
+            self.send_json(Method::POST, "/remember", Some(json!({ "items": [item] })))?;
         Ok(true)
     }
 
-    fn recall(&self, query: Option<&str>, limit: usize) -> Result<Vec<AmcpMemoryItem>, String> {
-        let trimmed = query.unwrap_or_default().trim();
+    fn recall(&self, request: &RecallRequest) -> Result<Vec<AmcpMemoryItem>, String> {
+        let trimmed = request.query.as_deref().unwrap_or_default().trim();
         if trimmed.is_empty() {
             return self
                 .export_response_items()
-                .map(|items| items.into_iter().take(limit.max(1)).collect());
+                .map(|items| items.into_iter().take(request.limit.max(1)).collect());
         }
 
-        let response: RecallResponse = self.send_json(
-            Method::POST,
-            "/recall",
-            Some(json!({
-                "query": trimmed,
-                "limit": limit.max(1),
-                "token_budget": 4000,
-                "depth": "shallow"
-            })),
-        )?;
+        let capabilities = self.discover_capabilities();
+        let mut payload = json!({
+            "query": trimmed,
+            "limit": request.limit.max(1),
+            "token_budget": request.token_budget.max(1),
+            "depth": "shallow"
+        });
+        if capabilities.supports_budget_recall {
+            if let Some(context_budget) = &request.context_budget {
+                payload["context_budget"] =
+                    serde_json::to_value(context_budget).map_err(|err| err.to_string())?;
+            }
+        }
+        let response: RecallResponse = self.send_json(Method::POST, "/recall", Some(payload))?;
         Ok(response.items)
     }
 
     fn sessions(&self) -> Result<Vec<AmcpSessionRef>, String> {
-        let response: SessionListResponse = self.send_json(Method::GET, "/sessions?limit=100", None)?;
+        let response: SessionListResponse =
+            self.send_json(Method::GET, "/sessions?limit=100", None)?;
         Ok(response
             .items
             .into_iter()
@@ -842,11 +960,15 @@ impl AmcpMemoryBackend for ThirdPartyAmcpBackend {
         MemoryBackendKind::ThirdPartyAmcp
     }
 
+    fn capabilities(&self) -> Result<AmcpBackendCapabilities, String> {
+        Ok(AmcpBackendCapabilities::minimal())
+    }
+
     fn remember(&self, _item: &AmcpMemoryItem) -> Result<bool, String> {
         Err(self.unsupported_message())
     }
 
-    fn recall(&self, _query: Option<&str>, _limit: usize) -> Result<Vec<AmcpMemoryItem>, String> {
+    fn recall(&self, _request: &RecallRequest) -> Result<Vec<AmcpMemoryItem>, String> {
         Err(self.unsupported_message())
     }
 
@@ -871,12 +993,57 @@ impl AmcpMemoryBackend for ThirdPartyAmcpBackend {
     }
 }
 
+fn reorder_items_for_budget(
+    mut items: Vec<AmcpMemoryItem>,
+    request: &RecallRequest,
+) -> Vec<AmcpMemoryItem> {
+    let active_files = request
+        .context_budget
+        .as_ref()
+        .map(|budget| {
+            budget
+                .active_files
+                .iter()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    if active_files.is_empty() {
+        return items;
+    }
+    items.sort_by(|left, right| {
+        score_item_file_hits(right, &active_files)
+            .cmp(&score_item_file_hits(left, &active_files))
+            .then_with(|| {
+                timestamp_millis(&right.updated_at)
+                    .unwrap_or_default()
+                    .cmp(&timestamp_millis(&left.updated_at).unwrap_or_default())
+            })
+    });
+    items
+}
+
+fn score_item_file_hits(item: &AmcpMemoryItem, active_files: &HashSet<String>) -> usize {
+    item.source_refs
+        .iter()
+        .filter_map(|source| {
+            if source.kind != "file" {
+                return None;
+            }
+            Some(source.uri.trim_start_matches("file://").to_string())
+        })
+        .filter(|path| active_files.contains(path))
+        .count()
+}
+
 fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<AmcpMemoryItem> {
     Ok(AmcpMemoryItem {
         id: row.get(0)?,
         content: row.get(1)?,
         item_type: row.get(2)?,
-        scope: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_else(|_| default_local_scope()),
+        scope: serde_json::from_str(&row.get::<_, String>(3)?)
+            .unwrap_or_else(|_| default_local_scope()),
         origin: serde_json::from_str(&row.get::<_, String>(4)?)
             .unwrap_or_else(|_| default_local_origin(None, 0)),
         visibility: row.get(5)?,
@@ -938,10 +1105,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        default_local_origin, default_local_scope, default_private_retention,
-        export_items_jsonl, iso_timestamp_from_millis, metadata_title, parse_items_jsonl,
-        resolve_memory_backend_kind, session_key_for_item, source_ref_uri, timestamp_millis,
-        AmcpMemoryBackend, AmcpMemoryItem, AmcpSourceRef, MemoryBackendKind, NexusCloudBackend,
+        default_local_origin, default_local_scope, default_private_retention, export_items_jsonl,
+        iso_timestamp_from_millis, metadata_title, parse_items_jsonl, resolve_memory_backend_kind,
+        session_key_for_item, source_ref_uri, timestamp_millis, AmcpMemoryBackend, AmcpMemoryItem,
+        AmcpSourceRef, MemoryBackendKind, NexusCloudBackend, RecallContextBudget, RecallRequest,
     };
     use crate::{load_config, LoadedConfig};
 
@@ -991,7 +1158,14 @@ mod tests {
         assert!(backend.remember(&item).unwrap());
         assert!(!backend.remember(&item).unwrap());
 
-        let recall = backend.recall(Some("routing"), 5).unwrap();
+        let recall = backend
+            .recall(&RecallRequest {
+                query: Some("routing".to_string()),
+                limit: 5,
+                token_budget: 4000,
+                context_budget: None,
+            })
+            .unwrap();
         assert_eq!(recall.len(), 1);
         assert_eq!(metadata_title(&recall[0]), "Routing defaults");
         assert_eq!(
@@ -1031,7 +1205,7 @@ mod tests {
         let item_json = serde_json::to_string(&item).unwrap();
 
         let server = thread::spawn(move || {
-            for _ in 0..7 {
+            for _ in 0..8 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buffer = Vec::new();
                 let mut chunk = [0u8; 4096];
@@ -1085,6 +1259,9 @@ mod tests {
                     ("POST", "/v1/amcp/recall") => {
                         format!("{{\"items\":[{item_json}]}}")
                     }
+                    ("GET", "/v1/amcp/capabilities") => {
+                        "{\"supports_budget_recall\":true,\"supports_compaction_checkpoints\":true,\"supports_provenance\":true,\"max_item_size\":65536,\"retention_policies\":[\"persistent\",\"session-derived\"]}".to_string()
+                    }
                     ("GET", "/v1/amcp/sessions?limit=100") => {
                         "{\"items\":[{\"id\":\"session-1\",\"atom_count\":1,\"last_activity\":\"1970-01-01T00:00:00.020Z\"}]}".to_string()
                     }
@@ -1119,7 +1296,22 @@ mod tests {
 
         let backend = NexusCloudBackend::new(&workspace, &config);
         assert!(backend.remember(&item).unwrap());
-        assert_eq!(backend.recall(Some("routing"), 5).unwrap().len(), 1);
+        assert_eq!(
+            backend
+                .recall(&RecallRequest {
+                    query: Some("routing".to_string()),
+                    limit: 5,
+                    token_budget: 4000,
+                    context_budget: Some(RecallContextBudget {
+                        max_tokens: 4000,
+                        priority: "balanced".to_string(),
+                        active_files: vec!["src/main.rs".to_string()],
+                    }),
+                })
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(backend.sessions().unwrap()[0].key, "session-1");
         assert_eq!(backend.session("session-1").unwrap().len(), 1);
         assert_eq!(backend.export_items().unwrap().len(), 1);
@@ -1130,23 +1322,29 @@ mod tests {
 
         let captured = requests.lock().unwrap();
         let first_headers = captured[0].2.to_ascii_lowercase();
-        assert_eq!(captured.len(), 7);
+        assert_eq!(captured.len(), 8);
         assert_eq!(captured[0].0, "POST");
         assert_eq!(captured[0].1, "/v1/amcp/remember");
         assert!(first_headers.contains("authorization: bearer nxs_test_key"));
         assert!(first_headers.contains("x-amcp-agent-name: 3122-harness"));
         assert!(first_headers.contains("x-nexus-agent-name: 3122-harness"));
         assert!(first_headers.contains("x-workspace-id: workspace-a"));
-        assert!(captured[0].3.contains("\"created_at\":\"1970-01-01T00:00:00"));
-        assert!(captured[0].3.contains("\"updated_at\":\"1970-01-01T00:00:00"));
-        assert_eq!(captured[1].1, "/v1/amcp/recall");
-        assert!(captured[1].3.contains("\"query\":\"routing\""));
-        assert_eq!(captured[2].1, "/v1/amcp/sessions?limit=100");
-        assert_eq!(captured[3].1, "/v1/amcp/sessions/session-1");
-        assert_eq!(captured[4].1, "/v1/amcp/export");
-        assert_eq!(captured[5].1, "/v1/amcp/import");
-        assert!(captured[5].3.contains("\"preserve_timestamps\":true"));
-        assert_eq!(captured[6].1, "/v1/amcp/memories/amcp-sample");
+        assert!(captured[0]
+            .3
+            .contains("\"created_at\":\"1970-01-01T00:00:00"));
+        assert!(captured[0]
+            .3
+            .contains("\"updated_at\":\"1970-01-01T00:00:00"));
+        assert_eq!(captured[1].1, "/v1/amcp/capabilities");
+        assert_eq!(captured[2].1, "/v1/amcp/recall");
+        assert!(captured[2].3.contains("\"query\":\"routing\""));
+        assert!(captured[2].3.contains("\"context_budget\""));
+        assert_eq!(captured[3].1, "/v1/amcp/sessions?limit=100");
+        assert_eq!(captured[4].1, "/v1/amcp/sessions/session-1");
+        assert_eq!(captured[5].1, "/v1/amcp/export");
+        assert_eq!(captured[6].1, "/v1/amcp/import");
+        assert!(captured[6].3.contains("\"preserve_timestamps\":true"));
+        assert_eq!(captured[7].1, "/v1/amcp/memories/amcp-sample");
 
         cleanup(&workspace);
     }
