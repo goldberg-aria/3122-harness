@@ -46,7 +46,7 @@ The harness should encode operational rules that keep weaker models useful and s
 4. Ollama support for local models
 5. External adapter lane for authenticated CLIs such as Claude Code and Codex
 6. First-class skills and MCP surfaces
-7. Local-Lite memory by default with no signup requirement
+7. Local AMCP memory by default with no signup requirement
 8. Clean-room architecture with no dependency on copied private internals
 
 ## Explicit non-goals for v1
@@ -106,6 +106,13 @@ Portable memory records are serialized in one AMCP core shape across all backend
 
 The local backend is the default.
 `nexus-cloud` and `third-party-amcp` share the same external item schema and can be swapped in through config without rewriting prompt assembly.
+
+Important naming boundary:
+
+- `local-amcp` is the current local backend inside `3122`
+- `Nexus Free` / `Local Lite` is a Nexus product plan label, not a current `3122` backend selector
+- `3122` does not currently implement a dedicated `nexus-local` backend
+- because of that, Nexus-side Local Lite plan rules are not enforced by `3122` local mode today
 
 Current hosted implementation:
 
@@ -251,7 +258,7 @@ Current approval behavior:
 
 Context budget behavior:
 
-- recent history, Local-Lite recall, and conversation recall are all trimmed before the final prompt is assembled
+- recent history, local portable recall, and conversation recall are all trimmed before the final prompt is assembled
 - if the total prompt context still exceeds budget, instruction text is truncated last
 
 ## Workspace context
@@ -270,7 +277,7 @@ Context should eventually be layered in this order:
 1. runtime state
 2. local instruction files
 3. recent working history
-4. Local-Lite recall
+4. local portable recall
 5. relevant conversation recall
 
 Prompt assembly principles:
@@ -307,9 +314,9 @@ Boundary strengthening:
 - model switching stores a structured handoff snapshot in the session event log
 - the first turn after a model switch gets a temporary handoff boost in prompt context
 
-## Local-Lite memory
+## Local Memory
 
-Local-Lite memory is the default persistence layer.
+Local memory is the default persistence layer inside `3122`.
 
 Principles:
 
@@ -332,7 +339,13 @@ Planned memory categories:
 
 The transcript is not the memory system.
 The transcript is raw history.
-Local-Lite memory is the compressed, reusable context layer built from that history.
+Local memory is the compressed, reusable context layer built from that history.
+
+Boundary note:
+
+- this section describes `3122` local memory, which is currently `local-amcp`
+- it does not describe Nexus Free / Local Lite product activation semantics
+- if `3122` later adds `nexus-local`, that would be a separate backend choice
 
 ## Skills
 

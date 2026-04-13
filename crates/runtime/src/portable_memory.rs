@@ -60,10 +60,41 @@ pub struct AmcpMemoryItem {
     #[serde(default)]
     pub source_refs: Vec<AmcpSourceRef>,
     pub energy: f32,
-    #[serde(deserialize_with = "deserialize_timestamp_string")]
+    #[serde(
+        default = "default_empty_string",
+        deserialize_with = "deserialize_timestamp_string_or_empty"
+    )]
     pub created_at: String,
-    #[serde(deserialize_with = "deserialize_timestamp_string")]
+    #[serde(
+        default = "default_empty_string",
+        deserialize_with = "deserialize_timestamp_string_or_empty"
+    )]
     pub updated_at: String,
+}
+
+impl AmcpMemoryItem {
+    fn normalize_timestamps(mut self) -> Self {
+        let fallback = self
+            .origin
+            .timestamp
+            .clone()
+            .unwrap_or_else(default_timestamp_string);
+        if self.created_at.is_empty() {
+            self.created_at = if self.updated_at.is_empty() {
+                fallback.clone()
+            } else {
+                self.updated_at.clone()
+            };
+        }
+        if self.updated_at.is_empty() {
+            self.updated_at = if self.created_at.is_empty() {
+                fallback
+            } else {
+                self.created_at.clone()
+            };
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,7 +255,11 @@ pub fn export_items_jsonl(items: &[AmcpMemoryItem]) -> Result<String, String> {
 pub fn parse_items_jsonl(input: &str) -> Result<Vec<AmcpMemoryItem>, String> {
     let mut items = Vec::new();
     for line in input.lines().filter(|line| !line.trim().is_empty()) {
-        items.push(serde_json::from_str::<AmcpMemoryItem>(line).map_err(|err| err.to_string())?);
+        items.push(
+            serde_json::from_str::<AmcpMemoryItem>(line)
+                .map_err(|err| err.to_string())?
+                .normalize_timestamps(),
+        );
     }
     Ok(items)
 }
@@ -266,6 +301,26 @@ where
     let value = Value::deserialize(deserializer)?;
     normalize_timestamp_value(value)
         .ok_or_else(|| serde::de::Error::custom("invalid timestamp value"))
+}
+
+fn deserialize_timestamp_string_or_empty<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(String::new());
+    }
+    normalize_timestamp_value(value)
+        .ok_or_else(|| serde::de::Error::custom("invalid timestamp value"))
+}
+
+fn default_empty_string() -> String {
+    String::new()
+}
+
+fn default_timestamp_string() -> String {
+    "1970-01-01T00:00:00Z".to_string()
 }
 
 fn deserialize_optional_timestamp_string<'de, D>(
@@ -758,7 +813,11 @@ impl NexusCloudBackend {
     fn export_response_items(&self) -> Result<Vec<AmcpMemoryItem>, String> {
         let response: ExportResponse =
             self.send_json(Method::POST, "/export", Some(json!({ "format": "json" })))?;
-        Ok(response.items)
+        Ok(response
+            .items
+            .into_iter()
+            .map(AmcpMemoryItem::normalize_timestamps)
+            .collect())
     }
 
     fn delete_one(&self, id: &str) -> Result<bool, String> {
@@ -818,7 +877,11 @@ impl AmcpMemoryBackend for NexusCloudBackend {
             }
         }
         let response: RecallResponse = self.send_json(Method::POST, "/recall", Some(payload))?;
-        Ok(response.items)
+        Ok(response
+            .items
+            .into_iter()
+            .map(AmcpMemoryItem::normalize_timestamps)
+            .collect())
     }
 
     fn sessions(&self) -> Result<Vec<AmcpSessionRef>, String> {
@@ -841,7 +904,29 @@ impl AmcpMemoryBackend for NexusCloudBackend {
     fn session(&self, session_key: &str) -> Result<Vec<AmcpMemoryItem>, String> {
         let response: SessionDetailResponse =
             self.send_json(Method::GET, &format!("/sessions/{session_key}"), None)?;
-        Ok(response.chain)
+        let fallback_agent_id = response
+            .item
+            .as_ref()
+            .and_then(|item| item.origin.as_ref())
+            .and_then(|origin| origin.agent_id.as_deref())
+            .map(ToOwned::to_owned);
+        let fallback_timestamp = response
+            .item
+            .as_ref()
+            .and_then(|item| item.last_activity.as_deref())
+            .map(ToOwned::to_owned);
+        Ok(response
+            .chain
+            .into_iter()
+            .map(|entry| {
+                entry.into_amcp(
+                    session_key,
+                    self.namespace.as_deref(),
+                    fallback_agent_id.as_deref(),
+                    fallback_timestamp.as_deref(),
+                )
+            })
+            .collect())
     }
 
     fn export_items(&self) -> Result<Vec<AmcpMemoryItem>, String> {
@@ -899,10 +984,9 @@ struct SessionListResponse {
 
 #[derive(Debug, Deserialize)]
 struct SessionDetailResponse {
-    #[allow(dead_code)]
-    item: Option<NexusSessionSummary>,
+    item: Option<NexusSessionDetailSummary>,
     #[serde(default)]
-    chain: Vec<AmcpMemoryItem>,
+    chain: Vec<SessionDetailChainItem>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -924,6 +1008,93 @@ struct NexusSessionSummary {
     atom_count: usize,
     #[serde(default, deserialize_with = "deserialize_optional_timestamp_string")]
     last_activity: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_timestamp_string")]
+    timestamp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NexusSessionDetailSummary {
+    #[serde(default, deserialize_with = "deserialize_optional_timestamp_string")]
+    last_activity: Option<String>,
+    #[serde(default)]
+    origin: Option<NexusSessionOrigin>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NexusSessionOrigin {
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SessionDetailChainItem {
+    Amcp(AmcpMemoryItem),
+    Summary(NexusSessionChainItem),
+}
+
+impl SessionDetailChainItem {
+    fn into_amcp(
+        self,
+        session_key: &str,
+        namespace: Option<&str>,
+        fallback_agent_id: Option<&str>,
+        fallback_timestamp: Option<&str>,
+    ) -> AmcpMemoryItem {
+        match self {
+            SessionDetailChainItem::Amcp(item) => item.normalize_timestamps(),
+            SessionDetailChainItem::Summary(item) => {
+                let metadata = json!({
+                    "session_position": item.position,
+                    "session_link_type": item.link_type,
+                    "session_link_from": item.link_from,
+                });
+                AmcpMemoryItem {
+                    id: item.id,
+                    content: item.content,
+                    item_type: item.item_type,
+                    scope: AmcpScope {
+                        kind: "user".to_string(),
+                        id: namespace.unwrap_or(DEFAULT_LOCAL_SCOPE_ID).to_string(),
+                    },
+                    origin: AmcpOrigin {
+                        agent_id: fallback_agent_id.unwrap_or("3122-harness").to_string(),
+                        app_id: APP_ID.to_string(),
+                        session_id: Some(session_key.to_string()),
+                        timestamp: item
+                            .timestamp
+                            .clone()
+                            .or_else(|| fallback_timestamp.map(ToOwned::to_owned)),
+                    },
+                    visibility: "private".to_string(),
+                    retention: AmcpRetention {
+                        mode: "persistent".to_string(),
+                    },
+                    tags: Vec::new(),
+                    metadata,
+                    source_refs: Vec::new(),
+                    energy: 1.0,
+                    created_at: item.timestamp.clone().unwrap_or_default(),
+                    updated_at: item.timestamp.unwrap_or_default(),
+                }
+                .normalize_timestamps()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct NexusSessionChainItem {
+    id: String,
+    #[serde(rename = "type")]
+    item_type: String,
+    content: String,
+    #[serde(default)]
+    position: Option<usize>,
+    #[serde(default)]
+    link_type: Option<String>,
+    #[serde(default)]
+    link_from: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_timestamp_string")]
     timestamp: Option<String>,
 }
@@ -1055,7 +1226,8 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<AmcpMemoryItem> {
         energy: row.get(10)?,
         created_at: iso_timestamp_from_millis(row.get::<_, i64>(11)?.max(0) as u128),
         updated_at: iso_timestamp_from_millis(row.get::<_, i64>(12)?.max(0) as u128),
-    })
+    }
+    .normalize_timestamps())
 }
 
 pub fn metadata_title(item: &AmcpMemoryItem) -> String {
@@ -1187,6 +1359,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_items_jsonl_backfills_missing_timestamps_from_origin() {
+        let input = r#"{"id":"amcp-missing-ts","content":"portable recall item","type":"task","scope":{"kind":"user","id":"workspace-a"},"origin":{"agent_id":"3122-harness","app_id":"3122","session_id":"session-1","timestamp":"2026-04-13T14:00:35.670Z"},"visibility":"private","retention":{"mode":"persistent"},"tags":[],"metadata":{},"source_refs":[],"energy":1.0}"#;
+        let parsed = parse_items_jsonl(input).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].created_at, "2026-04-13T14:00:35.67Z");
+        assert_eq!(parsed[0].updated_at, "2026-04-13T14:00:35.67Z");
+    }
+
+    #[test]
     fn source_ref_uri_uses_file_scheme() {
         assert_eq!(
             source_ref_uri(Path::new("/tmp/example.rs")),
@@ -1266,7 +1447,7 @@ mod tests {
                         "{\"items\":[{\"id\":\"session-1\",\"atom_count\":1,\"last_activity\":\"1970-01-01T00:00:00.020Z\"}]}".to_string()
                     }
                     ("GET", "/v1/amcp/sessions/session-1") => {
-                        format!("{{\"item\":{{\"id\":\"session-1\",\"atom_count\":1,\"last_activity\":\"1970-01-01T00:00:00.020Z\"}},\"chain\":[{item_json}]}}")
+                        "{\"item\":{\"id\":\"session-1\",\"atom_count\":1,\"last_activity\":\"1970-01-01T00:00:00.020Z\",\"origin\":{\"agent_id\":\"3122-harness\"}},\"chain\":[{\"id\":\"amcp-sample\",\"type\":\"context\",\"content\":\"Remember provider routing defaults\",\"position\":1,\"link_type\":\"sequential\",\"link_from\":null,\"timestamp\":\"1970-01-01T00:00:00.020Z\"}]}".to_string()
                     }
                     ("POST", "/v1/amcp/export") => {
                         format!("{{\"format\":\"json\",\"items\":[{item_json}]}}")

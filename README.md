@@ -98,6 +98,9 @@ It is not a standalone memory product. It is the reference client layer in the b
 - `nexus-cloud`: first hosted backend over Nexus `/v1/amcp`
 - `third-party-amcp`: extension slot
 
+**EN**: `Nexus Free` / `Local Lite` is a Nexus product tier, not a current `3122` backend selector. In `3122`, local memory still means `local-amcp`, while hosted Nexus memory means `nexus-cloud`.  
+**KO**: `Nexus Free` / `Local Lite`는 Nexus 제품 플랜 이름이지 현재 `3122` backend 선택자가 아닙니다. `3122`에서 로컬 메모리는 계속 `local-amcp`이고, hosted Nexus 메모리는 `nexus-cloud`입니다.
+
 **EN**: This means local export, import, and backend migration are based on one portable record contract instead of a harness-only format.  
 **KO**: 그래서 로컬 export, import, backend migration이 하네스 전용 포맷이 아니라 하나의 portable record 계약 위에서 동작합니다.
 
@@ -230,6 +233,60 @@ Runtime rules:
 - `memory migrate --from local-amcp --to nexus-cloud` moves portable AMCP items only
 - transcripts and trajectory continuity remain local runtime state
 - strengthening source of truth: `docs/AMCP_MEMORY_STRENGTHENING_DIRECTIVE_2026-04-13.md`
+- `3122` does not currently expose a dedicated `nexus-local` backend or enforce Nexus Free / Local Lite plan rules in local mode
+
+### Connect 3122 To Nexus
+
+`3122` already speaks the Nexus AMCP surface through `nexus-cloud`.
+
+Use this when you want hosted Nexus memory with an account and API key.
+If you want local no-signup memory inside `3122`, stay on `local-amcp`.
+
+Use this setup:
+
+```toml
+[memory]
+backend = "nexus-cloud"
+dual_write_legacy_jsonl = true
+auto_promote_policy = "suggest"
+
+[memory.nexus_cloud]
+endpoint = "https://<nexus-api-host>"
+api_key_env = "NEXUS_API_KEY"
+namespace = "workspace-default"
+```
+
+```bash
+export NEXUS_API_KEY=...
+```
+
+Then verify with:
+
+```bash
+cargo run -p cli -- memory save
+cargo run -p cli -- memory recall 6
+cargo run -p cli -- memory sessions
+cargo run -p cli -- memory export --format amcp-jsonl --output memory-export.jsonl
+cargo run -p cli -- memory migrate --from local-amcp --to nexus-cloud
+```
+
+Expected behavior:
+
+- `memory save` writes AMCP items to Nexus through `/v1/amcp/remember`
+- `memory recall` reads portable recall through `/v1/amcp/recall`
+- `memory sessions` and `memory session <key>` read hosted session state
+- export/import/migrate preserve the same AMCP item shape
+
+Current status:
+
+- `nexus-cloud` support is implemented in code
+- contract tests for the Nexus `/v1/amcp` surface pass
+- `local-amcp` remains the default no-signup backend
+- `Nexus Free` / `Local Lite` is currently a Nexus plan label, not a `3122` backend name
+- `nexus-local` is not implemented
+- on April 13, 2026, live smoke passed against a real Nexus endpoint from this workspace
+- verified commands: `memory save`, `memory search`, `memory recall`, `memory sessions`, `memory session`, and `memory export`
+- current Nexus deployments may return `404` on `/v1/amcp/capabilities`; `3122` treats that as minimal capability fallback, not as a hard failure
 
 ## Tool-call protocol
 
@@ -342,12 +399,13 @@ Template placeholders:
 - optional `usage = "/name <required> [optional]"` is shown in `commands show` and validation errors
 - optional `min_args` and `max_args` let a command fail early with a clear usage message
 
-Local-Lite memory:
+Local memory:
 
 - `memory save` promotes the latest session into AMCP-native portable memory
 - trajectory state is stored in `.harness/memory.db`
 - portable memory uses one AMCP item shape across local and hosted backends
 - `[memory].backend` selects `local-amcp`, `nexus-cloud`, or `third-party-amcp`
+- `Nexus Free` / `Local Lite` is not a separate `3122` backend selector today
 - `[memory].dual_write_legacy_jsonl = true` keeps `.harness/memory/*.jsonl` compatibility files during migration
 - `[memory].auto_promote_policy = suggest` stores trajectory-derived AMCP candidates without auto-writing them
 - `trajectory` lists recent compressed work trajectories
@@ -371,8 +429,8 @@ Local-Lite memory:
 - `handoff debug` shows the latest structured handoff snapshot plus pending boost state
 - `why-context` prints the exact runtime context injected before a model turn
 - REPL exit autosaves new local memory records for the current session
-- prompt context now includes recent working history, Local-Lite memory recall, and relevant conversation recall from older sessions
-- Local-Lite recall now prioritizes the active trajectory over older free-form memory records
+- prompt context now includes recent working history, local portable memory recall, and relevant conversation recall from older sessions
+- local portable recall now prioritizes the active trajectory over older free-form memory records
 - `why-context` now explains why the current recall set was selected
 - the first prompt after `/model <spec>` gets a temporary handoff boost in prompt context
 - prompt context is budgeted so long sessions degrade conversation recall first, then memory, recent history, and finally instructions
