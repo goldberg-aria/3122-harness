@@ -1,5 +1,6 @@
 use std::env;
 use std::io::{self, Stdout, Write};
+use std::process::Command;
 use std::path::{Path, PathBuf};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -46,28 +47,36 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let update_notice = detect_update_notice(&workspace);
 
     match args.first().map(String::as_str) {
-        None | Some("repl") => run_repl(&workspace, &config),
+        None | Some("repl") => run_repl(&workspace, &config, update_notice),
         Some("doctor") => {
+            maybe_print_update_notice(update_notice.as_deref());
             print!("{}", doctor_report(&workspace, &config).render());
         }
         Some("config") => {
+            maybe_print_update_notice(update_notice.as_deref());
             println!("{}", config.render_summary(&workspace));
         }
         Some("providers") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_providers_command(&workspace, &args[1..]);
         }
         Some("model") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_model_command(&workspace, &config, &args[1..]);
         }
         Some("memory") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_memory_command(&workspace, &config, &args[1..]);
         }
         Some("trajectory") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_trajectory_command(&workspace, &args[1..]);
         }
         Some("commands") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_commands_command(&workspace, &args[1..]);
         }
         Some("resume") => match build_resume_text(&workspace) {
@@ -77,11 +86,16 @@ fn main() {
                 std::process::exit(1);
             }
         },
-        Some("handoff") => handle_handoff_command(&workspace, &args[1..]),
+        Some("handoff") => {
+            maybe_print_update_notice(update_notice.as_deref());
+            handle_handoff_command(&workspace, &args[1..])
+        }
         Some("why-context") => {
+            maybe_print_update_notice(update_notice.as_deref());
             print!("{}", build_context_dump(&workspace, &config, None, None));
         }
         Some("blueprint") => {
+            maybe_print_update_notice(update_notice.as_deref());
             println!("{}", blueprint_summary());
         }
         Some("prompt") => {
@@ -93,6 +107,7 @@ fn main() {
                 print_prompt_help();
                 return;
             }
+            maybe_print_update_notice(update_notice.as_deref());
             let (override_model, prompt) = parse_prompt_args(&args[1..]);
             if prompt.trim().is_empty() {
                 eprintln!("usage: {} prompt [--model <spec>] <text...>", APP_NAME);
@@ -110,15 +125,19 @@ fn main() {
             );
         }
         Some("skills") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_skills_command(&workspace, &config, &args[1..]);
         }
         Some("mcp") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_mcp_command(&workspace, &config, &args[1..]);
         }
         Some("session") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_session_command(&workspace, &config, &args[1..]);
         }
         Some("tool") => {
+            maybe_print_update_notice(update_notice.as_deref());
             handle_tool_command(
                 &workspace,
                 &args[1..],
@@ -127,9 +146,11 @@ fn main() {
             );
         }
         Some("help") | Some("--help") | Some("-h") => {
+            maybe_print_update_notice(update_notice.as_deref());
             print_help();
         }
         Some(other) => {
+            maybe_print_update_notice(update_notice.as_deref());
             eprintln!("unknown command: {other}");
             print_help();
             std::process::exit(2);
@@ -137,7 +158,7 @@ fn main() {
     }
 }
 
-fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
+fn run_repl(workspace: &PathBuf, config: &LoadedConfig, update_notice: Option<String>) {
     let session = match SessionStore::create_in(&config.session_dir(workspace)) {
         Ok(store) => store,
         Err(err) => {
@@ -160,6 +181,9 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
 
     let mut ui = TuiState::new();
     ui.push_system("Type /help for commands".to_string());
+    if let Some(notice) = update_notice {
+        ui.push_system(notice);
+    }
 
     if enable_raw_mode().is_err() {
         eprintln!("failed to enable raw mode");
@@ -334,6 +358,62 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig) {
     let _ = execute!(stdout, Show, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     autosave_session_memory(workspace, &session);
+}
+
+fn maybe_print_update_notice(notice: Option<&str>) {
+    if let Some(notice) = notice {
+        eprintln!("{notice}");
+    }
+}
+
+fn detect_update_notice(workspace: &Path) -> Option<String> {
+    let branch = git_stdout(workspace, ["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == "HEAD" {
+        return None;
+    }
+    let upstream = git_stdout(
+        workspace,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    )?;
+    let local_head = git_stdout(workspace, ["rev-parse", "HEAD"])?;
+    let upstream_head = git_stdout(workspace, ["rev-parse", upstream.as_str()])?;
+    if local_head == upstream_head {
+        return None;
+    }
+    let behind = git_stdout(
+        workspace,
+        ["rev-list", "--count", format!("HEAD..{upstream}").as_str()],
+    )?
+    .parse::<usize>()
+    .ok()?;
+    build_update_notice(&branch, &upstream, behind)
+}
+
+fn build_update_notice(branch: &str, upstream: &str, behind: usize) -> Option<String> {
+    if behind == 0 {
+        return None;
+    }
+    Some(format!(
+        "update available: `{branch}` is behind `{upstream}` by {behind} commit(s); run `git pull`"
+    ))
+}
+
+fn git_stdout<const N: usize>(workspace: &Path, args: [&str; N]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 struct TuiState {
@@ -4987,8 +5067,9 @@ fn print_prompt_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_slash_suggestion, build_slash_suggestions, maybe_accept_selected_slash_suggestion,
-        render_suggestion_lines, SlashSuggestion, TuiState,
+        apply_slash_suggestion, build_slash_suggestions, build_update_notice,
+        maybe_accept_selected_slash_suggestion, render_suggestion_lines, SlashSuggestion,
+        TuiState,
     };
 
     #[test]
@@ -5080,6 +5161,20 @@ mod tests {
         assert_eq!(
             ui.input_history,
             vec!["same".to_string(), "other".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_update_notice_returns_none_when_not_behind() {
+        assert_eq!(build_update_notice("main", "origin/main", 0), None);
+    }
+
+    #[test]
+    fn build_update_notice_formats_message_when_behind() {
+        let notice = build_update_notice("main", "origin/main", 3).unwrap();
+        assert_eq!(
+            notice,
+            "update available: `main` is behind `origin/main` by 3 commit(s); run `git pull`"
         );
     }
 }
