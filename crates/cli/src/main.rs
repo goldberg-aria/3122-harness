@@ -1864,6 +1864,7 @@ fn default_model_for_profile(alias: &str, route: &str) -> Option<String> {
     match (alias, route) {
         ("anthropic-api", "anthropic") => Some("claude-sonnet-4-6".to_string()),
         ("openai-api", "openai-compat") => Some("gpt-4.1-mini".to_string()),
+        ("xai", "openai-compat") => Some("grok-4.20-reasoning".to_string()),
         ("groq", "openai-compat") => Some("openai/gpt-oss-20b".to_string()),
         ("qwen-api", "openai-compat") => Some("qwen/qwen3.6-plus".to_string()),
         ("zai", "openai-compat") => Some("glm-5".to_string()),

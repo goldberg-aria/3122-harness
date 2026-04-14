@@ -146,6 +146,12 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             description: "OpenRouter OpenAI-compatible gateway",
         },
         ProviderPreset {
+            name: "xai",
+            route: ProviderRoute::OpenAiCompat,
+            base_url: "https://api.x.ai/v1",
+            description: "xAI Grok OpenAI-compatible API",
+        },
+        ProviderPreset {
             name: "deepseek",
             route: ProviderRoute::OpenAiCompat,
             base_url: "https://api.deepseek.com/v1",
@@ -279,6 +285,9 @@ mod tests {
         let preset = provider_preset("deepseek").unwrap();
         assert_eq!(preset.route, ProviderRoute::OpenAiCompat);
         assert!(preset.base_url.contains("api.deepseek.com"));
+
+        let xai = provider_preset("xai").unwrap();
+        assert_eq!(xai.base_url, "https://api.x.ai/v1");
 
         let groq = provider_preset("groq").unwrap();
         assert_eq!(groq.base_url, "https://api.groq.com/openai/v1");

@@ -450,9 +450,23 @@ Saved provider profiles:
 
 - `providers add` stores BYOK profiles in `.harness/providers.json`
 - auto-detection currently recognizes some key formats such as OpenRouter and OpenAI
-- manual registration supports presets such as `deepseek`, `dashscope-cn`, `dashscope-intl`, `siliconflow`, `groq`, `minimax`, `deepinfra`, and `zai-coding`
+- manual registration supports presets such as `xai`, `deepseek`, `dashscope-cn`, `dashscope-intl`, `siliconflow`, `groq`, `minimax`, `deepinfra`, and `zai-coding`
 - saved profiles can be used as `profile/<alias>/<model>`
 - `providers sync-env` saves env-backed profiles such as `anthropic-api`, `openai-api`, `groq`, `qwen-api`, `zai`, `minimax`, and `deepinfra`
+
+Grok / xAI coding:
+
+- `3122` can use Grok through the OpenAI-compatible lane
+- add a saved profile with `providers add xai --api-key <XAI_API_KEY> --preset xai`
+- use `profile/xai/grok-4.20-reasoning` for higher-quality coding turns
+- use `profile/xai/grok-4-1-fast-reasoning` for lower-latency coding turns
+- example:
+
+```bash
+cargo run -p cli -- providers add xai --api-key <XAI_API_KEY> --preset xai
+cargo run -p cli -- prompt --model profile/xai/grok-4.20-reasoning "read README.md and summarize the provider architecture"
+cargo run -p cli -- repl
+```
 
 What to prepare:
 
