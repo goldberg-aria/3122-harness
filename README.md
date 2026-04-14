@@ -151,7 +151,13 @@ Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/RO
 
 ## Install
 
-Current install path:
+Quick install from the latest GitHub Release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/goldberg-aria/3122-harness/main/scripts/install.sh | bash
+```
+
+Manual source install:
 
 ```bash
 git clone https://github.com/goldberg-aria/3122-harness.git
@@ -169,7 +175,9 @@ Notes:
 
 - `3122` without subcommands starts the terminal REPL
 - `cargo run -p cli -- ...` is the development path when running from the repo without installing
-- prebuilt release binaries, an install script, and package-manager distribution are not wired yet in this repo
+- GitHub Releases publish `.tar.gz` archives for Linux x64, macOS Intel, and macOS Apple Silicon when a `v*` tag is pushed
+- `scripts/install.sh` downloads the latest matching release asset for the current machine
+- package-manager distribution is not wired yet in this repo
 
 ## Commands
 

@@ -1,0 +1,117 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            label: macos-intel
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set release metadata
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RELEASE_TAG=${{ github.event.inputs.tag }}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release --package cli --bin 3122 --target "${{ matrix.target }}"
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="3122-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          stage_dir="dist/3122-${RELEASE_TAG}-${{ matrix.target }}"
+          mkdir -p "$stage_dir"
+          cp "target/${{ matrix.target }}/release/3122" "$stage_dir/3122"
+          cp README.md "$stage_dir/README.md"
+          cp LICENSE "$stage_dir/LICENSE"
+          tar -czf "$archive" -C "$stage_dir" .
+          shasum -a 256 "$archive" > "${archive}.sha256"
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            3122-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            3122-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    name: publish release
+    runs-on: ubuntu-24.04
+    needs: build
+
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: release-artifacts
+
+      - name: Set release metadata
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RELEASE_TAG=${{ github.event.inputs.tag }}" >> "$GITHUB_ENV"
+          else
+            echo "RELEASE_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+          notes="Automated release for ${tag}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-artifacts/*/* --clobber
+          else
+            gh release create "$tag" release-artifacts/*/* \
+              --title "$tag" \
+              --notes "$notes" \
+              --target "${GITHUB_SHA}"
+          fi
