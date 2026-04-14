@@ -3,12 +3,44 @@
 **EN**: `3122` is an AMCP-native, model-neutral coding harness.  
 **KO**: `3122`는 AMCP 네이티브, 모델 중립 코딩 하네스입니다.
 
+**EN**: In practice, `3122` exists to make portable memory operational inside real coding workflows. The harness matters because memory needs a runtime.  
+**KO**: 실제로 `3122`의 목적은 portable memory를 현실적인 코딩 워크플로우 안에서 작동하게 만드는 것입니다. 하네스는 메모리를 운용하기 위한 런타임이라서 중요합니다.
+
 It is not a standalone memory product. It is the reference client layer in the broader Synapsis ecosystem.  
 단독 메모리 제품이 아니라, 더 큰 Synapsis 생태계 안에서 동작하는 레퍼런스 클라이언트 레이어입니다.
 
 ## Memory Ecosystem | 메모리 생태계
 
 ![Nunchi AI memory ecosystem architecture](docs/assets/nunchiai-ecosystem-architecture.svg)
+
+## Why Memory First | 왜 메모리가 먼저인가
+
+**EN**: Most coding tools can keep a transcript, but that does not mean they have durable memory. Before this split, too much useful context was trapped in session logs, provider-specific recall flows, or harness-only schemas. That makes memory brittle when you switch models, backends, devices, or workspaces.  
+**KO**: 대부분의 코딩 도구는 transcript를 남길 수 있지만, 그게 durable memory를 뜻하지는 않습니다. 이 분리 이전에는 유용한 맥락이 세션 로그, provider 전용 recall 흐름, 하네스 전용 schema 안에 갇히기 쉬웠습니다. 그러면 모델, 백엔드, 기기, 워크스페이스가 바뀔 때 메모리가 쉽게 깨집니다.
+
+**EN**: `3122` is built around a stricter idea:
+- transcripts are not portable memory
+- retrieval alone is not enough
+- continuity state and portable memory must be separated
+- local and hosted memory must share one AMCP item shape
+
+**KO**: `3122`는 더 엄격한 기준으로 설계되었습니다.
+- transcript는 portable memory가 아닙니다
+- retrieval만으로는 부족합니다
+- continuity 상태와 portable memory는 분리되어야 합니다
+- 로컬 메모리와 hosted 메모리는 하나의 AMCP item shape를 공유해야 합니다
+
+**EN**: This gives users practical advantages:
+- work can survive model switches and handoffs
+- local memory can later move to Nexus without schema rewrite
+- recall can be reused across sessions instead of being trapped in one transcript
+- the harness can change while the memory contract stays stable
+
+**KO**: 이 구조가 주는 실질적인 이점은 분명합니다.
+- 모델 전환과 handoff 이후에도 작업 맥락이 이어집니다
+- 로컬 메모리를 나중에 schema 변경 없이 Nexus로 옮길 수 있습니다
+- recall이 하나의 transcript에 갇히지 않고 세션을 넘어 재사용됩니다
+- 하네스 구현이 바뀌어도 메모리 계약은 안정적으로 유지됩니다
 
 ## Ecosystem | 생태계
 
@@ -106,6 +138,34 @@ It is not a standalone memory product. It is the reference client layer in the b
 
 **EN**: Memory should survive tool changes, backend changes, and workspace rebuilds.  
 **KO**: 메모리는 도구를 바꿔도, 백엔드를 바꿔도, 워크스페이스를 다시 만들어도 살아남아야 합니다.
+
+## Using Memory In REPL | REPL에서 메모리 쓰기
+
+**EN**: The memory surface is available while the model is already running in the REPL.  
+**KO**: 메모리 표면은 모델이 이미 REPL에서 실행 중인 상태에서도 바로 쓸 수 있습니다.
+
+Common examples:
+
+```text
+/memory search x.ai
+/memory search 설치
+/memory recall
+/memory recall 3
+/memory sessions
+/memory save
+```
+
+**EN**:
+- `/memory search <query>` searches saved portable memory
+- `/memory recall [limit]` prints the portable recall block the harness would inject
+- `/memory sessions` lists saved portable memory sessions
+- `/memory save` promotes the current session into portable memory
+
+**KO**:
+- `/memory search <query>`는 저장된 portable memory를 검색합니다
+- `/memory recall [limit]`는 하네스가 실제로 주입할 portable recall 블록을 보여줍니다
+- `/memory sessions`는 저장된 portable memory session 목록을 보여줍니다
+- `/memory save`는 현재 세션을 portable memory로 승격합니다
 
 ## Current Status | 현재 상태
 
