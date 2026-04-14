@@ -149,58 +149,78 @@ This repository currently contains:
 
 Planning is fixed in [docs/ROADMAP.md](/Users/paul_k/Documents/p-23/3122/docs/ROADMAP.md).
 
+## Install
+
+Current install path:
+
+```bash
+git clone https://github.com/goldberg-aria/3122-harness.git
+cd 3122-harness
+cargo install --path crates/cli --force
+```
+
+After install, run the harness directly:
+
+```bash
+3122
+```
+
+Notes:
+
+- `3122` without subcommands starts the terminal REPL
+- `cargo run -p cli -- ...` is the development path when running from the repo without installing
+- prebuilt release binaries, an install script, and package-manager distribution are not wired yet in this repo
+
 ## Commands
 
 ```bash
-cargo run -p cli --bin 3122 -- repl
-./target/debug/3122 repl
-cargo run -p cli -- doctor
-cargo run -p cli -- config
-cargo run -p cli -- model show
-cargo run -p cli -- model set-primary openai/gpt-4.1-mini
-cargo run -p cli -- memory
-cargo run -p cli -- memory show 1
-cargo run -p cli -- memory recall 6
-cargo run -p cli -- memory save
-cargo run -p cli -- memory search provider
-cargo run -p cli -- memory sessions
-cargo run -p cli -- memory session file:///absolute/path/to/.harness/sessions/session-123.jsonl
-cargo run -p cli -- memory delete --id amcp-example-id
-cargo run -p cli -- memory export --format amcp-jsonl --output memory-export.jsonl
-cargo run -p cli -- memory import --format amcp-jsonl --input memory-export.jsonl
-cargo run -p cli -- memory migrate --from local-amcp --to nexus-cloud
-cargo run -p cli -- trajectory
-cargo run -p cli -- trajectory active
-cargo run -p cli -- trajectory search provider
-cargo run -p cli -- resume
-cargo run -p cli -- handoff
-cargo run -p cli -- handoff debug
-cargo run -p cli -- why-context
-cargo run -p cli -- commands
-cargo run -p cli -- commands show recap
-cargo run -p cli -- commands init
-cargo run -p cli -- commands new checkpoint macro
-cargo run -p cli -- commands new ctx alias --global
-cargo run -p cli -- tool parallel-read '[{"tool":"read","path":"README.md"},{"tool":"glob","pattern":"src/*.rs"}]'
-cargo run -p cli -- prompt "say hello"
-cargo run -p cli -- providers
-cargo run -p cli -- providers presets
-cargo run -p cli -- providers detect-key <api-key>
-cargo run -p cli -- providers add router --api-key <api-key>
-cargo run -p cli -- providers sync-env
-cargo run -p cli -- providers saved
-cargo run -p cli -- blueprint
-cargo run -p cli -- skills
-cargo run -p cli -- skills suggest
-cargo run -p cli -- skills promote 1
-cargo run -p cli -- skills show project-bootstrap
-cargo run -p cli -- skills run project-bootstrap "start the first runtime slice"
-cargo run -p cli -- mcp
-cargo run -p cli -- mcp tools mock-echo
-cargo run -p cli -- mcp call mock-echo echo '{"text":"hello"}'
-cargo run -p cli -- session latest
-cargo run -p cli -- tool read README.md
-cargo run -p cli -- repl
+3122
+3122 doctor
+3122 config
+3122 model show
+3122 model set-primary openai/gpt-4.1-mini
+3122 memory
+3122 memory show 1
+3122 memory recall 6
+3122 memory save
+3122 memory search provider
+3122 memory sessions
+3122 memory session file:///absolute/path/to/.harness/sessions/session-123.jsonl
+3122 memory delete --id amcp-example-id
+3122 memory export --format amcp-jsonl --output memory-export.jsonl
+3122 memory import --format amcp-jsonl --input memory-export.jsonl
+3122 memory migrate --from local-amcp --to nexus-cloud
+3122 trajectory
+3122 trajectory active
+3122 trajectory search provider
+3122 resume
+3122 handoff
+3122 handoff debug
+3122 why-context
+3122 commands
+3122 commands show recap
+3122 commands init
+3122 commands new checkpoint macro
+3122 commands new ctx alias --global
+3122 tool parallel-read '[{"tool":"read","path":"README.md"},{"tool":"glob","pattern":"src/*.rs"}]'
+3122 prompt "say hello"
+3122 providers
+3122 providers presets
+3122 providers detect-key <api-key>
+3122 providers add router --api-key <api-key>
+3122 providers sync-env
+3122 providers saved
+3122 blueprint
+3122 skills
+3122 skills suggest
+3122 skills promote 1
+3122 skills show project-bootstrap
+3122 skills run project-bootstrap "start the first runtime slice"
+3122 mcp
+3122 mcp tools mock-echo
+3122 mcp call mock-echo echo '{"text":"hello"}'
+3122 session latest
+3122 tool read README.md
 ```
 
 ## Hosted memory

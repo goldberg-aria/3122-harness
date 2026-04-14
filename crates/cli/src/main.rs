@@ -28,7 +28,7 @@ use runtime::{
     search_trajectories, slash_command_dir, upsert_provider_profile, validate_slash_command_args,
     write_file, ApprovalAction, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, ConnectionMode,
     LoadedConfig, MemoryBackendKind, MemoryRecord, ModelHandoffSnapshot, PermissionMode,
-    SavedProviderProfile, SessionStore, SlashCommandKind, SlashCommandScope, ToolOutput,
+    ProviderPreset, SavedProviderProfile, SessionStore, SlashCommandKind, SlashCommandScope, ToolOutput,
     TrajectoryRecord, VerificationPolicy,
 };
 use serde_json::json;
@@ -286,14 +286,21 @@ fn run_repl(workspace: &PathBuf, config: &LoadedConfig, update_notice: Option<St
                 if maybe_accept_selected_slash_suggestion(workspace, &mut ui) {
                     continue;
                 }
+                let secret_input = ui.model_setup_expects_secret();
                 let line = ui.input.trim().to_string();
                 ui.input.clear();
                 ui.sync_slash_navigation(0);
-                ui.remember_input(&line);
+                if !secret_input {
+                    ui.remember_input(&line);
+                }
                 if line.is_empty() {
                     continue;
                 }
-                ui.push_user(line.clone());
+                if secret_input {
+                    ui.push_user("[hidden]".to_string());
+                } else {
+                    ui.push_user(line.clone());
+                }
                 let _ = redraw_tui(
                     &mut stdout,
                     workspace,
@@ -419,7 +426,8 @@ fn git_stdout<const N: usize>(workspace: &Path, args: [&str; N]) -> Option<Strin
 struct TuiState {
     transcript: Vec<String>,
     input: String,
-    model_choices: Vec<String>,
+    model_choices: Vec<ModelChoice>,
+    model_setup: Option<ModelSetupState>,
     slash_selection: usize,
     slash_scroll: usize,
     input_history: Vec<String>,
@@ -433,6 +441,7 @@ impl TuiState {
             transcript: Vec::new(),
             input: String::new(),
             model_choices: Vec::new(),
+            model_setup: None,
             slash_selection: 0,
             slash_scroll: 0,
             input_history: Vec::new(),
@@ -467,6 +476,22 @@ impl TuiState {
             Ok(text) => self.push_block(&text),
             Err(err) => self.push_error(err),
         }
+    }
+
+    fn is_model_setup_active(&self) -> bool {
+        self.model_setup.is_some()
+    }
+
+    fn model_setup_expects_secret(&self) -> bool {
+        self.model_setup
+            .as_ref()
+            .map(ModelSetupState::expects_secret)
+            .unwrap_or(false)
+    }
+
+    fn clear_model_setup(&mut self) {
+        self.model_setup = None;
+        self.model_choices.clear();
     }
 
     fn sync_slash_navigation(&mut self, total: usize) {
@@ -552,6 +577,53 @@ impl TuiState {
     fn clear_history_navigation(&mut self) {
         self.history_selection = None;
         self.history_draft.clear();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ModelChoice {
+    label: String,
+    action: ModelChoiceAction,
+}
+
+#[derive(Debug, Clone)]
+enum ModelChoiceAction {
+    Switch(String),
+    StartSetup,
+    SetupProvider(String),
+    SetupModel(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelSetupStage {
+    Provider,
+    Model,
+    ApiKey,
+    BaseUrl,
+}
+
+#[derive(Debug, Clone)]
+struct ModelSetupState {
+    stage: ModelSetupStage,
+    preset: Option<ProviderPreset>,
+    model: Option<String>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+}
+
+impl ModelSetupState {
+    fn new() -> Self {
+        Self {
+            stage: ModelSetupStage::Provider,
+            preset: None,
+            model: None,
+            api_key: None,
+            base_url: None,
+        }
+    }
+
+    fn expects_secret(&self) -> bool {
+        self.stage == ModelSetupStage::ApiKey
     }
 }
 
@@ -836,9 +908,18 @@ fn process_repl_input_tui(
     ui: &mut TuiState,
     custom_depth: usize,
 ) -> ReplDirective {
-    let should_log_input = !(trimmed.parse::<usize>().is_ok() && !ui.model_choices.is_empty());
+    let should_log_input = !ui.model_setup_expects_secret()
+        && !(trimmed.parse::<usize>().is_ok() && !ui.model_choices.is_empty());
     if should_log_input {
         let _ = session.append("user_input", json!({ "text": trimmed }));
+    }
+
+    if ui.is_model_setup_active()
+        && !matches!(trimmed, "/exit" | "/quit" | "/q" | "/help")
+        && !trimmed.starts_with("/model ")
+        && trimmed != "/model"
+    {
+        return handle_model_setup_input(workspace, config, session, trimmed, current_model, ui);
     }
 
     match trimmed {
@@ -863,6 +944,7 @@ fn process_repl_input_tui(
         "/model" => {
             let (text, choices) =
                 render_model_status_text(workspace, config, current_model.as_deref());
+            ui.model_setup = None;
             ui.model_choices = choices;
             ui.push_block(&text);
             return ReplDirective::Continue;
@@ -947,39 +1029,37 @@ fn process_repl_input_tui(
         _ => {}
     }
 
-    if let Ok(index) = trimmed.parse::<usize>() {
+    if let Some(index) = selection_index_for_model_choices(trimmed, ui) {
         if !ui.model_choices.is_empty() {
-            if let Some(model) = ui.model_choices.get(index.saturating_sub(1)).cloned() {
-                let previous_model = current_model
-                    .as_deref()
-                    .or_else(|| config.primary_model())
-                    .map(ToOwned::to_owned);
-                *current_model = Some(model.clone());
-                let _ = session.append(
-                    "model_change",
-                    json!({ "from": previous_model, "model": model }),
-                );
-                match build_model_handoff_snapshot(
-                    workspace,
-                    session.path(),
-                    previous_model.as_deref(),
-                    &model,
-                ) {
-                    Ok(snapshot) => {
-                        let _ = session.append(
-                            "model_handoff",
-                            serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
-                        );
-                        ui.push_block(&render_model_switch_summary_text(&snapshot));
+            if let Some(choice) = ui.model_choices.get(index).cloned() {
+                match choice.action {
+                    ModelChoiceAction::Switch(model) => {
+                        match set_active_model_with_handoff(
+                            workspace,
+                            config,
+                            session,
+                            current_model,
+                            &model,
+                        ) {
+                            Ok(snapshot) => {
+                                ui.push_block(&render_model_switch_summary_text(&snapshot))
+                            }
+                            Err(err) => ui.push_error(format!(
+                                "model set to {model}; failed to build handoff: {err}"
+                            )),
+                        }
                     }
-                    Err(err) => ui.push_error(format!(
-                        "model set to {model}; failed to build handoff: {err}"
-                    )),
+                    ModelChoiceAction::StartSetup => start_model_setup(ui),
+                    ModelChoiceAction::SetupProvider(_) | ModelChoiceAction::SetupModel(_) => {
+                        ui.push_error("selection is not available in this menu".to_string())
+                    }
                 }
-                ui.model_choices.clear();
+                if !ui.is_model_setup_active() {
+                    ui.model_choices.clear();
+                }
                 return ReplDirective::Continue;
             }
-            ui.push_error(format!("unknown model selection: {index}"));
+            ui.push_error(format!("unknown model selection: {trimmed}"));
             return ReplDirective::Continue;
         }
     }
@@ -998,27 +1078,14 @@ fn process_repl_input_tui(
             ui.push_error("usage: /model <provider/model | profile/alias/model>".to_string());
             return ReplDirective::Continue;
         }
+        if model == "add" {
+            start_model_setup(ui);
+            return ReplDirective::Continue;
+        }
         ui.model_choices.clear();
-        let previous_model = current_model
-            .as_deref()
-            .or_else(|| config.primary_model())
-            .map(ToOwned::to_owned);
-        *current_model = Some(model.to_string());
-        let _ = session.append(
-            "model_change",
-            json!({ "from": previous_model, "model": model }),
-        );
-        match build_model_handoff_snapshot(
-            workspace,
-            session.path(),
-            previous_model.as_deref(),
-            model,
-        ) {
+        ui.model_setup = None;
+        match set_active_model_with_handoff(workspace, config, session, current_model, model) {
             Ok(snapshot) => {
-                let _ = session.append(
-                    "model_handoff",
-                    serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
-                );
                 ui.push_block(&render_model_switch_summary_text(&snapshot));
             }
             Err(err) => ui.push_error(format!(
@@ -1742,7 +1809,7 @@ fn render_model_status_text(
     workspace: &Path,
     config: &LoadedConfig,
     current_model: Option<&str>,
-) -> (String, Vec<String>) {
+) -> (String, Vec<ModelChoice>) {
     let choices = build_model_choices(workspace, config, current_model);
     let mut lines = vec![
         format!("active: {}", current_model.unwrap_or("-")),
@@ -1765,22 +1832,23 @@ fn render_model_status_text(
     }
     if !choices.is_empty() {
         lines.push("switch:".to_string());
-        for (index, model) in choices.iter().enumerate() {
-            lines.push(format!("{}. {}", index + 1, model));
+        for (index, choice) in choices.iter().enumerate() {
+            let display_index = if index == 0 { 0 } else { index };
+            lines.push(format!("{}. {}", display_index, choice.label));
         }
-        lines.push("tip: type the number to switch".to_string());
+        lines.push("tip: type the number to switch; 0 adds a provider".to_string());
     }
     let registry = load_provider_registry(workspace).unwrap_or_default();
     if registry.profiles.is_empty() {
         lines.push("saved_profiles: none".to_string());
     } else {
-        lines.push("saved_profiles:".to_string());
-        for profile in registry.profiles {
-            lines.push(format!(
-                "- {} | {} | use: profile/{}/<model>",
-                profile.alias, profile.base_url, profile.alias
-            ));
-        }
+        let aliases = registry
+            .profiles
+            .into_iter()
+            .map(|profile| profile.alias)
+            .collect::<Vec<_>>();
+        lines.push(format!("saved_profiles: {}", aliases.join(", ")));
+        lines.push("detail: /providers".to_string());
     }
     (lines.join("\n"), choices)
 }
@@ -1816,24 +1884,32 @@ fn build_model_choices(
     workspace: &Path,
     config: &LoadedConfig,
     current_model: Option<&str>,
-) -> Vec<String> {
-    let mut choices = Vec::new();
+) -> Vec<ModelChoice> {
+    let mut models = Vec::new();
     if let Some(model) = current_model {
-        push_unique_choice(&mut choices, model.to_string());
+        push_unique_choice(&mut models, model.to_string());
     }
     if let Some(model) = config.primary_model() {
-        push_unique_choice(&mut choices, model.to_string());
+        push_unique_choice(&mut models, model.to_string());
     }
     for model in &config.data.model.fallback {
-        push_unique_choice(&mut choices, model.clone());
+        push_unique_choice(&mut models, model.clone());
     }
 
     let registry = load_provider_registry(workspace).unwrap_or_default();
     for profile in registry.profiles {
         if let Some(model) = default_model_for_profile(&profile.alias, &profile.route) {
-            push_unique_choice(&mut choices, format!("profile/{}/{}", profile.alias, model));
+            push_unique_choice(&mut models, format!("profile/{}/{}", profile.alias, model));
         }
     }
+    let mut choices = vec![ModelChoice {
+        label: "Add provider/model...".to_string(),
+        action: ModelChoiceAction::StartSetup,
+    }];
+    choices.extend(models.into_iter().map(|model| ModelChoice {
+        label: display_model_choice_label(&model, current_model),
+        action: ModelChoiceAction::Switch(model),
+    }));
     choices
 }
 
@@ -1841,6 +1917,343 @@ fn push_unique_choice(choices: &mut Vec<String>, model: String) {
     if !choices.iter().any(|existing| existing == &model) {
         choices.push(model);
     }
+}
+
+fn provider_model_suggestions(provider_name: &str) -> Vec<String> {
+    match provider_name {
+        "anthropic" => vec![
+            "claude-sonnet-4-6".to_string(),
+            "claude-opus-4-1".to_string(),
+        ],
+        "openai" => vec!["gpt-4.1-mini".to_string(), "gpt-4.1".to_string()],
+        "openrouter" => vec![
+            "openai/gpt-4.1-mini".to_string(),
+            "qwen/qwen3.6-plus".to_string(),
+            "anthropic/claude-sonnet-4-6".to_string(),
+        ],
+        "xai" => vec![
+            "grok-4-1-fast-reasoning".to_string(),
+            "grok-4.20-reasoning".to_string(),
+        ],
+        "deepseek" => vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+        "dashscope-cn" | "dashscope-intl" => {
+            vec!["qwen-max".to_string(), "qwen-plus".to_string()]
+        }
+        "siliconflow" => vec![
+            "Qwen/Qwen3-Coder-30B-A3B-Instruct".to_string(),
+            "deepseek-ai/DeepSeek-V3".to_string(),
+        ],
+        "groq" => vec![
+            "openai/gpt-oss-20b".to_string(),
+            "llama-3.3-70b-versatile".to_string(),
+        ],
+        "minimax" => vec!["MiniMax-M2.7".to_string()],
+        "deepinfra" => vec![
+            "nvidia/Nemotron-3-Nano-30B-A3B".to_string(),
+            "meta-llama/Llama-3.3-70B-Instruct".to_string(),
+        ],
+        "zai-coding" => vec!["glm-5".to_string()],
+        _ => vec!["custom".to_string()],
+    }
+}
+
+fn display_model_choice_label(spec: &str, current_model: Option<&str>) -> String {
+    let compact = if let Some(rest) = spec.strip_prefix("profile/") {
+        match rest.split_once('/') {
+            Some((alias, model)) => format!("{alias} / {model}"),
+            None => spec.to_string(),
+        }
+    } else {
+        match spec.split_once('/') {
+            Some((provider, model)) => format!("{provider} / {model}"),
+            None => spec.to_string(),
+        }
+    };
+    if current_model == Some(spec) {
+        format!("{compact} (active)")
+    } else {
+        compact
+    }
+}
+
+fn build_provider_setup_choices() -> Vec<ModelChoice> {
+    provider_presets()
+        .into_iter()
+        .map(|preset| ModelChoice {
+            label: format!("{} | {}", preset.name, preset.description),
+            action: ModelChoiceAction::SetupProvider(preset.name.to_string()),
+        })
+        .collect()
+}
+
+fn build_provider_model_choices(provider_name: &str) -> Vec<ModelChoice> {
+    provider_model_suggestions(provider_name)
+        .into_iter()
+        .map(|model| ModelChoice {
+            label: model.clone(),
+            action: ModelChoiceAction::SetupModel(model),
+        })
+        .collect()
+}
+
+fn render_model_setup_provider_text(choices: &[ModelChoice]) -> String {
+    let mut lines = vec![
+        "[1/4] Provider".to_string(),
+        "Choose the company profile to save.".to_string(),
+    ];
+    for (index, choice) in choices.iter().enumerate() {
+        lines.push(format!("{}. {}", index + 1, choice.label));
+    }
+    lines.push("type the number to continue".to_string());
+    lines.join("\n")
+}
+
+fn render_model_setup_model_text(preset: &ProviderPreset, choices: &[ModelChoice]) -> String {
+    let mut lines = vec![
+        "[2/4] Model".to_string(),
+        format!("Provider: {}", preset.name),
+    ];
+    for (index, choice) in choices.iter().enumerate() {
+        lines.push(format!("{}. {}", index + 1, choice.label));
+    }
+    lines.push("type the number to continue".to_string());
+    lines.join("\n")
+}
+
+fn render_model_setup_api_key_text(preset: &ProviderPreset, model: &str) -> String {
+    [
+        "[3/4] API Key".to_string(),
+        format!("Provider: {}", preset.name),
+        format!("Model: {model}"),
+        "Paste the API key, then press Enter.".to_string(),
+        "The key is not written to the session transcript.".to_string(),
+    ]
+    .join("\n")
+}
+
+fn render_model_setup_base_url_text(preset: &ProviderPreset, model: &str, base_url: &str) -> String {
+    [
+        "[4/4] Base URL".to_string(),
+        format!("Provider: {}", preset.name),
+        format!("Model: {model}"),
+        "Press Enter to accept the suggested Base URL, or edit it first.".to_string(),
+        format!("Base URL [{base_url}]"),
+    ]
+    .join("\n")
+}
+
+fn render_model_setup_saved_text(profile: &SavedProviderProfile, active_model: &str) -> String {
+    [
+        format!("saved provider profile `{}`", profile.alias),
+        format!("route: {}", profile.route),
+        format!("base_url: {}", profile.base_url),
+        format!("source: {}", profile.source),
+        format!("active_model: {active_model}"),
+    ]
+    .join("\n")
+}
+
+fn build_saved_provider_profile(
+    alias: &str,
+    preset: &ProviderPreset,
+    api_key: &str,
+    base_url: &str,
+) -> SavedProviderProfile {
+    SavedProviderProfile {
+        alias: alias.to_string(),
+        route: preset.route.as_str().to_string(),
+        base_url: base_url.to_string(),
+        api_key: api_key.to_string(),
+        source: format!("preset:{}", preset.name),
+    }
+}
+
+fn set_active_model_with_handoff(
+    workspace: &Path,
+    config: &LoadedConfig,
+    session: &SessionStore,
+    current_model: &mut Option<String>,
+    model: &str,
+) -> Result<ModelHandoffSnapshot, String> {
+    let previous_model = current_model
+        .as_deref()
+        .or_else(|| config.primary_model())
+        .map(ToOwned::to_owned);
+    *current_model = Some(model.to_string());
+    let _ = session.append(
+        "model_change",
+        json!({ "from": previous_model, "model": model }),
+    );
+    let snapshot = build_model_handoff_snapshot(
+        workspace,
+        session.path(),
+        previous_model.as_deref(),
+        model,
+    )?;
+    let _ = session.append(
+        "model_handoff",
+        serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({})),
+    );
+    Ok(snapshot)
+}
+
+fn start_model_setup(ui: &mut TuiState) {
+    ui.model_setup = Some(ModelSetupState::new());
+    ui.model_choices = build_provider_setup_choices();
+    ui.push_block(&render_model_setup_provider_text(&ui.model_choices));
+}
+
+fn selection_index_for_model_choices(input: &str, ui: &TuiState) -> Option<usize> {
+    let index = input.parse::<usize>().ok()?;
+    if ui.is_model_setup_active() {
+        index.checked_sub(1)
+    } else {
+        Some(index)
+    }
+}
+
+fn handle_model_setup_input(
+    workspace: &Path,
+    config: &LoadedConfig,
+    session: &SessionStore,
+    trimmed: &str,
+    current_model: &mut Option<String>,
+    ui: &mut TuiState,
+) -> ReplDirective {
+    let Some(mut setup) = ui.model_setup.clone() else {
+        return ReplDirective::Continue;
+    };
+    match setup.stage {
+        ModelSetupStage::Provider => {
+            let Some(index) = trimmed.parse::<usize>().ok().and_then(|value| value.checked_sub(1)) else {
+                ui.push_error("type the provider number".to_string());
+                return ReplDirective::Continue;
+            };
+            let Some(choice) = ui.model_choices.get(index) else {
+                ui.push_error(format!("unknown provider selection: {}", index + 1));
+                return ReplDirective::Continue;
+            };
+            let ModelChoiceAction::SetupProvider(provider_name) = &choice.action else {
+                ui.push_error("invalid provider selection".to_string());
+                return ReplDirective::Continue;
+            };
+            let Some(preset) = provider_preset(provider_name) else {
+                ui.push_error(format!("unknown provider preset: {provider_name}"));
+                return ReplDirective::Continue;
+            };
+            let next_choices = build_provider_model_choices(preset.name);
+            setup.stage = ModelSetupStage::Model;
+            setup.base_url = Some(preset.base_url.to_string());
+            setup.preset = Some(preset.clone());
+            ui.model_setup = Some(setup);
+            ui.model_choices = next_choices;
+            ui.push_block(&render_model_setup_model_text(&preset, &ui.model_choices));
+        }
+        ModelSetupStage::Model => {
+            let Some(index) = trimmed.parse::<usize>().ok().and_then(|value| value.checked_sub(1)) else {
+                ui.push_error("type the model number".to_string());
+                return ReplDirective::Continue;
+            };
+            let Some(choice) = ui.model_choices.get(index) else {
+                ui.push_error(format!("unknown model selection: {}", index + 1));
+                return ReplDirective::Continue;
+            };
+            let ModelChoiceAction::SetupModel(model) = &choice.action else {
+                ui.push_error("invalid model selection".to_string());
+                return ReplDirective::Continue;
+            };
+            let model = model.clone();
+            let Some(preset) = setup.preset.clone() else {
+                ui.push_error("provider setup state is missing".to_string());
+                ui.clear_model_setup();
+                return ReplDirective::Continue;
+            };
+            setup.stage = ModelSetupStage::ApiKey;
+            setup.model = Some(model.clone());
+            ui.model_setup = Some(setup);
+            ui.model_choices.clear();
+            ui.push_block(&render_model_setup_api_key_text(&preset, &model));
+        }
+        ModelSetupStage::ApiKey => {
+            if trimmed.is_empty() {
+                ui.push_error("api key cannot be empty".to_string());
+                return ReplDirective::Continue;
+            }
+            let Some(preset) = setup.preset.clone() else {
+                ui.push_error("provider setup state is missing".to_string());
+                ui.clear_model_setup();
+                return ReplDirective::Continue;
+            };
+            let Some(model) = setup.model.clone() else {
+                ui.push_error("model setup state is missing".to_string());
+                ui.clear_model_setup();
+                return ReplDirective::Continue;
+            };
+            setup.stage = ModelSetupStage::BaseUrl;
+            setup.api_key = Some(trimmed.to_string());
+            ui.model_setup = Some(setup.clone());
+            ui.model_choices.clear();
+            ui.input = setup
+                .base_url
+                .clone()
+                .unwrap_or_else(|| preset.base_url.to_string());
+            ui.push_block(&render_model_setup_base_url_text(
+                &preset,
+                &model,
+                ui.input.as_str(),
+            ));
+        }
+        ModelSetupStage::BaseUrl => {
+            let Some(preset) = setup.preset.clone() else {
+                ui.push_error("provider setup state is missing".to_string());
+                ui.clear_model_setup();
+                return ReplDirective::Continue;
+            };
+            let Some(model) = setup.model.clone() else {
+                ui.push_error("model setup state is missing".to_string());
+                ui.clear_model_setup();
+                return ReplDirective::Continue;
+            };
+            let Some(api_key) = setup.api_key.clone() else {
+                ui.push_error("api key setup state is missing".to_string());
+                ui.clear_model_setup();
+                return ReplDirective::Continue;
+            };
+            let base_url = if trimmed.is_empty() {
+                setup.base_url.clone().unwrap_or_else(|| preset.base_url.to_string())
+            } else {
+                trimmed.to_string()
+            };
+            let profile = build_saved_provider_profile(preset.name, &preset, &api_key, &base_url);
+            match upsert_provider_profile(workspace, profile.clone()) {
+                Ok(_) => {
+                    let active_model = format!("profile/{}/{}", profile.alias, model);
+                    match set_active_model_with_handoff(
+                        workspace,
+                        config,
+                        session,
+                        current_model,
+                        &active_model,
+                    ) {
+                        Ok(snapshot) => {
+                            ui.clear_model_setup();
+                            ui.push_block(&render_model_setup_saved_text(&profile, &active_model));
+                            ui.push_block(&render_model_switch_summary_text(&snapshot));
+                        }
+                        Err(err) => {
+                            ui.clear_model_setup();
+                            ui.push_error(format!(
+                                "saved provider profile `{}` but failed to switch model: {err}",
+                                profile.alias
+                            ));
+                        }
+                    }
+                }
+                Err(err) => ui.push_error(err),
+            }
+        }
+    }
+    ReplDirective::Continue
 }
 
 fn default_model_for_profile(alias: &str, route: &str) -> Option<String> {
@@ -5069,8 +5482,9 @@ fn print_prompt_help() {
 mod tests {
     use super::{
         apply_slash_suggestion, build_slash_suggestions, build_update_notice,
-        maybe_accept_selected_slash_suggestion, render_suggestion_lines, SlashSuggestion,
-        TuiState,
+        display_model_choice_label, maybe_accept_selected_slash_suggestion,
+        render_suggestion_lines, selection_index_for_model_choices, ModelChoice,
+        ModelChoiceAction, SlashSuggestion, TuiState,
     };
 
     #[test]
@@ -5177,5 +5591,37 @@ mod tests {
             notice,
             "update available: `main` is behind `origin/main` by 3 commit(s); run `git pull`"
         );
+    }
+
+    #[test]
+    fn display_model_choice_label_shortens_profile_specs() {
+        assert_eq!(
+            display_model_choice_label(
+                "profile/xai/grok-4-1-fast-reasoning",
+                Some("profile/xai/grok-4-1-fast-reasoning")
+            ),
+            "xai / grok-4-1-fast-reasoning (active)"
+        );
+        assert_eq!(
+            display_model_choice_label("anthropic/claude-sonnet-4-6", None),
+            "anthropic / claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn root_model_menu_uses_zero_for_add_provider() {
+        let mut ui = TuiState::new();
+        ui.model_choices = vec![
+            ModelChoice {
+                label: "Add provider/model...".to_string(),
+                action: ModelChoiceAction::StartSetup,
+            },
+            ModelChoice {
+                label: "xai / grok".to_string(),
+                action: ModelChoiceAction::Switch("profile/xai/grok".to_string()),
+            },
+        ];
+        assert_eq!(selection_index_for_model_choices("0", &ui), Some(0));
+        assert_eq!(selection_index_for_model_choices("1", &ui), Some(1));
     }
 }
