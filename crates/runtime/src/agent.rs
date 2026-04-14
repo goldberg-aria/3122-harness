@@ -453,6 +453,80 @@ struct PromptProfile {
     answer_line_limit: usize,
 }
 
+fn prefers_native_tool_calls(target: &ProviderTarget) -> bool {
+    matches!(
+        target.route,
+        ProviderRoute::OpenAiCompat | ProviderRoute::Anthropic | ProviderRoute::Ollama
+    )
+}
+
+fn tool_instruction_block(target: &ProviderTarget, shape: PromptShape) -> String {
+    if prefers_native_tool_calls(target) {
+        let mut block = String::from(
+            "You may either answer normally, or request exactly one tool call.\n\
+If a tool is needed, use the provider's native tool-calling interface first.\n\
+Do not print a `<tool_call>` XML block when native tool calling is available.\n\
+Fallback text tool protocol only if native tools are unavailable or rejected:\n\
+<tool_call>\n\
+{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n\
+</tool_call>\n\n",
+        );
+        if shape == PromptShape::Compact {
+            block.push_str("Keep each step atomic.\n\n");
+        }
+        return block;
+    }
+
+    match shape {
+        PromptShape::Default => {
+            "You may either answer normally, or request exactly one tool call.\n\
+If you need a tool, respond with only this XML block and nothing else:\n\
+<tool_call>\n\
+{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n\
+</tool_call>\n\n"
+                .to_string()
+        }
+        PromptShape::Compact => "Tool request format:\n\
+<tool_call>\n\
+{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n\
+</tool_call>\n\
+\n\
+Keep each step atomic.\n\n"
+            .to_string(),
+    }
+}
+
+fn final_tool_reminder(target: &ProviderTarget, shape: PromptShape) -> String {
+    match shape {
+        PromptShape::Default => {
+            let tool_line = if prefers_native_tool_calls(target) {
+                "either use one native tool call or a normal answer"
+            } else {
+                "either output one tool block or a normal answer"
+            };
+            format!(
+                "Final reminder:\n\
+- verify before claiming completion\n\
+- do not emit `<thinking>` or `<think>`\n\
+- {tool_line}\n"
+            )
+        }
+        PromptShape::Compact => {
+            let tool_line = if prefers_native_tool_calls(target) {
+                "either use one native tool call or one short normal answer"
+            } else {
+                "either output one tool block or one short normal answer"
+            };
+            format!(
+                "Final reminder:\n\
+- verify before claiming completion\n\
+- {tool_line}\n\
+- do not emit `<thinking>` or `<think>`\n"
+            )
+        }
+    }
+}
+
 fn compose_prompt(target: &ProviderTarget, prompt_context: &str, events: &[AgentEvent]) -> String {
     let profile = prompt_profile(target);
     let mut prompt = String::new();
@@ -488,13 +562,11 @@ Don't:\n\
 - do not emit chain-of-thought or `<thinking>` / `<think>` blocks\n\
 - do not mix other tasks, repos, or assumptions into this session\n\
 - do not return prose alongside a tool block\n\
-\n\
-You may either answer normally, or request exactly one tool call.\n\
-If you need a tool, respond with only this XML block and nothing else:\n\
-<tool_call>\n\
-{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n\
-</tool_call>\n\n\
-Available built-in tools:\n\
+\n",
+            );
+            header.push_str(&tool_instruction_block(target, PromptShape::Default));
+            header.push_str(
+                "Available built-in tools:\n\
 - read { path }\n\
 - write { path, contents }\n\
 - edit { path, needle, replacement }\n\
@@ -533,13 +605,11 @@ Compact rules for this model:\n\
 - Do not create or edit files unless the user clearly asked for file changes.\n\
 - The current User request overrides older recall and prior file-writing tasks.\n\
 - Do not emit chain-of-thought or `<thinking>` / `<think>`.\n\
-\n\
-Tool request format:\n\
-<tool_call>\n\
-{\"tool\":\"read\",\"arguments\":{\"path\":\"README.md\"}}\n\
-</tool_call>\n\
-\n\
-Tools:\n\
+\n",
+            );
+            header.push_str(&tool_instruction_block(target, PromptShape::Compact));
+            header.push_str(
+                "Tools:\n\
 - read { path }\n\
 - write { path, contents }\n\
 - edit { path, needle, replacement }\n\
@@ -607,21 +677,8 @@ When a tool result appears, use it to decide the next step. Keep each step atomi
         }
     }
 
-    let final_reminder = match profile.shape {
-        PromptShape::Default => {
-            "Final reminder:\n\
-- verify before claiming completion\n\
-- do not emit `<thinking>` or `<think>`\n\
-- either output one tool block or a normal answer\n"
-        }
-        PromptShape::Compact => {
-            "Final reminder:\n\
-- verify before claiming completion\n\
-- either output one tool block or one short normal answer\n\
-- do not emit `<thinking>` or `<think>`\n"
-        }
-    };
-    prompt.push_str(final_reminder);
+    let final_reminder = final_tool_reminder(target, profile.shape);
+    prompt.push_str(&final_reminder);
 
     prompt
 }
@@ -705,8 +762,15 @@ fn parse_tool_call(text: &str) -> Result<Option<ToolCallEnvelope>, String> {
         }
         return Ok(None);
     }
-    let body =
-        extract_tool_call_body(trimmed).ok_or_else(|| "invalid tool_call wrapper".to_string())?;
+    let Some(body) = extract_tool_call_body(trimmed) else {
+        if let Some(parsed) = parse_loose_tool_call(trimmed)? {
+            return Ok(Some(parsed));
+        }
+        if has_meaningful_non_tool_text(trimmed) {
+            return Ok(None);
+        }
+        return Err("invalid tool_call wrapper".to_string());
+    };
     let json_body = extract_first_json_object(&body).unwrap_or_else(|| body.clone());
     let repaired = repair_text_tool_call_body(&json_body);
     let parsed = serde_json::from_str::<ToolCallEnvelope>(&repaired).map_err(|err| {
@@ -790,6 +854,19 @@ fn extract_tool_call_body(text: &str) -> Option<String> {
     let rest = &text[start + "<tool_call>".len()..];
     let end = rest.find("</tool_call>")?;
     Some(rest[..end].trim().to_string())
+}
+
+fn has_meaningful_non_tool_text(text: &str) -> bool {
+    let cleaned = text
+        .replace("<tool_call>", " ")
+        .replace("</tool_call>", " ")
+        .replace("```json", " ")
+        .replace("```", " ");
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    extract_first_json_object(trimmed).is_none()
 }
 
 fn repair_text_tool_call_body(body: &str) -> String {
@@ -1113,9 +1190,9 @@ mod tests {
     };
 
     use super::{
-        coerce_string_value, enforce_verification_policy, parse_tool_call,
-        run_agent_loop_with_runner, strip_thinking_blocks, AgentOptions, ApprovalOutcome,
-        ApprovalRequest,
+        coerce_string_value, compose_prompt, enforce_verification_policy, parse_tool_call,
+        run_agent_loop_with_runner, strip_thinking_blocks, AgentEvent, AgentOptions,
+        ApprovalOutcome, ApprovalRequest,
     };
 
     fn temp_workspace(prefix: &str) -> PathBuf {
@@ -1189,6 +1266,15 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.tool, "exec");
         assert_eq!(parsed.arguments["command"], "ls -la /tmp");
+    }
+
+    #[test]
+    fn ignores_broken_tool_wrapper_when_model_also_returned_normal_answer() {
+        let parsed = parse_tool_call(
+            "### Provider 구조\nxAI는 OpenAI-compatible provider입니다.\n<tool_call>",
+        )
+        .unwrap();
+        assert!(parsed.is_none());
     }
 
     #[test]
@@ -1486,6 +1572,21 @@ mod tests {
         assert!(!prompts[0].contains("Do:\n"));
 
         cleanup(&workspace);
+    }
+
+    #[test]
+    fn openai_compat_prompt_prefers_native_tool_calls() {
+        let target = parse_model_target("openai/gpt-4.1-mini").unwrap();
+        let prompt = compose_prompt(
+            &target,
+            "workspace instructions",
+            &[AgentEvent::User("read README.md".to_string())],
+        );
+
+        assert!(prompt.contains("use the provider's native tool-calling interface first"));
+        assert!(prompt.contains("Do not print a `<tool_call>` XML block"));
+        assert!(!prompt
+            .contains("If you need a tool, respond with only this XML block and nothing else"));
     }
 
     #[test]

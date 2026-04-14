@@ -290,9 +290,10 @@ Current status:
 
 ## Tool-call protocol
 
-The current loop uses a provider-agnostic text contract.
+The current loop prefers provider-native tool calling when the backend supports it.
 
-If the model needs a tool, it must answer with only:
+Native-tool providers use their own tool-calling interface first.
+The text `<tool_call>` contract remains as the fallback path when native tools are unavailable or rejected:
 
 ```xml
 <tool_call>
@@ -310,7 +311,9 @@ Supported loop actions:
 Provider-native tool calling:
 
 - Anthropic, OpenAI-compatible providers, and Ollama now expose the built-in tool set as native tools when supported
+- OpenAI-compatible models such as Grok are prompted to use native tool calls first instead of emitting text-only XML wrappers
 - if native tool calling is unsupported or rejected, the harness falls back to the text `<tool_call>` path
+- malformed `<tool_call>` fragments in an otherwise normal model answer are ignored instead of aborting the turn
 - external CLI adapters still use the text tool path for now
 
 Approval behavior:
@@ -460,6 +463,7 @@ Grok / xAI coding:
 - add a saved profile with `providers add xai --api-key <XAI_API_KEY> --preset xai`
 - use `profile/xai/grok-4.20-reasoning` for higher-quality coding turns
 - use `profile/xai/grok-4-1-fast-reasoning` for lower-latency coding turns
+- REPL and one-shot prompt flows now prefer native OpenAI-compatible tool calls for Grok, with text-tool fallback only when needed
 - example:
 
 ```bash
