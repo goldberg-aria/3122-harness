@@ -86,6 +86,8 @@ jobs:
     needs: build
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v5
         with:
           path: release-artifacts
@@ -102,6 +104,7 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
